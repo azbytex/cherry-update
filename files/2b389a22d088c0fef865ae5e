@@ -1,0 +1,262 @@
+// Katalog stiker: emoji + stiker gambar buatan sendiri (SVG), plus panel pemilih.
+import { $$, esc, pickFile, toast, ICON } from './ui.js';
+import { db } from './db.js';
+import { splitStickerFile } from './stickersplit.js';
+import { playStickerPop } from './sound.js';
+
+const svg = (w, h, body) => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${body}</svg>`;
+const label = (text, bg, fg = '#fff', rot = 0) => svg(220, 90, `
+  <g transform="rotate(${rot} 110 45)">
+    <rect x="10" y="14" width="200" height="62" rx="16" fill="#000" opacity=".15" transform="translate(3 4)"/>
+    <rect x="10" y="14" width="200" height="62" rx="16" fill="${bg}"/>
+    <rect x="18" y="22" width="184" height="46" rx="11" fill="none" stroke="${fg}" stroke-width="3" stroke-dasharray="7 6" opacity=".7"/>
+    <text x="110" y="56" text-anchor="middle" font-family="Arial Black, Segoe UI, sans-serif" font-weight="900" font-size="28" fill="${fg}">${text}</text>
+  </g>`);
+const washi = (c1, c2, pat) => svg(240, 60, `
+  <defs><pattern id="p" width="20" height="20" patternUnits="userSpaceOnUse">${pat(c2)}</pattern></defs>
+  <path d="M6 8 L234 4 L230 16 L236 28 L230 40 L234 54 L8 56 L12 44 L4 32 L12 20 Z" fill="${c1}" opacity=".92"/>
+  <path d="M6 8 L234 4 L230 16 L236 28 L230 40 L234 54 L8 56 L12 44 L4 32 L12 20 Z" fill="url(#p)" opacity=".9"/>`);
+
+export const SVG_STICKERS = {
+  penting: label('PENTING!', '#e5484d'),
+  ujian: label('UJIAN', '#8b5cf6'),
+  deadline: label('DEADLINE', '#f97316'),
+  done: label('DONE ✓', '#16a34a'),
+  libur: label('LIBUR', '#0ea5e9'),
+  semangat: label('SEMANGAT!', '#ec4899'),
+  praktik: label('PRAKTIK', '#0d9488'),
+  washiPink: washi('#ffc2d9', '#fff', (c) => `<circle cx="10" cy="10" r="4" fill="${c}"/>`),
+  washiMint: washi('#bff0d8', '#7ccfa8', (c) => `<path d="M0 20 L20 0" stroke="${c}" stroke-width="5"/>`),
+  washiYellow: washi('#ffe78a', '#f3b700', (c) => `<rect x="0" y="0" width="10" height="20" fill="${c}" opacity=".45"/>`),
+  washiBlue: washi('#c7e3ff', '#fff', (c) => `<path d="M10 3l2 5h5l-4 3 2 5-5-3-5 3 2-5-4-3h5z" fill="${c}"/>`),
+  cherry: svg(120, 120, `
+    <path d="M60 18 C 58 40, 44 56, 36 70" stroke="#3f7d3a" stroke-width="5" fill="none" stroke-linecap="round"/>
+    <path d="M60 18 C 66 42, 78 58, 84 72" stroke="#3f7d3a" stroke-width="5" fill="none" stroke-linecap="round"/>
+    <path d="M60 18 C 74 6, 96 8, 104 22 C 88 28, 72 26, 60 18 Z" fill="#5fb85a"/>
+    <circle cx="36" cy="84" r="24" fill="#e5354b"/><circle cx="84" cy="86" r="24" fill="#d42a40"/>
+    <ellipse cx="28" cy="76" rx="6" ry="4" fill="#fff" opacity=".7"/><ellipse cx="76" cy="78" rx="6" ry="4" fill="#fff" opacity=".7"/>
+    <circle cx="30" cy="88" r="2.5" fill="#3a1a1f"/><circle cx="42" cy="88" r="2.5" fill="#3a1a1f"/><path d="M32 95 q4 4 8 0" stroke="#3a1a1f" stroke-width="2" fill="none" stroke-linecap="round"/>
+    <circle cx="78" cy="90" r="2.5" fill="#3a1a1f"/><circle cx="90" cy="90" r="2.5" fill="#3a1a1f"/><path d="M80 97 q4 4 8 0" stroke="#3a1a1f" stroke-width="2" fill="none" stroke-linecap="round"/>
+    <ellipse cx="25" cy="94" rx="4" ry="2.5" fill="#ff8da0"/><ellipse cx="47" cy="94" rx="4" ry="2.5" fill="#ff8da0"/>`),
+  cloud: svg(140, 100, `
+    <path d="M36 82 C 14 82, 10 56, 30 50 C 28 28, 56 20, 66 36 C 76 18, 110 22, 108 48 C 128 50, 130 82, 106 82 Z" fill="#fff" stroke="#9ccaf0" stroke-width="4"/>
+    <circle cx="58" cy="60" r="4" fill="#33415c"/><circle cx="84" cy="60" r="4" fill="#33415c"/>
+    <path d="M62 68 q9 8 18 0" stroke="#33415c" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <ellipse cx="50" cy="69" rx="6" ry="3.5" fill="#ffb3c7"/><ellipse cx="92" cy="69" rx="6" ry="3.5" fill="#ffb3c7"/>`),
+  heart: svg(110, 100, `
+    <path d="M55 92 C 20 66, 6 48, 10 30 C 14 12, 40 8, 55 28 C 70 8, 96 12, 100 30 C 104 48, 90 66, 55 92 Z" fill="#ff6b8b" stroke="#fff" stroke-width="6"/>
+    <ellipse cx="34" cy="32" rx="9" ry="6" fill="#fff" opacity=".6" transform="rotate(-30 34 32)"/>`),
+  star: svg(110, 110, `
+    <path d="M55 8 L68 40 L102 42 L76 64 L85 98 L55 79 L25 98 L34 64 L8 42 L42 40 Z" fill="#ffd93b" stroke="#fff" stroke-width="6" stroke-linejoin="round"/>
+    <circle cx="46" cy="56" r="3.5" fill="#5b4300"/><circle cx="64" cy="56" r="3.5" fill="#5b4300"/><path d="M48 66 q7 6 14 0" stroke="#5b4300" stroke-width="3" fill="none" stroke-linecap="round"/>`),
+  pin: svg(70, 110, `
+    <circle cx="35" cy="30" r="24" fill="#e5484d"/><ellipse cx="27" cy="22" rx="8" ry="5" fill="#fff" opacity=".5"/>
+    <path d="M35 54 L35 104" stroke="#8a8f98" stroke-width="5" stroke-linecap="round"/>`),
+};
+
+export const EMOJI_SETS = {
+  'Lucu': ['🐱', '🐶', '🐰', '🐻', '🐼', '🐨', '🦊', '🐥', '🐸', '🦄', '🐙', '🐳', '🦋', '🐝', '🐞', '🌸'],
+  'Kuliah': ['📚', '📖', '✏️', '🖊️', '📝', '📎', '📌', '🗓️', '⏰', '💡', '🎓', '🩺', '💉', '💊', '🏥', '🧪'],
+  'Rasa': ['😊', '😍', '🥰', '😆', '😎', '🤩', '😴', '😭', '😤', '🤯', '🥳', '😇', '🙏', '💪', '👍', '✨'],
+  'Makan': ['☕', '🧋', '🍰', '🍩', '🍪', '🍓', '🍒', '🍑', '🍕', '🍜', '🍱', '🍙', '🥗', '🍉', '🍦', '🧁'],
+  'Alam': ['☀️', '🌙', '⭐', '🌈', '☁️', '🌧️', '❄️', '🌷', '🌻', '🍀', '🌿', '🍂', '🌊', '🔥', '💖', '🎀'],
+};
+const MINE = 'Stiker saya';
+const FL = '3D';
+const TABS = { [MINE]: null, [FL]: null, 'Stiker': null, ...EMOJI_SETS };
+
+// ---------- Fluent Emoji 3D (Microsoft, lisensi MIT) ----------
+let flIndex = null;
+async function loadFluent() {
+  if (!flIndex) flIndex = fetch('stickers/fluent/index.json').then((r) => r.json()).catch(() => []);
+  return flIndex;
+}
+export const isFluent = (v) => typeof v === 'string' && v.startsWith('fl:');
+const flURL = (v) => `stickers/fluent/${v.slice(3)}.webp`;
+
+// Gambar stiker berbasis file (SVG bawaan / 3D) untuk canvas — dicache per URL
+const urlImgs = new Map();
+function urlImage(url, onload) {
+  let e = urlImgs.get(url);
+  if (!e) { const img = new Image(); e = { img, ok: false, waiters: [] }; img.onload = () => { e.ok = true; e.waiters.splice(0).forEach((f) => f()); }; img.src = url; urlImgs.set(url, e); }
+  if (!e.ok && onload) e.waiters.push(onload);
+  return e.ok ? e.img : null;
+}
+export function stickerImage(v, onload) { return isFluent(v) ? urlImage(flURL(v), onload) : svgImage(v, onload); }
+export function stickerImageReady(v) { return new Promise((r) => { const im = stickerImage(v, () => r(stickerImage(v))); if (im) r(im); }); }
+
+// ---------- Stiker saya (hasil impor pengguna, disimpan di perangkat) ----------
+// v = 'my:<blobId>'
+let mine = []; // [{ id, a }]
+const mineURL = new Map();
+export async function loadMyStickers() {
+  const rec = await db.get('kv', 'mystickers');
+  mine = rec?.value || [];
+  await Promise.all(mine.map(async (s) => { const b = await db.get('blobs', s.id); if (b) mineURL.set(s.id, URL.createObjectURL(b.blob)); }));
+}
+const saveMine = () => db.put('kv', { id: 'mystickers', value: mine });
+
+// Dipanggil saat layar pembuka: siapkan daftar 3D, gambar stiker saya, dan stiker bawaan supaya panel stiker langsung tampil
+export async function preloadStickers() {
+  const decode = (src) => { const im = new Image(); im.src = src; return im.decode().catch(() => {}); };
+  const fl = await loadFluent();
+  await Promise.all([
+    ...[...mineURL.values()].slice(0, 60).map(decode),
+    ...fl.slice(0, 48).map((x) => decode(flURL('fl:' + x.f))),
+    ...Object.keys(SVG_STICKERS).map((id) => svgImageReady(id)),
+  ]);
+}
+export const isMine = (v) => typeof v === 'string' && v.startsWith('my:');
+export const mineId = (v) => v.slice(3);
+export const isEmoji = (v) => !isSvgSticker(v) && !isMine(v) && !isFluent(v);
+async function importMine(files, onProgress) {
+  let n = 0;
+  for (const f of files) {
+    const parts = await splitStickerFile(f);
+    // urutan sesuai lembar (kiri→kanan, atas→bawah), lembar terbaru di depan
+    const added = [];
+    for (const p of parts) {
+      const id = 'stk' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      await db.put('blobs', { id, blob: p.blob });
+      mineURL.set(id, URL.createObjectURL(p.blob));
+      added.push({ id, a: p.a }); n++;
+      onProgress?.(n);
+    }
+    mine = [...added, ...mine];
+  }
+  await saveMine();
+  return n;
+}
+// Paket stiker bawaan (lembar milik pengguna) — dipotong otomatis sekali saat pertama dibuka
+const BUNDLED = ['stickers/pack-girl.webp', 'stickers/pack-axolotl.webp', 'stickers/pack-words.webp',
+  'stickers/pack-frog.webp', 'stickers/pack-axolotl-pink.webp', 'stickers/pack-chick.webp', 'stickers/pack-doodle.webp', 'stickers/pack-hearts.webp'];
+export async function seedBundledStickers() {
+  // catat paket yang sudah dipotong, supaya paket baru ikut masuk tanpa menggandakan yang lama
+  const norm = (u) => u.replace(/\.(png|webp)$/, '');
+  const rec = await db.get('kv', 'stickers-seeded');
+  const done = (rec?.value === true ? BUNDLED.slice(0, 3) : Array.isArray(rec?.value) ? rec.value : []).map(norm);
+  const todo = BUNDLED.filter((u) => !done.includes(norm(u)));
+  if (!todo.length) return 0;
+  const files = [];
+  for (const url of todo) { try { const r = await fetch(url); if (r.ok) files.push(await r.blob()); } catch {} }
+  if (!files.length) return 0;
+  const before = mine.length;
+  await importMine(files.reverse());
+  await db.put('kv', { id: 'stickers-seeded', value: [...done, ...todo.map(norm)] });
+  return mine.length - before;
+}
+async function removeMine(id) {
+  // gambar tetap disimpan agar stiker yang sudah ditempel tidak hilang; hanya dikeluarkan dari daftar
+  mine = mine.filter((s) => s.id !== id); await saveMine();
+}
+
+export function stickerURL(id) { return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(SVG_STICKERS[id]); }
+export function isSvgSticker(v) { return v in SVG_STICKERS; }
+// rasio lebar:tinggi stiker
+export function stickerAspect(v) {
+  if (isMine(v)) return mine.find((s) => s.id === mineId(v))?.a || 1;
+  const m = SVG_STICKERS[v]?.match(/viewBox="0 0 (\d+) (\d+)"/);
+  return m ? +m[1] / +m[2] : 1;
+}
+
+// HTML untuk satu stiker (dipakai di popup catatan & pemilih)
+export function stickerHTML(v) {
+  if (isFluent(v)) return `<img src="${flURL(v)}" alt="" loading="lazy" draggable="false">`;
+  if (isMine(v)) return `<img src="${mineURL.get(mineId(v)) || ''}" data-blob="${mineId(v)}" alt="" loading="lazy" draggable="false">`;
+  return isSvgSticker(v) ? `<img src="${stickerURL(v)}" alt="" draggable="false">` : `<span class="emo">${esc(v)}</span>`;
+}
+// muat gambar stiker-saya yang belum ada URL-nya (mis. setelah pulihkan cadangan)
+export async function hydrateMine(root) {
+  for (const img of root.querySelectorAll('img[data-blob]')) {
+    if (img.getAttribute('src')) continue;
+    const id = img.dataset.blob;
+    if (!mineURL.has(id)) { const b = await db.get('blobs', id); if (b) mineURL.set(id, URL.createObjectURL(b.blob)); }
+    img.src = mineURL.get(id) || '';
+  }
+}
+
+// Gambar stiker di canvas (emoji via teks, SVG via gambar yang dicache)
+const svgImgs = new Map();
+export function svgImage(id, onload) {
+  let e = svgImgs.get(id);
+  if (!e) {
+    const img = new Image(); e = { img, ok: false, waiters: [] };
+    img.onload = () => { e.ok = true; e.waiters.splice(0).forEach((f) => f()); };
+    img.src = stickerURL(id); svgImgs.set(id, e);
+  }
+  if (!e.ok && onload) e.waiters.push(onload);
+  return e.ok ? e.img : null;
+}
+export function svgImageReady(id) { return new Promise((r) => { const im = svgImage(id, () => r(svgImage(id))); if (im) r(im); }); }
+
+// Panel pemilih stiker (tab kategori). onPick(v)
+let lastTab = null;
+let flQuery = '', flGroup = 'Semua';
+async function drawFluent(container, onPick) {
+  const idx = await loadFluent();
+  const groups = ['Semua', ...new Set(idx.map((x) => x.g))];
+  const gEl = container.querySelector('.fl-groups'), grid = container.querySelector('.fl-grid'), q = container.querySelector('.fl-q');
+  if (!gEl) return;
+  gEl.innerHTML = groups.map((g) => `<button class="stk-tab ${g === flGroup ? 'on' : ''}" data-g="${esc(g)}">${esc(g)}</button>`).join('');
+  let limit = 96;
+  const filtered = () => {
+    const words = flQuery.toLowerCase().split(/\s+/).filter(Boolean);
+    return idx.filter((x) => (flGroup === 'Semua' || x.g === flGroup) && words.every((w) => x.n.includes(w) || x.k.includes(w)));
+  };
+  const fill = () => {
+    const list = filtered();
+    grid.innerHTML = list.slice(0, limit).map((x) => `<button class="stk" data-v="fl:${x.f}" title="${esc(x.n)}">${stickerHTML('fl:' + x.f)}</button>`).join('') || '<div class="stk-empty">Tidak ditemukan.</div>';
+    $$('[data-v]', grid).forEach((b) => b.onclick = (e) => { e.stopPropagation(); playStickerPop(); b.animate([{ transform: 'scale(1)' }, { transform: 'scale(1.35) rotate(-8deg)' }, { transform: 'scale(1)' }], { duration: 300, easing: 'cubic-bezier(.34,1.56,.64,1)' }); onPick(b.dataset.v); });
+  };
+  grid.onscroll = () => { if (grid.scrollTop + grid.clientHeight > grid.scrollHeight - 80) { const n = filtered().length; if (limit < n) { limit += 96; fill(); } } };
+  $$('[data-g]', gEl).forEach((b) => b.onclick = (e) => { e.stopPropagation(); flGroup = b.dataset.g; limit = 96; $$('[data-g]', gEl).forEach((x) => x.classList.toggle('on', x === b)); fill(); grid.scrollTop = 0; });
+  q.oninput = () => { flQuery = q.value; limit = 96; fill(); grid.scrollTop = 0; };
+  q.onclick = (e) => e.stopPropagation();
+  fill();
+}
+export function stickerPicker(container, onPick, { extra = '' } = {}) {
+  let tab = lastTab || (mine.length ? MINE : 'Stiker');
+  let manage = false;
+  const draw = () => {
+    lastTab = tab;
+    let grid;
+    if (tab === FL) {
+      container.innerHTML = `<div class="stk-tabs">${Object.keys(TABS).map((t) => `<button class="stk-tab ${t === tab ? 'on' : ''}" data-tab="${t}">${t}</button>`).join('')}${extra}</div>
+        <div class="fl-bar"><input class="inp fl-q" placeholder="Cari: cat, heart, cake, book…" value="${esc(flQuery)}"></div>
+        <div class="stk-tabs fl-groups"></div><div class="stk-grid fl-grid"></div>`;
+      $$('[data-tab]', container).forEach((b) => b.onclick = (e) => { e.stopPropagation(); tab = b.dataset.tab; manage = false; draw(); });
+      drawFluent(container, onPick);
+      return;
+    }
+    if (tab === MINE) {
+      grid = `<div class="stk-mine-bar">
+          <button class="stk-import" data-import>＋ Impor stiker</button>
+          ${mine.length ? `<button class="stk-manage ${manage ? 'on' : ''}" data-manage>${manage ? 'Selesai' : 'Atur'}</button>` : ''}
+          <span class="stk-hint">Gambar PNG atau lembar berisi banyak stiker; dipotong otomatis.</span></div>
+        <div class="stk-grid big ${manage ? 'managing' : ''}">${mine.map((s) => `<button class="stk" data-v="my:${s.id}">${stickerHTML('my:' + s.id)}${manage ? `<i class="stk-x">${ICON.close}</i>` : ''}</button>`).join('') || '<div class="stk-empty">Belum ada stiker. Impor gambar stikermu sendiri.</div>'}</div>`;
+    } else {
+      grid = `<div class="stk-grid ${tab === 'Stiker' ? 'big' : ''}">${(tab === 'Stiker' ? Object.keys(SVG_STICKERS) : TABS[tab]).map((v) => `<button class="stk" data-v="${esc(v)}">${stickerHTML(v)}</button>`).join('')}</div>`;
+    }
+    container.innerHTML = `<div class="stk-tabs">${Object.keys(TABS).map((t) => `<button class="stk-tab ${t === tab ? 'on' : ''}" data-tab="${t}">${t}</button>`).join('')}${extra}</div>${grid}`;
+    $$('[data-tab]', container).forEach((b) => b.onclick = (e) => { e.stopPropagation(); tab = b.dataset.tab; manage = false; draw(); });
+    $$('[data-v]', container).forEach((b) => b.onclick = async (e) => {
+      e.stopPropagation();
+      if (manage) { await removeMine(mineId(b.dataset.v)); draw(); return; }
+      b.animate([{ transform: 'scale(1)' }, { transform: 'scale(1.35) rotate(-8deg)' }, { transform: 'scale(1)' }], { duration: 300, easing: 'cubic-bezier(.34,1.56,.64,1)' });
+      playStickerPop();
+      onPick(b.dataset.v);
+    });
+    container.querySelector('[data-manage]')?.addEventListener('click', (e) => { e.stopPropagation(); manage = !manage; draw(); });
+    container.querySelector('[data-import]')?.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const files = await pickFile('image/*', true); if (!files?.length) return;
+      const btn = container.querySelector('[data-import]'); if (btn) btn.textContent = 'Memotong stiker…';
+      try {
+        const n = await importMine(files, (k) => { const b2 = container.querySelector('[data-import]'); if (b2) b2.textContent = `Memotong… ${k}`; });
+        toast(n ? `${n} stiker ditambahkan` : 'Tidak ada stiker yang ditemukan');
+      } catch (err) { console.error(err); toast('Gagal mengimpor gambar'); }
+      tab = MINE; draw();
+    });
+  };
+  draw();
+}

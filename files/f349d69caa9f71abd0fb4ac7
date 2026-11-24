@@ -1,0 +1,79 @@
+// To-do list sederhana.
+import { db } from './db.js';
+import { reschedule } from './notify.js';
+import { playCheckChime } from './sound.js';
+import { $, $$, esc, uid, ICON, parseYmd, longDate, ymd, openSheet, closeSheet, toast, confirmDialog } from './ui.js';
+
+let todos = [];
+let root;
+
+export async function initTodo(el) {
+  root = el;
+  todos = await db.all('todos');
+  root.innerHTML = `
+    <div class="topbar"><div class="title">To-do</div><div class="spacer"></div>
+      <button class="ib" id="t-clear" title="Hapus yang selesai">${ICON.trash}</button></div>
+    <div class="scroll"><div class="pad" id="t-list"></div></div>
+    <button class="fab" id="t-fab" title="Tugas baru">${ICON.plus}</button>`;
+  $('#t-fab', root).onclick = () => edit();
+  $('#t-clear', root).onclick = async () => {
+    const done = todos.filter((t) => t.done); if (!done.length) return toast('Belum ada tugas selesai');
+    if (!(await confirmDialog(`Hapus ${done.length} tugas yang sudah selesai?`, { ok: 'Hapus', danger: true }))) return;
+    await db.delMany('todos', done.map((t) => t.id)); todos = todos.filter((t) => !t.done); render(); reschedule();
+  };
+  $('#t-list', root).addEventListener('click', async (e) => {
+    const row = e.target.closest('.row'); if (!row) return;
+    const t = todos.find((x) => x.id === row.dataset.id);
+    if (e.target.closest('.check')) {
+      t.done = !t.done; t.doneAt = t.done ? Date.now() : 0;
+      if (t.done) playCheckChime();
+      await db.put('todos', t); render(); reschedule();
+    }
+    else edit(t);
+  });
+  render();
+}
+export const todoCount = () => todos.filter((t) => !t.done).length;
+export const todosDue = (key) => todos.filter((t) => t.due === key);
+export async function toggleTodo(id) {
+  const t = todos.find((x) => x.id === id); if (!t) return;
+  t.done = !t.done; t.doneAt = t.done ? Date.now() : 0;
+  await db.put('todos', t); render(); reschedule();
+}
+
+function render() {
+  const today = ymd(new Date());
+  const open = todos.filter((t) => !t.done).sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999') || a.created - b.created);
+  const done = todos.filter((t) => t.done).sort((a, b) => b.doneAt - a.doneAt);
+  const row = (t) => `
+    <div class="row click ${t.done ? 'done' : ''}" data-id="${t.id}">
+      <button class="check">${t.done ? ICON.check : ''}</button>
+      <div class="grow"><div class="ttl">${esc(t.title)}</div>
+        ${t.due ? `<div class="sub" style="${!t.done && t.due < today ? 'color:var(--danger)' : ''}">${t.due < today && !t.done ? 'Terlambat · ' : ''}${longDate(parseYmd(t.due))}</div>` : ''}
+        ${t.note ? `<div class="sub">${esc(t.note)}</div>` : ''}</div>
+    </div>`;
+  $('#t-list', root).innerHTML = !todos.length ? '<div class="empty">Belum ada tugas.<br>Ketuk + untuk menambah.</div>' :
+    (open.length ? `<div class="h2">Belum selesai · ${open.length}</div>${open.map(row).join('')}` : '') +
+    (done.length ? `<div class="h2">Selesai · ${done.length}</div>${done.map(row).join('')}` : '');
+}
+
+function edit(t) {
+  const isNew = !t;
+  t = t || { title: '', due: '', note: '' };
+  const s = openSheet(`<h3>${isNew ? 'Tugas baru' : 'Ubah tugas'}</h3>
+    <div class="field"><label>Tugas</label><input class="inp" id="td-t" value="${esc(t.title)}" placeholder="Mis. Kumpulkan laporan askep"></div>
+    <div class="field"><label>Tenggat (opsional)</label><input class="inp" id="td-d" type="date" value="${t.due || ''}"></div>
+    <div class="field"><label>Catatan</label><input class="inp" id="td-n" value="${esc(t.note || '')}"></div>
+    <div class="actions">${isNew ? '' : '<button class="btn danger left" id="td-del">Hapus</button>'}<button class="btn ghost" id="td-c">Batal</button><button class="btn primary" id="td-ok">Simpan</button></div>`, { guardForm: true, onSave: () => submit() });
+  if (isNew) setTimeout(() => $('#td-t', s).focus(), 40);
+  $('#td-c', s).onclick = () => closeSheet();
+  if (!isNew) $('#td-del', s).onclick = async () => { await db.del('todos', t.id); todos = todos.filter((x) => x !== t); closeSheet(); render(); reschedule(); };
+  const submit = async () => {
+    const title = $('#td-t', s).value.trim(); if (!title) return $('#td-t', s).focus();
+    Object.assign(t, { title, due: $('#td-d', s).value, note: $('#td-n', s).value.trim() });
+    if (isNew) { Object.assign(t, { id: uid(), done: false, created: Date.now() }); todos.push(t); }
+    await db.put('todos', t); closeSheet(); render(); reschedule();
+  };
+  $('#td-ok', s).onclick = submit;
+  $('#td-t', s).onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+}

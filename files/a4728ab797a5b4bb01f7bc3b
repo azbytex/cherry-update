@@ -1,0 +1,194 @@
+// Pemilih warna Cherry: menggantikan semua <input type="color"> di aplikasi.
+// Tab "Palet warna": kotak saturasi/kecerahan, slider hue & transparansi, pipet, Hex + %, simpan warna.
+// Tab "Set warna": kumpulan warna siap pakai.
+import { settings, saveSettings } from './db.js';
+import { toast } from './ui.js';
+
+const SETS = [
+  { name: 'Cherry', c: ['#fe0000', '#ff4d6d', '#ff8fa3', '#ffccd5', '#c9184a', '#800f2f', '#590d22', '#fff0f3'] },
+  { name: 'Pastel', c: ['#ffadad', '#ffd6a5', '#fdffb6', '#caffbf', '#9bf6ff', '#a0c4ff', '#bdb2ff', '#ffc6ff'] },
+  { name: 'Alam', c: ['#606c38', '#283618', '#fefae0', '#dda15e', '#bc6c25', '#8d6e63', '#a3b18a', '#344e41'] },
+  { name: 'Laut', c: ['#03045e', '#023e8a', '#0077b6', '#0096c7', '#00b4d8', '#48cae4', '#90e0ef', '#caf0f8'] },
+  { name: 'Neon', c: ['#f72585', '#b5179e', '#7209b7', '#3a0ca3', '#4361ee', '#4cc9f0', '#39ff14', '#ffea00'] },
+  { name: 'Senja', c: ['#ff7b00', '#ff8800', '#ff9500', '#ffa200', '#ffaa00', '#ffb700', '#ffc300', '#ffd000'] },
+  { name: 'Monokrom', c: ['#000000', '#212529', '#495057', '#6c757d', '#adb5bd', '#ced4da', '#e9ecef', '#ffffff'] },
+];
+const BASE = ['#2b2b2e', '#b3373a', '#2f54b5', '#0b7a55', '#e0a106', '#ffffff', '#ffe11a', '#f49ac1', '#7b4b3a', '#e53935', '#9c27b0', '#00bcd4'];
+
+// ---------- konversi warna ----------
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+function hsv2rgb(h, s, v) { const f = (n) => { const k = (n + h / 60) % 6; return v - v * s * Math.max(0, Math.min(k, 4 - k, 1)); }; return [f(5), f(3), f(1)].map((x) => Math.round(x * 255)); }
+function rgb2hsv(r, g, b) { r /= 255; g /= 255; b /= 255; const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn; let h = 0; if (d) h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4; return [(h * 60 + 360) % 360, mx ? d / mx : 0, mx]; }
+const hex2 = (n) => n.toString(16).padStart(2, '0');
+function parseHex(h) {
+  h = String(h || '').trim().replace('#', '');
+  if (/^[0-9a-f]{3}$/i.test(h)) h = h.split('').map((c) => c + c).join('');
+  if (!/^[0-9a-f]{6}([0-9a-f]{2})?$/i.test(h)) return null;
+  return { rgb: [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)), a: h.length === 8 ? parseInt(h.slice(6), 16) / 255 : 1 };
+}
+
+let P = null; // panel aktif
+const saved = () => (settings.savedColors ||= []);
+
+function open(input) {
+  close(false);
+  const p0 = parseHex(input.value) || { rgb: [0, 0, 0], a: 1 };
+  const [h, s, v] = rgb2hsv(...p0.rgb);
+  const el = document.createElement('div');
+  el.className = 'cpk';
+  el.innerHTML = `
+    <div class="cpk-tabs"><button data-tab="pal" class="on">Palet warna</button><button data-tab="set">Set warna</button><i class="cpk-ink"></i></div>
+    <div class="cpk-pane" data-pane="pal">
+      <div class="cpk-sv"><div class="cpk-svk"></div></div>
+      <div class="cpk-row">
+        <button class="cpk-drop" title="Ambil warna dari halaman"><svg viewBox="0 0 24 24"><path d="M14.5 4.5l5 5M17 2.5l4.5 4.5-3 3-4.5-4.5zM14 7l-9 9-1 4 4-1 9-9"/></svg></button>
+        <div class="cpk-sliders"><div class="cpk-hue"><i></i></div><div class="cpk-alpha"><b></b><i></i></div></div>
+      </div>
+      <div class="cpk-row cpk-io">
+        <span class="cpk-lbl">Hex</span>
+        <div class="cpk-field"><input class="cpk-hex" maxlength="7" spellcheck="false"><input class="cpk-pct" maxlength="4" inputmode="numeric"></div>
+        <button class="cpk-save" title="Simpan warna ini"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg></button>
+      </div>
+      <div class="cpk-grid cpk-mine"></div>
+    </div>
+    <div class="cpk-pane" data-pane="set" hidden>${SETS.map((st) => `<div class="cpk-set"><span>${st.name}</span><div class="cpk-grid">${st.c.map((c) => `<button class="cpk-sw" data-c="${c}" style="--c:${c}"></button>`).join('')}</div></div>`).join('')}</div>`;
+  document.body.appendChild(el);
+  P = { el, input, h, s, v, a: p0.a, start: input.value };
+
+  // posisi: di bawah tombol warna (atau di atasnya kalau tidak muat), tidak keluar layar
+  const anchor = input.closest('label') || input;
+  const ar = anchor.getBoundingClientRect(), W = el.offsetWidth, H = el.offsetHeight, m = 10;
+  let left = ar.left + ar.width / 2 - W / 2, top = ar.bottom + 8;
+  if (top + H > innerHeight - m) top = Math.max(m, ar.top - H - 8);
+  el.style.left = clamp(left, m, innerWidth - W - m) + 'px';
+  el.style.top = clamp(top, m, Math.max(m, innerHeight - H - m)) + 'px';
+  el.style.transformOrigin = `${clamp(ar.left + ar.width / 2 - parseFloat(el.style.left), 0, W)}px ${top > ar.top ? 0 : H}px`;
+
+  const q = (s) => el.querySelector(s);
+  const sv = q('.cpk-sv'), hue = q('.cpk-hue'), alpha = q('.cpk-alpha'), hex = q('.cpk-hex'), pct = q('.cpk-pct');
+  const paint = (skipText) => {
+    const rgb = hsv2rgb(P.h, P.s, P.v), base = '#' + rgb.map(hex2).join('');
+    sv.style.background = `linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, hsl(${P.h},100%,50%))`;
+    q('.cpk-svk').style.cssText = `left:${P.s * 100}%;top:${(1 - P.v) * 100}%;background:${base}`;
+    q('.cpk-hue i').style.cssText = `left:${P.h / 360 * 100}%;background:hsl(${P.h},100%,50%)`;
+    q('.cpk-alpha b').style.background = `linear-gradient(to right, transparent, ${base})`;
+    q('.cpk-alpha i').style.cssText = `left:${P.a * 100}%;background:${base}`;
+    q('.cpk-save').style.background = P.a < 1 ? `linear-gradient(${colorStr()},${colorStr()}), repeating-conic-gradient(#ccc 0 25%, #fff 0 50%) 0 0/10px 10px` : base;
+    q('.cpk-save').style.color = P.v > 0.7 && P.s < 0.35 ? '#222' : '#fff';
+    if (!skipText) { hex.value = base.slice(1).toUpperCase(); pct.value = Math.round(P.a * 100) + '%'; }
+  };
+  const colorStr = () => { const rgb = hsv2rgb(P.h, P.s, P.v); return '#' + rgb.map(hex2).join('') + (P.a < 1 ? hex2(Math.round(P.a * 255)) : ''); };
+  // kirim ke input asli: 'input' saat digeser, 'change' saat selesai
+  const emit = (commit) => {
+    const c = colorStr();
+    if (c.length > 7 && input.type === 'color') input.type = 'text';
+    if (c.length === 7 && input.type === 'text' && input.dataset.cpkWas === 'color') input.type = 'color';
+    input.value = c;
+    const lab = input.closest('label'); if (lab && lab.classList.contains('ms-any')) lab.style.background = c;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    if (commit) input.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  P.emit = emit;
+  const drag = (node, fn) => node.addEventListener('pointerdown', (e) => {
+    e.preventDefault(); node.setPointerCapture(e.pointerId);
+    const go = (ev) => { const r = node.getBoundingClientRect(); fn(clamp((ev.clientX - r.left) / r.width), clamp((ev.clientY - r.top) / r.height)); paint(); emit(false); };
+    go(e);
+    node.onpointermove = go;
+    node.onpointerup = node.onpointercancel = () => { node.onpointermove = null; emit(true); };
+  });
+  drag(sv, (x, y) => { P.s = x; P.v = 1 - y; });
+  drag(hue, (x) => { P.h = x * 359.9; });
+  drag(alpha, (x) => { P.a = Math.round(x * 100) / 100; });
+  hex.oninput = () => { const p = parseHex(hex.value); if (!p) return; [P.h, P.s, P.v] = rgb2hsv(...p.rgb); paint(true); emit(false); };
+  hex.onchange = () => { paint(); emit(true); };
+  pct.onchange = () => { const n = parseFloat(pct.value); if (!isNaN(n)) P.a = clamp(n / 100); paint(); emit(true); };
+  for (const i of [hex, pct]) i.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); i.blur(); } };
+
+  const pick = (c) => { const p = parseHex(c); if (!p) return; [P.h, P.s, P.v] = rgb2hsv(...p.rgb); P.a = p.a; paint(); emit(true); };
+  const drawMine = () => {
+    const list = [...saved(), ...BASE.filter((c) => !saved().includes(c))].slice(0, 24);
+    q('.cpk-mine').innerHTML = list.map((c) => `<button class="cpk-sw ${saved().includes(c) ? 'mine' : ''}" data-c="${c}" style="--c:${c}"></button>`).join('');
+    q('.cpk-mine').querySelectorAll('.cpk-sw').forEach(bindSw);
+  };
+  const bindSw = (b) => {
+    let t = 0, long = false;
+    b.onpointerdown = () => { long = false; if (b.classList.contains('mine')) t = setTimeout(() => { long = true; settings.savedColors = saved().filter((x) => x !== b.dataset.c); saveSettings(); drawMine(); toast('Warna dihapus dari simpanan'); }, 550); };
+    b.onpointerup = b.onpointerleave = () => clearTimeout(t);
+    b.onclick = () => { if (!long) pick(b.dataset.c); };
+  };
+  el.querySelectorAll('[data-pane="set"] .cpk-sw').forEach(bindSw);
+  q('.cpk-save').onclick = () => {
+    const c = colorStr(); settings.savedColors = [c, ...saved().filter((x) => x !== c)].slice(0, 18); saveSettings(); drawMine();
+    toast('Warna disimpan. Tahan lama untuk menghapus.');
+  };
+  // tab dengan garis bawah yang meluncur
+  const ink = q('.cpk-ink');
+  const setTab = (t) => {
+    el.querySelectorAll('.cpk-tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === t));
+    el.querySelectorAll('.cpk-pane').forEach((p) => (p.hidden = p.dataset.pane !== t));
+    const b = q(`.cpk-tabs [data-tab="${t}"]`); ink.style.cssText = `left:${b.offsetLeft}px;width:${b.offsetWidth}px`;
+  };
+  el.querySelectorAll('.cpk-tabs button').forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
+  requestAnimationFrame(() => setTab('pal'));
+  // pipet: ketuk di mana saja pada halaman untuk mengambil warnanya
+  q('.cpk-drop').onclick = () => {
+    el.classList.add('peek');
+    toast('Ketuk bagian halaman untuk mengambil warnanya');
+    const grab = (e) => {
+      document.removeEventListener('pointerdown', grab, true);
+      e.preventDefault(); e.stopImmediatePropagation();
+      el.classList.remove('peek');
+      const c = sampleAt(e.clientX, e.clientY);
+      if (c) pick(c); else toast('Tidak ada warna di titik itu');
+      swallowNext();
+    };
+    setTimeout(() => document.addEventListener('pointerdown', grab, true), 0);
+  };
+  drawMine(); paint();
+  el.classList.add('in');
+}
+// warna di titik layar: dari kanvas halaman (tinta di atas kertas)
+function sampleAt(x, y) {
+  const els = document.elementsFromPoint(x, y).filter((n) => n.tagName === 'CANVAS');
+  for (const c of els) {
+    try {
+      const r = c.getBoundingClientRect(), px = Math.floor((x - r.left) * c.width / r.width), py = Math.floor((y - r.top) * c.height / r.height);
+      const d = c.getContext('2d').getImageData(px, py, 1, 1).data;
+      if (d[3] > 20) return '#' + [d[0], d[1], d[2]].map(hex2).join('');
+    } catch {}
+  }
+  return null;
+}
+function swallowNext() { const k = (e) => { e.stopImmediatePropagation(); e.preventDefault(); }; document.addEventListener('click', k, { capture: true, once: true }); setTimeout(() => document.removeEventListener('click', k, true), 600); }
+function close(commit = true) {
+  if (!P) return;
+  const { el } = P; P = null;
+  el.classList.remove('in'); el.classList.add('out');
+  setTimeout(() => el.remove(), 220);
+}
+
+// ambil alih semua input warna
+export function initColorPicker() {
+  document.addEventListener('click', (e) => {
+    const inp = e.target.closest?.('input[type=color], input[data-cpk-was]');
+    if (!inp) return;
+    e.preventDefault(); e.stopPropagation();
+    if (!inp.dataset.cpkWas) inp.dataset.cpkWas = 'color';
+    open(inp);
+  }, true);
+  // label yang membungkus input: klik label → buka panel, bukan pemilih bawaan
+  document.addEventListener('click', (e) => {
+    const lab = e.target.closest?.('label'); if (!lab || e.target.tagName === 'INPUT') return;
+    const inp = lab.querySelector('input[type=color], input[data-cpk-was]'); if (!inp) return;
+    e.preventDefault(); e.stopPropagation();
+    if (!inp.dataset.cpkWas) inp.dataset.cpkWas = 'color';
+    open(inp);
+  }, true);
+  // ketuk di luar panel = tutup (ketukan itu tidak menekan yang lain)
+  document.addEventListener('pointerdown', (e) => {
+    if (!P || P.el.contains(e.target) || P.el.classList.contains('peek')) return;
+    if (e.target.closest('input[type=color], input[data-cpk-was]') || e.target.closest('label')?.querySelector('input[type=color], input[data-cpk-was]')) return;
+    e.preventDefault(); e.stopImmediatePropagation(); close(); swallowNext();
+  }, true);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && P) close(); });
+}

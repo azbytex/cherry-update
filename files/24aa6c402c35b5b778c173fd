@@ -1,0 +1,98 @@
+// Memotong lembar stiker jadi stiker satu-satu dan menghapus latar putih.
+// Bekerja sepenuhnya di perangkat (tanpa internet).
+
+const isBg = (d, i) => d[i + 3] < 24 || (d[i] > 232 && d[i + 1] > 232 && d[i + 2] > 232);
+
+// Kembalikan daftar kotak {x,y,w,h} tiap stiker di gambar
+function findStickers(data, W, H) {
+  const CELL = Math.max(4, Math.round(Math.max(W, H) / 250)), sc = CELL / 4, gw = Math.ceil(W / CELL), gh = Math.ceil(H / CELL);
+  const on = new Uint8Array(gw * gh);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (!isBg(data, (y * W + x) * 4)) on[((y / CELL) | 0) * gw + ((x / CELL) | 0)] = 1;
+  }
+  // lebarkan sedikit supaya bagian kecil (kilau, coretan) menyatu dengan stikernya
+  const R = 4;
+  const dil = new Uint8Array(gw * gh);
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    if (!on[y * gw + x]) continue;
+    for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+      const yy = y + dy, xx = x + dx;
+      if (yy >= 0 && yy < gh && xx >= 0 && xx < gw) dil[yy * gw + xx] = 1;
+    }
+  }
+  const label = new Int32Array(gw * gh).fill(-1);
+  const boxes = [];
+  const stack = [];
+  for (let s = 0; s < gw * gh; s++) {
+    if (!dil[s] || label[s] >= 0) continue;
+    const id = boxes.length;
+    let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1, count = 0;
+    stack.push(s); label[s] = id;
+    while (stack.length) {
+      const c = stack.pop(), cx = c % gw, cy = (c / gw) | 0;
+      if (on[c]) { count++; if (cx < x0) x0 = cx; if (cy < y0) y0 = cy; if (cx > x1) x1 = cx; if (cy > y1) y1 = cy; }
+      for (const n of [c - 1, c + 1, c - gw, c + gw]) {
+        if (n < 0 || n >= gw * gh || label[n] >= 0 || !dil[n]) continue;
+        if ((n === c - 1 && cx === 0) || (n === c + 1 && cx === gw - 1)) continue;
+        label[n] = id; stack.push(n);
+      }
+    }
+    if (count) boxes.push({ x: x0 * CELL, y: y0 * CELL, w: (x1 - x0 + 1) * CELL, h: (y1 - y0 + 1) * CELL, count });
+  }
+  // buang serpihan kecil
+  const big = boxes.filter((b) => b.w >= 28 * sc && b.h >= 20 * sc && b.count >= 12);
+  return big.sort((a, b) => (Math.abs(a.y - b.y) < 40 * sc ? a.x - b.x : a.y - b.y));
+}
+
+// Hapus latar putih yang tersambung ke tepi (putih di dalam stiker, mis. mata, tetap)
+function removeBackground(ctx, w, h) {
+  const img = ctx.getImageData(0, 0, w, h), d = img.data;
+  const seen = new Uint8Array(w * h);
+  const q = [];
+  const push = (x, y) => { const i = y * w + x; if (!seen[i] && isBg(d, i * 4)) { seen[i] = 1; q.push(i); } };
+  for (let x = 0; x < w; x++) { push(x, 0); push(x, h - 1); }
+  for (let y = 0; y < h; y++) { push(0, y); push(w - 1, y); }
+  while (q.length) {
+    const i = q.pop(), x = i % w, y = (i / w) | 0;
+    d[i * 4 + 3] = 0;
+    if (x > 0) push(x - 1, y); if (x < w - 1) push(x + 1, y);
+    if (y > 0) push(x, y - 1); if (y < h - 1) push(x, y + 1);
+  }
+  // haluskan tepi: piksel terang yang menempel latar dibuat semi-transparan
+  for (let i = 0; i < w * h; i++) {
+    if (seen[i]) continue;
+    const x = i % w, y = (i / w) | 0;
+    const nearBg = (x > 0 && seen[i - 1]) || (x < w - 1 && seen[i + 1]) || (y > 0 && seen[i - w]) || (y < h - 1 && seen[i + w]);
+    if (nearBg) { const l = (d[i * 4] + d[i * 4 + 1] + d[i * 4 + 2]) / 3; if (l > 200) d[i * 4 + 3] = Math.min(d[i * 4 + 3], Math.round((255 - l) * 4)); }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+
+// file → [{ blob, a }] (a = rasio lebar/tinggi)
+export async function splitStickerFile(file, { maxSide = 360 } = {}) {
+  const bm = await createImageBitmap(file);
+  const k = Math.min(1, 2400 / Math.max(bm.width, bm.height));
+  const W = Math.round(bm.width * k), H = Math.round(bm.height * k);
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(bm, 0, 0, W, H);
+  const data = ctx.getImageData(0, 0, W, H).data;
+  let boxes = findStickers(data, W, H);
+  if (!boxes.length) boxes = [{ x: 0, y: 0, w: W, h: H }];
+  const out = [];
+  for (const b of boxes) {
+    const pad = Math.round(6 * Math.max(1, Math.max(W, H) / 1000));
+    const x = Math.max(0, b.x - pad), y = Math.max(0, b.y - pad);
+    const w = Math.min(W - x, b.w + pad * 2), h = Math.min(H - y, b.h + pad * 2);
+    const cc = document.createElement('canvas'); cc.width = w; cc.height = h;
+    const cx = cc.getContext('2d', { willReadFrequently: true });
+    cx.drawImage(c, x, y, w, h, 0, 0, w, h);
+    removeBackground(cx, w, h);
+    const s = Math.min(1, maxSide / Math.max(w, h));
+    const fc = document.createElement('canvas'); fc.width = Math.round(w * s); fc.height = Math.round(h * s);
+    const fx = fc.getContext('2d'); fx.imageSmoothingQuality = 'high'; fx.drawImage(cc, 0, 0, fc.width, fc.height);
+    const blob = await new Promise((r) => fc.toBlob(r, 'image/webp', 0.92));
+    out.push({ blob, a: w / h });
+  }
+  return out;
+}

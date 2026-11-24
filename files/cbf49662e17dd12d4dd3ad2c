@@ -1,0 +1,240 @@
+// Bahasa aplikasi: Indonesia (bawaan) atau English.
+// Teks di kode tetap berbahasa Indonesia. Saat English dipilih, teks yang tampil di layar diterjemahkan
+// lewat kamus di bawah (cocok persis) dan pola (teks yang mengandung angka/nama).
+import { settings } from './db.js';
+import { MONTHS, MONTHS_LONG, DAYS, DAYS_LONG } from './ui.js';
+
+export const LANGS = { id: 'Bahasa Indonesia', en: 'English' };
+export const lang = () => (settings.lang === 'en' ? 'en' : 'id');
+
+const MONTHS_EN = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const MONTHS_ID = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+const DAYS_EN = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const DAYS_ID = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+
+const EN = {
+  // navigasi & umum
+  'Kalender': 'Calendar', 'Catatan': 'Notes', 'To-do': 'To-do', 'Saya': 'Me', 'Baru': 'New', 'Batal': 'Cancel', 'Simpan': 'Save',
+  'Hapus': 'Delete', 'Tutup': 'Close', 'Buka': 'Open', 'Ya': 'Yes', 'Tidak': 'No', 'Kembali': 'Back', 'Selesai': 'Done',
+  'Konfirmasi': 'Confirm', 'Terapkan': 'Apply', 'Buat': 'Create', 'Cari': 'Search', 'Lainnya': 'More', 'Semua': 'All',
+  'Tampilkan': 'Show', 'Sembunyikan': 'Hide', 'Aktif': 'On', 'Mati': 'Off', 'Urungkan': 'Undo', 'Ulangi': 'Repeat', 'Buang': 'Discard',
+  'Menyiapkan…': 'Preparing…', 'Menyimpan…': 'Saving…', 'Tekan sekali lagi untuk keluar': 'Press back again to exit',
+  'Tanpa judul': 'Untitled', 'Judul': 'Title', 'Tanggal': 'Date', 'Warna': 'Color', 'Hari ini': 'Today', 'Besok': 'Tomorrow',
+  'Bulan': 'Month', 'Font': 'Font', 'Pilih font': 'Choose font', 'Bawaan': 'Default', 'Warna lain': 'Other color', 'Warna apa saja': 'Any color',
+  'Tidak bisa membuka': "Can't open", 'Geser': 'Move', 'Putar': 'Rotate', 'Teks': 'Text', 'Atur': 'Manage',
+
+  // kalender
+  'Acara': 'Events', '+ Acara': '+ Event', 'Acara baru': 'New event', 'Ubah acara': 'Edit event', 'Tambah acara': 'Add event',
+  'Acara ditambahkan': 'Event added', 'Acara diperbarui': 'Event updated', 'Acara dihapus': 'Event deleted', 'Acara hari ini': "Today's event",
+  'Acara mendatang': 'Upcoming events', 'Agenda mendatang': 'Upcoming agenda', 'Agenda 90 hari ke depan': 'Agenda for the next 90 days',
+  'Belum ada acara': 'No events yet', 'Belum ada acara di hari ini': 'No events on this day', 'Belum ada acara mendatang.': 'No upcoming events.',
+  'Tidak ada acara.': 'No events.', 'Tidak ada acara di file itu': 'No events in that file', 'Ada catatan': 'Has notes',
+  'Mulai (opsional)': 'Start (optional)', 'Selesai (opsional)': 'End (optional)', 'Sepanjang hari': 'All day',
+  'Tidak berulang': 'Does not repeat', 'Setiap hari': 'Every day', 'Setiap minggu': 'Every week', 'Setiap bulan': 'Every month', 'Setiap tahun': 'Every year',
+  'Ingatkan': 'Remind me', 'Saat mulai': 'At start time', '10 menit sebelumnya': '10 minutes before', '30 menit sebelumnya': '30 minutes before',
+  '1 jam sebelumnya': '1 hour before', '1 hari sebelumnya': '1 day before', 'Mis. Ujian, praktik, deadline tugas': 'e.g. Exam, lab, assignment deadline',
+  'Tulis catatan': 'Write a note', 'Buka catatan hari ini': "Open today's note", 'Ke hari ini': 'Go to today',
+  'Bulan sebelumnya': 'Previous month', 'Bulan berikutnya': 'Next month', 'Hari sebelumnya': 'Previous day', 'Hari berikutnya': 'Next day',
+  'Ekspor kalender (.ics)': 'Export calendar (.ics)', 'Impor kalender (.ics)': 'Import calendar (.ics)',
+  'Sesuaikan kalender': 'Customize calendar', 'Warna, awal minggu, gaya tanggal & acara': 'Colors, week start, date & event style',
+  'Minggu dimulai hari': 'Week starts on', 'Nomor minggu': 'Week numbers', 'Tanggal bulan lain': 'Other months’ dates',
+  'Hari Minggu merah': 'Red Sundays', 'Penanda hari ini': 'Today marker', 'Tampilan acara': 'Event style', 'Blok penuh': 'Full block',
+  'Titik warna': 'Color dot', 'Label': 'Label', 'Bulat': 'Round', 'Angka besar': 'Big number', 'Monthly Plan': 'Monthly Plan',
+
+  // catatan
+  'Semua catatan': 'All notes', 'Catatan harian': 'Daily notes', 'Folder': 'Folders', 'Sampah': 'Trash', 'Harian': 'Daily',
+  'Folder baru': 'New folder', '+ Folder': '+ Folder', '+ Folder baru': '+ New folder', 'Nama folder': 'Folder name', 'Ganti nama folder': 'Rename folder',
+  'Hapus folder': 'Delete folder', 'Tanpa folder': 'No folder', 'Mis. Semester 3': 'e.g. Semester 3',
+  'Buku catatan': 'Notebooks', 'Buku catatan baru': 'New notebook', 'Buku baru': 'New notebook', 'Mis. Askep Kardiovaskular': 'e.g. Biology notes',
+  'Cari judul…': 'Search titles…', 'Ganti nama': 'Rename', 'Ganti sampul': 'Change cover', 'Pindahkan ke folder': 'Move to folder',
+  'Duplikat': 'Duplicate', 'Diduplikat': 'Duplicated', 'Ekspor ke PDF': 'Export to PDF', 'Dipindah ke Sampah': 'Moved to Trash',
+  'Dipindahkan': 'Moved', 'Pulihkan': 'Restore', 'Dipulihkan': 'Restored', 'Hapus permanen': 'Delete forever',
+  'Pulihkan dulu untuk membuka': 'Restore it first to open', 'Kosongkan sampah': 'Empty trash', 'Kosongkan': 'Empty',
+  'Sampah dikosongkan': 'Trash emptied', 'Sampah sudah kosong': 'Trash is already empty',
+  'Sampah kosong. Catatan yang kamu hapus menunggu di sini 30 hari.': 'Trash is empty. Deleted notes wait here for 30 days.',
+  'Kamera': 'Camera', 'Galeri': 'Gallery', 'Foto ditambahkan': 'Photo added', 'Hapus foto?': 'Delete photo?', 'Hapus foto': 'Delete photo',
+  'Foto ini akan dihapus dari tanggal ini.': 'This photo will be removed from this date.', 'Rata kiri / tengah / kanan': 'Align left / center / right',
+  'Belum ada foto di tanggal ini.Tambahkan dari kamera atau galeri.': 'No photos on this date yet.Add one from the camera or gallery.',
+  'Haluskan coretan':'Stroke smoothing', 'Meredam getaran tangan saat menulis dan menggambar': 'Steadies hand shake while writing and drawing',
+  'Halus': 'Smooth', 'Sangat halus': 'Very smooth', 'Pilih': 'Select', 'Pilih (ketuk untuk pilih stiker, teks, atau kotak tanggal)': 'Select (tap a sticker, text, or date cell)',
+  'Belum ada buku. Ketuk + untuk membuat buku baru.':'No notebooks yet. Tap + to create one.', 'Hapus halaman': 'Delete page',
+  'Belum ada catatan harian. Ketuk tanggal di Kalender, lalu tulis.':'No daily notes yet. Tap a date in Calendar, then write.',
+  'Impor PDF': 'Import PDF', 'Impor gambar': 'Import images', 'Mengimpor PDF': 'Importing PDF', 'Mengimpor gambar': 'Importing images',
+  'Gagal membaca PDF': "Couldn't read the PDF", 'Gagal mengimpor gambar': "Couldn't import images", 'Gagal membuat PDF': "Couldn't create the PDF",
+  'Membuat PDF': 'Creating PDF', 'Sampul': 'Cover', 'Warna sampul': 'Cover color', 'Motif sampul': 'Cover pattern', 'Pakai gambar': 'Use an image',
+  'Jenis kertas': 'Paper type', 'Warna kertas': 'Paper color', 'Polos': 'Plain', 'Bergaris': 'Lined', 'Kotak': 'Grid', 'Titik': 'Dots',
+  'Putih': 'White', 'Krem': 'Cream', 'Abu': 'Gray', 'Gelap': 'Dark', 'Garis': 'Lines', 'Pita': 'Ribbon', 'Serong': 'Diagonal',
+  'Gingham': 'Gingham', 'Polkadot': 'Polka dot', 'Hati': 'Hearts', 'Bintang': 'Stars', 'Bunga': 'Flowers', 'Ceri': 'Cherries', 'Awan': 'Clouds',
+  'Ombak': 'Waves', 'Catur': 'Checkers', 'Pelangi': 'Rainbow', 'Gradasi': 'Gradient', 'Kraft': 'Kraft', 'Kulit': 'Leather', 'Selotip': 'Tape',
+  'Pojok emas': 'Gold corner', 'Bingkai': 'Frame',
+
+  // editor
+  'Pena': 'Pen', 'Stabilo': 'Highlighter', 'Penghapus': 'Eraser', 'Bentuk (ketuk lagi untuk pilih bentuk)': 'Shape (tap again to pick a shape)',
+  'Stiker & foto': 'Stickers & photos', 'Tambah halaman': 'Add page', 'Tambah halaman Monthly Plan': 'Add Monthly Plan page',
+  'Sisipkan gambar jadi halaman': 'Insert image as page', 'Ganti kertas halaman ini': 'Change this page’s paper',
+  'Ganti kertas semua halaman': 'Change paper for all pages', 'Gaya Monthly Plan (font & warna)': 'Monthly Plan style (font & colors)',
+  'Gaya Monthly Plan': 'Monthly Plan style', 'Acak gaya': 'Shuffle style', 'Acak': 'Shuffle', 'Atur bulan (Monthly Plan)': 'Set month (Monthly Plan)',
+  'Bulan untuk Monthly Plan': 'Month for this Monthly Plan', 'Hapus halaman ini': 'Delete this page', 'Gaya disimpan': 'Style saved',
+  'Buku harus punya minimal 1 halaman': 'A notebook needs at least 1 page', 'Bagikan halaman ini sebagai gambar': 'Share this page as an image',
+  'Bagikan gambar': 'Share image', 'Menyiapkan gambar…': 'Preparing image…', 'Kembalikan tegak': 'Straighten',
+  'Mode stylus': 'Stylus mode', 'Mode stylus: jari hanya untuk geser': 'Stylus mode: fingers only move the page',
+  'Mode stylus: stylus untuk menulis. Dua jari untuk geser, zoom, dan putar.': 'Stylus mode: the stylus writes. Two fingers move, zoom, and rotate.',
+  'Jari bisa menulis. Dua jari untuk geser dan zoom.': 'Fingers can write. Two fingers move and zoom.',
+  'Bentuk tanggal': 'Date shape', 'Lingkaran': 'Circle', 'Tebal': 'Bold', 'Cincin': 'Ring', 'Lembut': 'Soft',
+  'Warna utama': 'Main color', 'Warna akhir pekan': 'Weekend color', 'Isi kotak': 'Cell fill', 'Garis kotak': 'Cell border', 'Warna angka': 'Number color',
+  'Warna (ketuk kotak warna untuk pilih warna apa saja)': 'Color (tap a swatch to pick any color)', 'Warna teks': 'Text color',
+  'Terapkan ke semua halaman Monthly Plan di buku ini': 'Apply to every Monthly Plan page in this notebook',
+  'Kotak kosong': 'Empty cell', 'Hapus catatan': 'Delete note', 'Hapus catatan di kotak ini?': 'Delete the note in this cell?',
+  'Buang perubahan catatan ini?': 'Discard changes to this note?', 'Tulis apa saja: kegiatan, catatan, daftar…': 'Write anything: plans, notes, lists…',
+  'Tebal ': 'Bold', 'Miring': 'Italic', 'Garis bawah': 'Underline', 'Coret': 'Strikethrough', 'Daftar poin': 'Bulleted list', 'Daftar nomor': 'Numbered list',
+  'Kotak centang': 'Checklist', 'Rata kiri': 'Align left', 'Rata tengah': 'Center', 'Rata kanan': 'Align right', 'Rata kiri-kanan': 'Justify',
+  'Hapus stabilo': 'Remove highlight', 'Sisipkan foto': 'Insert photo', 'Ambil foto (kamera)': 'Take photo (camera)', 'Pilih dari galeri': 'Choose from gallery',
+  'Kotak teks bebas': 'Free text box', 'Ketuk dua kali untuk edit': 'Double-tap to edit', 'Label judul': 'Heading',
+  'Buka catatan': 'Open note', '1 foto': '1 photo', 'Ketuk atau geser foto untuk melihat berikutnya': 'Tap or swipe the photo to see the next one',
+
+  // stiker
+  'Stiker': 'Stickers', 'Stiker saya': 'My stickers', '＋ Impor stiker': '＋ Import stickers', 'Lucu': 'Cute', 'Kuliah': 'Study', 'Rasa': 'Feelings',
+  'Makan': 'Food', 'Alam': 'Nature', 'Memotong stiker…': 'Cutting stickers…', 'Tidak ada stiker yang ditemukan': 'No stickers found',
+  'Belum ada stiker. Impor gambar stikermu sendiri.': 'No stickers yet. Import your own sticker images.',
+  'Gambar PNG atau lembar berisi banyak stiker; dipotong otomatis.': 'A PNG or a sheet with many stickers; cut out automatically.',
+  'Cari: cat, heart, cake, book…': 'Search: cat, heart, cake, book…', 'Wajah': 'Faces', 'Orang': 'People', 'Hewan & alam': 'Animals & nature',
+  'Makanan': 'Food', 'Tempat': 'Places', 'Aktivitas': 'Activities', 'Benda': 'Objects', 'Simbol': 'Symbols',
+
+  // to-do
+  'Tugas': 'Tasks', 'Tugas baru': 'New task', 'Ubah tugas': 'Edit task', 'Tenggat (opsional)': 'Due (optional)', 'Hapus yang selesai': 'Clear completed',
+  'Belum ada tugas selesai': 'No completed tasks yet', 'Belum ada tugas.': 'No tasks yet.', 'Ketuk + untuk menambah.': 'Tap + to add one.', 'Mis. Kumpulkan laporan askep': 'e.g. Submit the lab report', 'Tugas belum selesai': 'Unfinished tasks',
+
+  // saya
+  'Ringkasan': 'Summary', 'Total halaman': 'Total pages', 'Tampilan': 'Appearance', 'Tema': 'Theme', 'Terang': 'Light', 'Ikuti HP': 'Follow phone',
+  'Bahasa': 'Language', 'Menulis': 'Writing', 'Stylus menulis, jari menggeser dan zoom': 'The stylus writes; fingers move, zoom, and rotate',
+  'Notifikasi': 'Notifications', 'Pengingat acara': 'Event reminders', 'Sesuai pilihan "Ingatkan" di tiap acara': 'Uses each event’s "Remind me" setting',
+  'Ringkasan pagi': 'Morning summary', 'Acara & to-do hari itu, jam': 'That day’s events & to-dos, at', 'Pengingat cadangan': 'Backup reminder',
+  'Kalau sudah 30 hari belum mencadangkan': 'If you haven’t backed up in 30 days', 'Coba notifikasi': 'Test notification',
+  'Kirim contoh notifikasi sekarang': 'Send a sample notification now', 'Izinkan notifikasi untuk Cherry di pengaturan HP': 'Allow notifications for Cherry in your phone settings',
+  'Keamanan': 'Security', 'Buat PIN': 'Create PIN', 'Ganti PIN': 'Change PIN', 'Hapus PIN': 'Remove PIN',
+  'PIN untuk buku catatan yang dikunci': 'PIN for locked notebooks', 'Kunci buku catatan lewat menu buku: Kunci dengan PIN': 'Lock a notebook from its menu: Lock with PIN',
+  'Semua buku yang terkunci akan terbuka': 'All locked notebooks will be unlocked', 'Data': 'Data',
+  'Catatanmu tersimpan di HP ini saja. Buat cadangan sebelum ganti HP atau hapus aplikasi.': 'Your notes live only on this phone. Make a backup before switching phones or uninstalling.',
+  'Buat cadangan': 'Back up', 'Simpan semua catatan, kalender & to-do ke satu file': 'Save all notes, calendar & to-dos to one file',
+  'Pulihkan dari cadangan': 'Restore from backup', 'Mengganti data saat ini dengan isi file cadangan': 'Replaces current data with the backup file',
+  'Hapus semua data': 'Delete all data', 'Membuat cadangan': 'Creating backup', 'Memulihkan cadangan': 'Restoring backup', 'Cadangan dipulihkan': 'Backup restored',
+  'Gagal membuat cadangan': "Couldn't create the backup", 'File cadangan tidak valid': 'Invalid backup file', 'bukan file cadangan Cherry': 'not a Cherry backup file',
+  'Data saat ini akan diganti dengan isi file cadangan. Lanjutkan?': 'Current data will be replaced by the backup file. Continue?',
+  'Hapus SEMUA catatan, acara kalender, dan to-do? Tindakan ini tidak bisa dibatalkan.': 'Delete ALL notes, calendar events, and to-dos? This can’t be undone.',
+  'Hapus semua': 'Delete all', 'Semua data dihapus': 'All data deleted', 'Cherry 1.4': 'Cherry 1.4',
+  'Acara mendatang ': 'Upcoming events', 'Simpan atau kirim file': 'Save or send file',
+
+  // kunci PIN
+  'Kunci dengan PIN': 'Lock with PIN', 'Buka kunci': 'Unlock', 'Buku dikunci': 'Notebook locked', 'Kunci dibuka': 'Notebook unlocked',
+  'Buku terkunci': 'Notebook locked', 'Buat PIN baru': 'Create a new PIN', 'Ulangi PIN': 'Confirm PIN', 'Masukkan PIN yang sama sekali lagi': 'Enter the same PIN again',
+  'PIN tidak sama': "PINs don't match", 'PIN dibuat': 'PIN created', 'PIN salah': 'Wrong PIN', 'Masukkan PIN': 'Enter PIN', 'PIN lama': 'Current PIN',
+  'Masukkan PIN yang sekarang': 'Enter your current PIN', 'PIN dihapus': 'PIN removed', 'Terlalu banyak salah. Tunggu 30 detik.': 'Too many tries. Wait 30 seconds.',
+  'Kamu belum punya PIN. Buat PIN sekarang? Kalau lupa PIN, buku yang terkunci tidak bisa dibuka.': "You don't have a PIN yet. Create one now? If you forget it, locked notebooks can't be opened.",
+
+  // notifikasi
+  'Rencana hari ini': "Today's plan", 'Cadangkan catatanmu': 'Back up your notes', 'Mulai sekarang': 'Starting now',
+  'Sudah lebih dari 30 hari sejak cadangan terakhir.': "It's been over 30 days since your last backup.",
+  'Simpan cadangan supaya catatan aman kalau ganti HP.': 'Save a backup so your notes stay safe if you switch phones.',
+  'Notifikasi aktif. Begini tampilannya.': "Notifications are on. Here's how they look.", 'sekarang': 'now',
+  'Pengingat Cherry': 'Cherry reminders', 'Acara, rencana harian, dan cadangan': 'Events, daily plans, and backups',
+
+  // teks di kertas (canvas)
+  'JADWAL': 'SCHEDULE', 'CATATAN': 'NOTES', 'TO-DO': 'TO-DO',
+};
+
+// pola untuk teks yang mengandung angka atau nama
+const mEN = (m) => MONTHS_EN[MONTHS_ID.indexOf(m)] || m;
+const dEN = (d) => DAYS_EN[DAYS_ID.indexOf(d)] || d;
+const MON_RE = MONTHS_ID.join('|'), DAY_RE = DAYS_ID.join('|');
+const pl = (n, one, many) => `${n} ${+n === 1 ? one : many}`;
+const PATTERNS = [
+  [new RegExp(`^(${DAY_RE}), (\\d{1,2}) (${MON_RE}) (\\d{4})$`), (_, d, n, m, y) => `${dEN(d)}, ${mEN(m)} ${n}, ${y}`],
+  [new RegExp(`^(\\d{1,2}) (${MON_RE}) (\\d{4})$`), (_, n, m, y) => `${mEN(m)} ${n}, ${y}`],
+  [new RegExp(`^(${MON_RE}) (\\d{4})$`), (_, m, y) => `${mEN(m)} ${y}`],
+  [new RegExp(`^Monthly Plan (${MON_RE}) (\\d{4})$`), (_, m, y) => `Monthly Plan ${mEN(m)} ${y}`],
+  [/^(\d+) dari (\d+) foto$/, (_, a, b) => `${a} of ${b} photos`],
+  [/^Coba lagi dalam (\d+) detik$/, (_, n) => `Try again in ${n} seconds`],
+  [/^PIN salah \((\d+) kali lagi\)$/, (_, n) => `Wrong PIN (${pl(n, 'try', 'tries')} left)`],
+  [/^Masukkan PIN untuk membuka "(.*)"$/, (_, t) => `Enter your PIN to open "${t}"`],
+  [/^"(.*)" tidak akan meminta PIN lagi$/, (_, t) => `"${t}" won't ask for a PIN anymore`],
+  [/^(\d+) angka untuk mengunci catatan$/, (_, n) => `${n} digits to lock your notes`],
+  [/^(\d+) acara$/, (_, n) => pl(n, 'event', 'events')],
+  [/^(\d+) to-do$/, (_, n) => pl(n, 'to-do', 'to-dos')],
+  [/^(\d+) menit lagi$/, (_, n) => `in ${pl(n, 'minute', 'minutes')}`],
+  [/^(\d+) jam lagi$/, (_, n) => `in ${pl(n, 'hour', 'hours')}`],
+  [/^(.*) · (\d+) hlm$/, (_, a, n) => `${a} · ${n} ${+n === 1 ? 'page' : 'pages'}`],
+  [/^(\d+) catatan · (\d+) halaman · (\d+) folder$/, (_, a, b, c) => `${pl(a, 'notebook', 'notebooks')} · ${pl(b, 'page', 'pages')} · ${pl(c, 'folder', 'folders')}`],
+  [/^catatan · (\d+) halaman · (\d+) folder$/, (_, b, c) => `notebooks · ${pl(b, 'page', 'pages')} · ${pl(c, 'folder', 'folders')}`],
+  [/^Halaman (\d+) dari (\d+)$/, (_, a, b) => `Page ${a} of ${b}`],
+  [/^Halaman (\d+) ditambahkan$/, (_, a) => `Page ${a} added`],
+  [/^Hapus "(.*)" selamanya\? Tidak bisa dikembalikan\.$/, (_, t) => `Delete "${t}" forever? This can't be undone.`],
+  [/^Hapus acara "(.*)"\?$/, (_, t) => `Delete event "${t}"?`],
+  [/^Hapus folder "(.*)"\? Isinya tidak ikut terhapus, hanya dipindah ke Semua catatan\.$/, (_, t) => `Delete folder "${t}"? Its notebooks stay and move to All notes.`],
+  [/^Hapus halaman (\d+)\? Tindakan ini tidak bisa dibatalkan\.$/, (_, n) => `Delete page ${n}? This can't be undone.`],
+  [/^Hapus (\d+) catatan di Sampah selamanya\?$/, (_, n) => `Delete ${pl(n, 'notebook', 'notebooks')} in Trash forever?`],
+  [/^Hapus (\d+) tugas yang sudah selesai\?$/, (_, n) => `Delete ${pl(n, 'completed task', 'completed tasks')}?`],
+  [/^Pindahkan "(.*)"$/, (_, t) => `Move "${t}"`],
+  [/^Dipindahkan ke (.*)$/, (_, t) => `Moved to ${t}`],
+  [/^PDF diimpor \((\d+) halaman\)$/, (_, n) => `PDF imported (${pl(n, 'page', 'pages')})`],
+  [/^(\d+) gambar diimpor$/, (_, n) => `${pl(n, 'image', 'images')} imported`],
+  [/^(\d+) stiker ditambahkan$/, (_, n) => `${pl(n, 'sticker', 'stickers')} added`],
+  [/^(\d+) acara diimpor(.*)$/, (_, n, r) => `${pl(n, 'event', 'events')} imported${r}`],
+  [/^Memotong… (.*)$/, (_, r) => `Cutting… ${r}`],
+  [/^Belum selesai · (\d+)$/, (_, n) => `To do · ${n}`],
+  [/^Selesai · (\d+)$/, (_, n) => `Done · ${n}`],
+  [/^Terlambat · (.*)$/, (_, r) => `Overdue · ${trBase(r)}`],
+  [/^Mengumpulkan (.*)$/, (_, r) => `Collecting ${r}`],
+  [/^(.*) · Hari ini$/, (_, r) => `${trBase(r)} · Today`],
+  [/^(.+) · (.+)$/, (_, a, b) => { const A = trBase(a), B = trBase(b); return A !== a || B !== b ? `${A} · ${B}` : null; }],
+];
+
+function trBase(s) {
+  if (EN[s] != null) return EN[s];
+  const di = DAYS_ID.indexOf(s); if (di >= 0) return DAYS_EN[di];
+  const mi = MONTHS_ID.indexOf(s); if (mi >= 0) return MONTHS_EN[mi];
+  for (const [re, fn] of PATTERNS) { const m = s.match(re); if (m) { const r = fn(...m); if (r != null) return r; } }
+  return s;
+}
+// terjemahkan satu teks (dipakai juga untuk notifikasi, nama file, dan tulisan di kertas)
+export function tr(s) { if (lang() !== 'en' || typeof s !== 'string') return s; const t = s.trim(); if (!t) return s; const r = trBase(t); return r === t ? s : s.replace(t, r); }
+
+// ---------- Terjemahan layar ----------
+const SKIP = 'script,style,textarea,[contenteditable="true"],.rn-body,.rn-txt,.text-input,.name,.ev-title,.dp-title,.nb-title,.nb-body,.td-title,.pv-title,.label,.notes-user';
+function translateText(node) {
+  const p = node.parentElement; if (!p || (p.closest(SKIP) && !p.closest('[data-i18n]'))) return;
+  const v = node.data, t = v.trim(); if (!t || t.length > 400) return;
+  const r = trBase(t); if (r !== t) node.data = v.replace(t, r);
+}
+const ATTRS = ['placeholder', 'title', 'aria-label'];
+function translateEl(el) {
+  if (el.closest?.(SKIP) && !el.matches?.('input[placeholder],textarea[placeholder]')) return;
+  for (const a of ATTRS) { const v = el.getAttribute?.(a); if (v) { const r = trBase(v.trim()); if (r !== v.trim()) el.setAttribute(a, r); } }
+}
+function translateTree(root) {
+  if (root.nodeType === 3) return translateText(root);
+  if (root.nodeType !== 1) return;
+  translateEl(root);
+  root.querySelectorAll?.('[placeholder],[title],[aria-label]').forEach(translateEl);
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let n = w.nextNode(); n; n = w.nextNode()) translateText(n);
+}
+
+// Pasang bahasa: dipanggil sekali setelah pengaturan dimuat
+export function initLang() {
+  document.documentElement.lang = lang();
+  if (lang() !== 'en') return;
+  // nama bulan & hari di seluruh aplikasi (array dipakai bersama, diganti isinya di tempat)
+  MONTHS.splice(0, 12, ...MONTHS_EN.map((m) => m.slice(0, 3)));
+  MONTHS_LONG.splice(0, 12, ...MONTHS_EN);
+  DAYS.splice(0, 7, ...DAYS_EN.map((d) => d.slice(0, 3)));
+  DAYS_LONG.splice(0, 7, ...DAYS_EN);
+  translateTree(document.body);
+  new MutationObserver((list) => {
+    for (const m of list) {
+      if (m.type === 'characterData') translateText(m.target);
+      else if (m.type === 'attributes') translateEl(m.target);
+      else m.addedNodes.forEach(translateTree);
+    }
+  }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ATTRS });
+}
+export const monthsEN = MONTHS_EN, daysEN = DAYS_EN;

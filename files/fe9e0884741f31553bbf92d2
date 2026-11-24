@@ -1,0 +1,260 @@
+// Impor/ekspor: PDF, gambar, kalender (.ics), dan cadangan data.
+import { db, STORES } from './db.js';
+import { markBackup } from './notify.js';
+import { tr } from './i18n.js';
+import { uid, toast, openSheet, closeSheet, blobToDataURL, dataURLToBlob, ymd, pad } from './ui.js';
+import { PAGE_W, drawTemplate, drawStroke, drawText, templateLayout, drawChecks, drawCellSummaries } from './paper.js';
+import { noteSummariesReady, itemImageReady, drawItems } from './editor.js';
+import { ensureFont } from './fonts.js';
+import { newPage, createNotebook } from './notebooks.js';
+import { settings } from './db.js';
+
+const Cap = () => window.Capacitor?.isNativePlatform?.() ? window.Capacitor.Plugins : null;
+
+// ---------- Simpan / bagikan file ----------
+export async function saveFile(name, blob) {
+  const P = Cap();
+  if (P?.Filesystem && P?.Share) {
+    const data = (await blobToDataURL(blob)).split(',')[1];
+    const res = await P.Filesystem.writeFile({ path: name, data, directory: 'CACHE' });
+    await P.Share.share({ title: name, url: res.uri, dialogTitle: tr('Simpan atau kirim file') });
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+// Bagikan halaman sebagai gambar PNG (WhatsApp, Instagram, galeri, dll), dengan tanda kecil Cherry di pojok
+export async function sharePageImage(pg, title) {
+  title = tr(title);
+  const c = await renderPageImage(pg, 1600);
+  try {
+    const logo = new Image(); logo.src = 'assets/logo/logo_cherry_tulisan.svg'; await logo.decode();
+    const ctx = c.getContext('2d'), w = c.width * 0.1, h = w * logo.naturalHeight / logo.naturalWidth;
+    ctx.globalAlpha = 0.75; ctx.drawImage(logo, c.width - w - c.width * 0.035, c.height - h - c.width * 0.02, w, h); ctx.globalAlpha = 1;
+  } catch {}
+  const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+  const name = safeName(title) + '.png';
+  const P = Cap();
+  if (P?.Filesystem && P?.Share) {
+    const data = (await blobToDataURL(blob)).split(',')[1];
+    const res = await P.Filesystem.writeFile({ path: name, data, directory: 'CACHE' });
+    await P.Share.share({ title, files: [res.uri], dialogTitle: tr('Bagikan gambar') });
+    return;
+  }
+  const file = new File([blob], name, { type: 'image/png' });
+  if (navigator.canShare?.({ files: [file] })) { try { await navigator.share({ files: [file], title }); return; } catch (e) { if (e.name === 'AbortError') return; } }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+const safeName = (s) => (s || 'catatan').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80);
+
+function progress(title) {
+  openSheet(`<h3>${title}</h3><p id="pg-msg">Menyiapkan…</p><div style="height:8px;background:var(--rail);border-radius:4px;overflow:hidden"><div id="pg-bar" style="height:100%;width:0;background:#e0b400;transition:width .2s"></div></div>`);
+  return (done, total, msg) => {
+    const bar = document.getElementById('pg-bar'), m = document.getElementById('pg-msg');
+    if (bar) bar.style.width = (total ? done / total * 100 : 0) + '%';
+    if (m) m.textContent = msg || `${done} / ${total}`;
+  };
+}
+
+// ---------- Impor PDF → buku catatan ----------
+let pdfjs;
+async function loadPdfJs() {
+  if (pdfjs) return pdfjs;
+  pdfjs = await import('../lib/pdf.min.mjs');
+  pdfjs.GlobalWorkerOptions.workerSrc = new URL('../lib/pdf.worker.min.mjs', import.meta.url).href;
+  return pdfjs;
+}
+export async function importPdf(file, folder = null) {
+  const set = progress('Mengimpor PDF');
+  try {
+    const lib = await loadPdfJs();
+    const doc = await lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+    const nbId = uid(); const pages = [];
+    let coverBlob = null;
+    for (let i = 1; i <= doc.numPages; i++) {
+      set(i - 1, doc.numPages, `Halaman ${i} dari ${doc.numPages}`);
+      const page = await doc.getPage(i);
+      const v0 = page.getViewport({ scale: 1 });
+      const scale = Math.min(1600 / v0.width, 3);
+      const vp = page.getViewport({ scale });
+      const c = document.createElement('canvas'); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+      const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+      await page.render({ canvasContext: ctx, canvas: c, viewport: vp }).promise;
+      const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.88));
+      const bid = uid(); await db.put('blobs', { id: bid, blob });
+      if (i === 1) coverBlob = bid;
+      const np = newPage(nbId, { h: Math.round(PAGE_W * vp.height / vp.width), bg: bid, tpl: 'plain', paper: 'white' });
+      // simpan teks PDF + posisinya supaya bisa dicari dan disalin
+      try {
+        const tc = await page.getTextContent(), k = PAGE_W / v0.width, pt = [];
+        for (const it of tc.items) {
+          if (!it.str || !it.str.trim()) continue;
+          const tx = lib.Util.transform(v0.transform, it.transform), h = Math.hypot(tx[2], tx[3]);
+          pt.push({ s: it.str, x: tx[4] * k, y: (tx[5] - h * 0.85) * k, w: it.width * k, h: h * 1.1 * k });
+        }
+        if (pt.length) np.pt = pt;
+      } catch {}
+      pages.push(np);
+      page.cleanup();
+    }
+    set(1, 1, 'Selesai');
+    const nb = await createNotebook({ title: file.name.replace(/\.pdf$/i, ''), folder, cover: { kind: 'pdf', blob: coverBlob }, pages });
+    closeSheet(); toast(`PDF diimpor (${pages.length} halaman)`);
+    return nb;
+  } catch (e) {
+    console.error(e); closeSheet(); toast('Gagal membaca PDF'); return null;
+  }
+}
+
+// ---------- Gambar → halaman ----------
+export async function imageFileToPage(file, nbId) {
+  const bm = await createImageBitmap(file);
+  const w = Math.min(bm.width, 2000), h = Math.round(bm.height * w / bm.width);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); ctx.drawImage(bm, 0, 0, w, h);
+  const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.9));
+  const id = uid(); await db.put('blobs', { id, blob });
+  return newPage(nbId, { h: Math.round(PAGE_W * h / w), bg: id });
+}
+export async function importImages(files, folder = null) {
+  const set = progress('Mengimpor gambar');
+  const nbId = uid(); const pages = [];
+  for (let i = 0; i < files.length; i++) { set(i, files.length); pages.push(await imageFileToPage(files[i], nbId)); }
+  const nb = await createNotebook({ title: files[0].name.replace(/\.[^.]+$/, ''), folder, cover: { kind: 'img', blob: pages[0].bg }, pages });
+  closeSheet(); toast(`${pages.length} gambar diimpor`);
+  return nb;
+}
+
+// ---------- Ekspor buku → PDF ----------
+let jsPdfLoading;
+function loadJsPdf() {
+  return jsPdfLoading ||= new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = 'lib/jspdf.umd.min.js';
+    s.onload = () => res(window.jspdf.jsPDF); s.onerror = rej; document.head.appendChild(s);
+  });
+}
+export async function renderPageImage(pg, width = 1240) {
+  const h = Math.round(width * pg.h / pg.w);
+  const c = document.createElement('canvas'); c.width = width; c.height = h;
+  const ctx = c.getContext('2d');
+  const fams = [pg.style?.font, ...(pg.texts || []).map((t) => t.f)].filter(Boolean);
+  await Promise.all(fams.flatMap((f) => [ensureFont(f), ensureFont(f, 700)]));
+  drawTemplate(ctx, width, h, pg.tpl, pg.paper, { date: pg.date, month: pg.month, weekStart: settings.weekStart, style: pg.style });
+  if (pg.bg) { const r = await db.get('blobs', pg.bg); if (r) ctx.drawImage(await createImageBitmap(r.blob), 0, 0, width, h); }
+  const s = width / pg.w;
+  const lay = templateLayout(pg.tpl, { date: pg.date, month: pg.month, weekStart: settings.weekStart, style: pg.style });
+  drawChecks(ctx, lay, pg.checks, s);
+  drawCellSummaries(ctx, lay, await noteSummariesReady(pg), s, pg.style?.ink);
+  if (pg.items?.length) {
+    const imgs = new Map();
+    for (const it of pg.items) imgs.set(it, await itemImageReady(it));
+    drawItems(ctx, pg.items, s, (it) => imgs.get(it));
+  }
+  for (const st of pg.strokes) drawStroke(ctx, st, s);
+  for (const t of pg.texts) drawText(ctx, t, s);
+  return c;
+}
+export async function exportNotebookPdf(nb, pages) {
+  const set = progress('Membuat PDF');
+  try {
+    const jsPDF = await loadJsPdf();
+    pages ||= (await Promise.all(nb.pageIds.map((id) => db.get('pages', id)))).filter(Boolean);
+    let pdf;
+    for (let i = 0; i < pages.length; i++) {
+      set(i, pages.length, `Halaman ${i + 1} dari ${pages.length}`);
+      const pg = pages[i];
+      const w = 595.28, h = w * pg.h / pg.w;
+      const fmt = [w, h], orient = w > h ? 'l' : 'p';
+      if (!pdf) pdf = new jsPDF({ unit: 'pt', format: fmt, orientation: orient, compress: true });
+      else pdf.addPage(fmt, orient);
+      const c = await renderPageImage(pg);
+      pdf.addImage(c.toDataURL('image/jpeg', 0.9), 'JPEG', 0, 0, w, h, undefined, 'FAST');
+    }
+    set(1, 1, 'Menyimpan…');
+    await saveFile(safeName(nb.title) + '.pdf', pdf.output('blob'));
+    closeSheet();
+  } catch (e) { console.error(e); closeSheet(); toast('Gagal membuat PDF'); }
+}
+
+// ---------- Kalender .ics ----------
+const icsEsc = (s) => String(s || '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;');
+const icsUnesc = (s) => s.replace(/\\n/gi, '\n').replace(/\\([,;\\])/g, '$1');
+const FREQ = { daily: 'DAILY', weekly: 'WEEKLY', monthly: 'MONTHLY', yearly: 'YEARLY' };
+export async function exportIcs(events) {
+  const d8 = (s) => s.replace(/-/g, '');
+  const t6 = (t) => t.replace(':', '') + '00';
+  const nextDay = (s) => { const [y, m, d] = s.split('-').map(Number); return ymd(new Date(y, m - 1, d + 1)).replace(/-/g, ''); };
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Cherry//Kalender//ID', 'CALSCALE:GREGORIAN'];
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15) + 'Z';
+  for (const e of events) {
+    lines.push('BEGIN:VEVENT', `UID:${e.id}@cherry`, `DTSTAMP:${stamp}`, `SUMMARY:${icsEsc(e.title)}`);
+    if (e.time) {
+      lines.push(`DTSTART:${d8(e.date)}T${t6(e.time)}`);
+      if (e.end) lines.push(`DTEND:${d8(e.date)}T${t6(e.end)}`);
+    } else lines.push(`DTSTART;VALUE=DATE:${d8(e.date)}`, `DTEND;VALUE=DATE:${nextDay(e.date)}`);
+    if (FREQ[e.repeat]) lines.push(`RRULE:FREQ=${FREQ[e.repeat]}`);
+    if (e.note) lines.push(`DESCRIPTION:${icsEsc(e.note)}`);
+    lines.push(`X-CHERRY-COLOR:${e.color}`, 'END:VEVENT');
+  }
+  lines.push('END:VCALENDAR');
+  await saveFile(`kalender-cherry-${ymd(new Date())}.ics`, new Blob([lines.join('\r\n')], { type: 'text/calendar' }));
+}
+export function parseIcs(text, defaultColor) {
+  const raw = text.replace(/\r\n[ \t]/g, '').replace(/\n[ \t]/g, '').split(/\r?\n/);
+  const out = []; let cur = null;
+  for (const line of raw) {
+    if (line === 'BEGIN:VEVENT') { cur = {}; continue; }
+    if (line === 'END:VEVENT') {
+      if (cur?.date && cur.title) out.push({ id: uid(), created: Date.now(), title: cur.title, date: cur.date, time: cur.time || '', end: cur.end || '', note: cur.note || '', repeat: cur.repeat || 'none', color: cur.color || defaultColor });
+      cur = null; continue;
+    }
+    if (!cur) continue;
+    const i = line.indexOf(':'); if (i < 0) continue;
+    const key = line.slice(0, i).split(';')[0].toUpperCase(), val = line.slice(i + 1);
+    const dt = (v) => {
+      const m = v.match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2}))?(Z)?/); if (!m) return null;
+      if (m[6] && m[4]) { const d = new Date(Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5])); return { date: ymd(d), time: `${pad(d.getHours())}:${pad(d.getMinutes())}` }; }
+      return { date: `${m[1]}-${m[2]}-${m[3]}`, time: m[4] ? `${m[4]}:${m[5]}` : '' };
+    };
+    if (key === 'SUMMARY') cur.title = icsUnesc(val);
+    else if (key === 'DESCRIPTION') cur.note = icsUnesc(val);
+    else if (key === 'DTSTART') { const d = dt(val); if (d) { cur.date = d.date; cur.time = d.time; } }
+    else if (key === 'DTEND') { const d = dt(val); if (d?.time) cur.end = d.time; }
+    else if (key === 'RRULE') { const f = (val.match(/FREQ=(\w+)/) || [])[1]; cur.repeat = Object.keys(FREQ).find((k) => FREQ[k] === f) || 'none'; }
+    else if (key === 'X-CHERRY-COLOR') cur.color = val;
+  }
+  return out;
+}
+
+// ---------- Cadangan seluruh data ----------
+export async function exportBackup() {
+  const set = progress('Membuat cadangan');
+  try {
+    const data = { app: 'cherry', version: 1, created: Date.now() };
+    for (const s of STORES) {
+      set(STORES.indexOf(s), STORES.length, 'Mengumpulkan ' + s);
+      const rows = await db.all(s);
+      data[s] = s === 'blobs' ? await Promise.all(rows.map(async (r) => ({ id: r.id, data: await blobToDataURL(r.blob) }))) : rows;
+    }
+    await saveFile(`cherry-cadangan-${ymd(new Date())}.json`, new Blob([JSON.stringify(data)], { type: 'application/json' }));
+    markBackup();
+    closeSheet();
+  } catch (e) { console.error(e); closeSheet(); toast('Gagal membuat cadangan'); }
+}
+export async function importBackup(file) {
+  const set = progress('Memulihkan cadangan');
+  try {
+    const data = JSON.parse(await file.text());
+    if (data.app !== 'cherry') throw new Error('bukan file cadangan Cherry');
+    for (const s of STORES) {
+      set(STORES.indexOf(s), STORES.length, 'Memulihkan ' + s);
+      await db.clear(s);
+      let rows = data[s] || [];
+      if (s === 'blobs') rows = await Promise.all(rows.map(async (r) => ({ id: r.id, blob: await dataURLToBlob(r.data) })));
+      await db.putMany(s, rows);
+    }
+    closeSheet(); toast('Cadangan dipulihkan'); setTimeout(() => location.reload(), 700);
+  } catch (e) { console.error(e); closeSheet(); toast('File cadangan tidak valid'); }
+}

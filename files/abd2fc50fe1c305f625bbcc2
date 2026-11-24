@@ -1,0 +1,115 @@
+// Kunci buku catatan dengan PIN 4 angka.
+// Satu PIN untuk semua buku yang dikunci. PIN disimpan sebagai hash (SHA-256 + garam), bukan angka aslinya.
+import { db } from './db.js';
+import { $, $$, openSheet, closeSheet, toast, confirmDialog } from './ui.js';
+
+const LEN = 4;
+let pinRec = null; // { salt, hash }
+let fails = 0, lockedUntil = 0;
+
+export async function loadPin() { pinRec = (await db.get('kv', 'pin'))?.value || null; return pinRec; }
+export const hasPin = () => !!pinRec;
+
+async function hashPin(pin, salt) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + ':' + pin));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+async function checkPin(pin) { return !!pinRec && (await hashPin(pin, pinRec.salt)) === pinRec.hash; }
+async function savePin(pin) {
+  const salt = [...crypto.getRandomValues(new Uint8Array(12))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  pinRec = { salt, hash: await hashPin(pin, salt) };
+  await db.put('kv', { id: 'pin', value: pinRec });
+}
+
+// Papan angka. check(pin) → true (lanjut) | string (pesan salah, kosongkan & goyang)
+function pinPad({ title, sub = '', check }) {
+  return new Promise((resolve) => {
+    let val = '', done = false, busy = false;
+    const s = openSheet(`
+      <div class="pin">
+        <div class="pin-lock"><svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/></svg></div>
+        <h3>${title}</h3><p class="pin-sub">${sub}</p>
+        <div class="pin-dots">${'<i></i>'.repeat(LEN)}</div>
+        <div class="pin-msg"></div>
+        <div class="pin-pad">${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => `<button data-n="${n}">${n}</button>`).join('')}<button data-x="cancel" class="pin-txt">Batal</button><button data-n="0">0</button><button data-x="back" class="pin-txt" aria-label="Hapus"><svg viewBox="0 0 24 24"><path d="M9 6h11v12H9l-6-6z"/><path d="M12.5 9.5l5 5M17.5 9.5l-5 5"/></svg></button></div>
+      </div>`, { onClose: () => { if (!done) { done = true; document.removeEventListener('keydown', key); resolve(null); } } });
+    const dots = $$('.pin-dots i', s), msg = $('.pin-msg', s), dotsBox = $('.pin-dots', s);
+    const paint = () => dots.forEach((d, i) => d.classList.toggle('on', i < val.length));
+    const finish = (v) => { done = true; document.removeEventListener('keydown', key); closeSheet(); resolve(v); };
+    const press = async (n) => {
+      if (busy || done) return;
+      if (Date.now() < lockedUntil) { msg.textContent = `Coba lagi dalam ${Math.ceil((lockedUntil - Date.now()) / 1000)} detik`; return; }
+      if (n === 'back') { val = val.slice(0, -1); paint(); return; }
+      if (val.length >= LEN) return;
+      val += n; paint(); msg.textContent = '';
+      if (val.length < LEN) return;
+      busy = true;
+      const r = check ? await check(val) : true;
+      if (r === true) { dotsBox.classList.add('ok'); setTimeout(() => finish(val), 180); return; }
+      msg.textContent = r || 'PIN salah';
+      dotsBox.classList.remove('shake'); void dotsBox.offsetWidth; dotsBox.classList.add('shake');
+      navigator.vibrate?.(120);
+      setTimeout(() => { val = ''; paint(); busy = false; }, 380);
+    };
+    $$('[data-n]', s).forEach((b) => b.onclick = () => press(b.dataset.n));
+    $('[data-x="back"]', s).onclick = () => press('back');
+    $('[data-x="cancel"]', s).onclick = () => { done = true; document.removeEventListener('keydown', key); closeSheet(); resolve(null); };
+    const key = (e) => { if (/^\d$/.test(e.key)) press(e.key); else if (e.key === 'Backspace') press('back'); };
+    document.addEventListener('keydown', key);
+  });
+}
+
+// Buat PIN baru: masukkan lalu ulangi
+export async function createPin() {
+  const first = await pinPad({ title: 'Buat PIN baru', sub: `${LEN} angka untuk mengunci catatan` });
+  if (!first) return false;
+  const again = await pinPad({ title: 'Ulangi PIN', sub: 'Masukkan PIN yang sama sekali lagi', check: (p) => p === first || 'PIN tidak sama' });
+  if (!again) return false;
+  await savePin(first);
+  toast('PIN dibuat');
+  return true;
+}
+
+// Minta PIN sampai benar (atau dibatalkan)
+export async function verifyPin(title = 'Masukkan PIN', sub = '') {
+  if (!pinRec) return true;
+  const r = await pinPad({ title, sub, check: async (p) => {
+    if (await checkPin(p)) { fails = 0; return true; }
+    fails++;
+    if (fails >= 5) { lockedUntil = Date.now() + 30000; fails = 0; return 'Terlalu banyak salah. Tunggu 30 detik.'; }
+    return `PIN salah (${5 - fails} kali lagi)`;
+  } });
+  return !!r;
+}
+
+// Dipanggil sebelum membuka/mengekspor buku yang dikunci
+export async function requireUnlock(nb) {
+  if (!nb?.locked || !pinRec) return true;
+  return verifyPin('Buku terkunci', `Masukkan PIN untuk membuka "${nb.title}"`);
+}
+
+// Kunci / buka kunci satu buku
+export async function toggleLock(nb, save) {
+  if (nb.locked) {
+    if (!(await verifyPin('Buka kunci', `"${nb.title}" tidak akan meminta PIN lagi`))) return;
+    nb.locked = false; await save(nb); toast('Kunci dibuka');
+    return;
+  }
+  if (!pinRec) {
+    if (!(await confirmDialog('Kamu belum punya PIN. Buat PIN sekarang? Kalau lupa PIN, buku yang terkunci tidak bisa dibuka.', { ok: 'Buat PIN' }))) return;
+    if (!(await createPin())) return;
+  }
+  nb.locked = true; await save(nb); toast('Buku dikunci');
+}
+
+// Ganti PIN: PIN lama dulu, lalu PIN baru + konfirmasi
+export async function changePin() {
+  if (pinRec && !(await verifyPin('PIN lama', 'Masukkan PIN yang sekarang'))) return;
+  await createPin();
+}
+// Hapus PIN: semua buku yang dikunci ikut terbuka
+export async function removePin(unlockAll) {
+  if (!pinRec || !(await verifyPin('Hapus PIN', 'Semua buku yang terkunci akan terbuka'))) return;
+  await unlockAll();
+  pinRec = null; await db.del('kv', 'pin'); toast('PIN dihapus');
+}

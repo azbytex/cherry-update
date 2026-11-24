@@ -1,0 +1,140 @@
+// Font kustom (offline, lisensi OFL & impor kustom). Memuat daftar, memastikan font siap sebelum digambar di canvas, dan pemilih font.
+import { $$, esc, pickFile, uid, toast } from './ui.js';
+import { db } from './db.js';
+
+export const DEFAULT_FONT = '"Segoe UI", Roboto, system-ui, sans-serif';
+let list = [];
+let ready = null;
+
+export function initFonts() {
+  if (ready) return ready;
+  const link = document.createElement('link');
+  link.rel = 'stylesheet'; link.href = 'fonts/fonts.css';
+  document.head.appendChild(link);
+  ready = (async () => {
+    try {
+      const l = await (await fetch('fonts/fonts.json')).json();
+      list = Array.isArray(l) ? l : [];
+    } catch {
+      list = [];
+    }
+    try {
+      const saved = (await db.get('kv', 'custom_fonts'))?.value || [];
+      for (const cf of saved) {
+        try {
+          const item = await db.get('blobs', cf.id);
+          if (item?.blob) {
+            const buf = await item.blob.arrayBuffer();
+            const ff = new FontFace(cf.family, buf);
+            await ff.load();
+            document.fonts.add(ff);
+            loaded.add(cf.family + 400);
+            loaded.add(cf.family + 700);
+            if (!list.some((f) => f.family === cf.family)) {
+              list.unshift({ family: cf.family, cat: 'Kustom' });
+            }
+          }
+        } catch (e) {
+          console.warn('custom font load error', e);
+        }
+      }
+    } catch {}
+    return list;
+  })();
+  return ready;
+}
+export const fontList = () => list;
+export const cssFamily = (family) => family ? `"${family}", ${DEFAULT_FONT}` : DEFAULT_FONT;
+
+// Pastikan font sudah termuat sebelum dipakai di canvas
+const loaded = new Set();
+export async function ensureFont(family, weight = 400) {
+  if (!family || loaded.has(family + weight)) return;
+  try { await document.fonts.load(`${weight} 32px "${family}"`); } catch {}
+  loaded.add(family + weight);
+}
+export const isFontReady = (family, weight = 400) => !family || loaded.has(family + weight);
+
+// Panel pemilih font (dirender di dalam container). onPick(family|null)
+export function fontPicker(container, current, onPick, sample = 'Cherry') {
+  let cat = 'Semua', q = '';
+  const cats = ['Semua', ...new Set(list.map((f) => f.cat))];
+  const draw = () => {
+    const ql = q.trim().toLowerCase();
+    const items = (cat === 'Semua' ? list : list.filter((f) => f.cat === cat)).filter((f) => !ql || f.family.toLowerCase().includes(ql));
+    container.innerHTML = `
+      <div class="stk-tabs" style="align-items:center;display:flex;gap:6px;overflow-x:auto;padding-bottom:6px">
+        ${cats.map((c) => `<button class="stk-tab ${c === cat ? 'on' : ''}" data-cat="${c}">${c}</button>`).join('')}
+        <button class="btn ghost btn-sm" id="fp-import" style="margin-left:auto;padding:4px 10px;font-size:12px;border-radius:999px;white-space:nowrap;flex:none">+ Impor Font</button>
+      </div>
+      <input class="font-q" id="fp-q" type="search" placeholder="Cari dari ${list.length} font" value="${esc(q)}" style="width:100%;margin:0 0 8px;padding:8px 12px;border-radius:10px;border:1px solid var(--line,#ddd);font:inherit;background:var(--card,#fff);color:inherit">
+      <div class="font-list">
+        <button class="font-item ${!current ? 'on' : ''}" data-f=""><span class="fs" style='font-family:${DEFAULT_FONT}'>${esc(sample)}</span><small>Bawaan</small></button>
+        ${items.map((f) => `<button class="font-item ${current === f.family ? 'on' : ''}" data-f="${esc(f.family)}"><span class="fs" data-ff="${esc(f.family)}">${esc(sample)}</span><small>${esc(f.family)}</small></button>`).join('')}
+      </div>`;
+
+    // contoh font dipasang saat item terlihat → HP tidak memuat ratusan font sekaligus
+    lazyFonts(container);
+    const qi = container.querySelector('#fp-q');
+    qi.oninput = () => { q = qi.value; const pos = qi.selectionStart; draw(); const n = container.querySelector('#fp-q'); n.focus(); try { n.setSelectionRange(pos, pos); } catch {} };
+    qi.onclick = (e) => e.stopPropagation();
+    const impBtn = container.querySelector('#fp-import');
+    if (impBtn) {
+      impBtn.onclick = async (e) => {
+        e.stopPropagation();
+        const file = await pickFile('.ttf,.otf,.woff,.woff2');
+        if (!file) return;
+        const fontName = file.name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ').trim() || 'Font Kustom';
+        try {
+          const buffer = await file.arrayBuffer();
+          const ff = new FontFace(fontName, buffer);
+          await ff.load();
+          document.fonts.add(ff);
+          loaded.add(fontName + 400);
+          loaded.add(fontName + 700);
+
+          const blobId = 'font_' + uid();
+          const blob = new Blob([buffer], { type: file.type || 'font/ttf' });
+          await db.put('blobs', { id: blobId, blob, name: fontName });
+          const saved = (await db.get('kv', 'custom_fonts'))?.value || [];
+          saved.push({ id: blobId, family: fontName, cat: 'Kustom' });
+          await db.put('kv', { id: 'custom_fonts', value: saved });
+
+          if (!list.some((f) => f.family === fontName)) {
+            list.unshift({ family: fontName, cat: 'Kustom' });
+          }
+          cat = 'Kustom';
+          current = fontName;
+          draw();
+          onPick(fontName);
+          toast(`Font "${fontName}" berhasil ditambahkan!`);
+        } catch (err) {
+          console.warn('Gagal memuat font kustom', err);
+          toast('Gagal memuat file font');
+        }
+      };
+    }
+
+    $$('[data-cat]', container).forEach((b) => b.onclick = (e) => { e.stopPropagation(); cat = b.dataset.cat; draw(); });
+    $$('[data-f]', container).forEach((b) => b.onclick = async (e) => {
+      e.stopPropagation();
+      const fam = b.dataset.f || null;
+      current = fam;
+      $$('.font-item', container).forEach((x) => x.classList.toggle('on', x === b));
+      await ensureFont(fam); await ensureFont(fam, 700);
+      onPick(fam);
+    });
+  };
+  draw();
+}
+
+let fontIO = null;
+function lazyFonts(container) {
+  fontIO?.disconnect();
+  const spans = [...container.querySelectorAll('.fs[data-ff]')];
+  if (!('IntersectionObserver' in window)) { spans.forEach((s) => (s.style.fontFamily = cssFamily(s.dataset.ff))); return; }
+  fontIO = new IntersectionObserver((ents) => {
+    for (const e of ents) if (e.isIntersecting) { const s = e.target; s.style.fontFamily = cssFamily(s.dataset.ff); fontIO.unobserve(s); }
+  }, { rootMargin: '120px' });
+  spans.forEach((s) => fontIO.observe(s));
+}

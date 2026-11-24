@@ -1,0 +1,128 @@
+// Notifikasi Cherry: pengingat acara, ringkasan pagi, dan pengingat cadangan.
+// Di HP memakai notifikasi Android (ikon apel Cherry). Di browser/preview memakai banner di dalam aplikasi.
+import { settings, saveSettings } from './db.js';
+import { ymd, parseYmd, esc } from './ui.js';
+import { tr } from './i18n.js';
+
+const LN = () => window.Capacitor?.Plugins?.LocalNotifications;
+const DAY = 864e5;
+
+// pilihan "Ingatkan" di acara (menit sebelum mulai; '' = tidak)
+export const REMIND = { '': 'Tidak', '0': 'Saat mulai', '10': '10 menit sebelumnya', '30': '30 menit sebelumnya', '60': '1 jam sebelumnya', '1440': '1 hari sebelumnya' };
+
+export const notifDefaults = { notifEvents: true, notifDaily: true, notifDailyTime: '07:00', notifBackup: true, lastBackup: 0, defaultRemind: '10' };
+for (const [k, v] of Object.entries(notifDefaults)) if (!(k in settings)) settings[k] = v;
+
+let src = { events: () => [], occurs: () => false, todosDue: () => [] };
+let onOpenDate = null;
+export function initNotify({ events, occurs, todosDue, openDate }) {
+  src = { events, occurs, todosDue }; onOpenDate = openDate;
+  for (const [k, v] of Object.entries(notifDefaults)) if (settings[k] === undefined) settings[k] = v;
+  const P = LN();
+  if (P) {
+    P.createChannel?.({ id: 'cherry', name: tr('Pengingat Cherry'), description: tr('Acara, rencana harian, dan cadangan'), importance: 4, visibility: 1, lights: true, lightColor: '#FE0000', vibration: true }).catch(() => {});
+    P.addListener?.('localNotificationActionPerformed', (a) => { const d = a?.notification?.extra?.date; if (d) onOpenDate?.(d); });
+  }
+  reschedule();
+}
+
+const hm = (t) => t ? t.replace(':', '.') : '';
+function atTime(key, time) { const d = parseYmd(key); const [h, m] = (time || '07:00').split(':').map(Number); d.setHours(h, m || 0, 0, 0); return d; }
+function relLabel(min) {
+  if (min === 0) return 'Mulai sekarang';
+  if (min < 60) return `${min} menit lagi`;
+  if (min < 1440) return `${min / 60} jam lagi`;
+  return 'Besok';
+}
+
+// Susun semua notifikasi 30 hari ke depan
+function buildList() {
+  const out = [], now = Date.now(), base = new Date(); base.setHours(0, 0, 0, 0);
+  const evs = src.events();
+  for (let i = 0; i <= 30; i++) {
+    const d = new Date(base.getTime() + i * DAY), key = ymd(d);
+    const todays = evs.filter((e) => src.occurs(e, d, key)).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+    if (settings.notifEvents) {
+      for (const e of todays) {
+        if (e.remind === '' || e.remind == null) continue;
+        const min = +e.remind, at = atTime(key, e.time || '07:00').getTime() - (e.time ? min : Math.min(min, 0)) * 6e4;
+        if (at < now + 5000) continue;
+        out.push({ at, title: e.title, body: e.time ? `${hm(e.time)}${e.end ? '–' + hm(e.end) : ''} · ${relLabel(min)}` : 'Acara hari ini', date: key, kind: 'event' });
+      }
+    }
+    if (settings.notifDaily && i <= 13) {
+      const at = atTime(key, settings.notifDailyTime).getTime(), todo = src.todosDue(key) || [];
+      if (at > now + 5000 && (todays.length || todo.length)) {
+        const parts = []; if (todays.length) parts.push(`${todays.length} acara`); if (todo.length) parts.push(`${todo.length} to-do`);
+        const first = todays.slice(0, 2).map((e) => (e.time ? hm(e.time) + ' ' : '') + e.title).join(', ');
+        out.push({ at, title: 'Rencana hari ini', body: parts.join(', ') + (first ? ' · ' + first : ''), date: key, kind: 'daily' });
+      }
+    }
+  }
+  if (settings.notifBackup && now - (settings.lastBackup || 0) > 30 * DAY) {
+    const at = new Date(base.getTime() + DAY); at.setHours(19, 0, 0, 0);
+    out.push({ at: at.getTime(), title: 'Cadangkan catatanmu', body: settings.lastBackup ? 'Sudah lebih dari 30 hari sejak cadangan terakhir.' : 'Simpan cadangan supaya catatan aman kalau ganti HP.', kind: 'backup' });
+  }
+  return out.sort((a, b) => a.at - b.at).slice(0, 60);
+}
+
+let timer = 0, webTimers = [];
+export function reschedule() { clearTimeout(timer); timer = setTimeout(doSchedule, 600); }
+async function doSchedule() {
+  const list = buildList();
+  const P = LN();
+  if (!P) { // preview di browser: banner dalam aplikasi untuk 24 jam ke depan
+    webTimers.forEach(clearTimeout);
+    webTimers = list.filter((n) => n.at - Date.now() < DAY).map((n) => setTimeout(() => banner(n.title, n.body, n.date), n.at - Date.now()));
+    return;
+  }
+  try {
+    const perm = await P.checkPermissions();
+    if (perm.display !== 'granted') return;
+    const pend = await P.getPending();
+    if (pend.notifications?.length) await P.cancel({ notifications: pend.notifications.map((n) => ({ id: n.id })) });
+    if (!list.length) return;
+    await P.schedule({ notifications: list.map((n, i) => ({
+      id: 1000 + i, title: n.kind === 'event' ? n.title : tr(n.title), body: tr(n.body), largeBody: tr(n.body),
+      schedule: { at: new Date(n.at), allowWhileIdle: true },
+      channelId: 'cherry', smallIcon: 'ic_stat_cherry', largeIcon: 'ic_notif_large', iconColor: '#FE0000',
+      extra: { date: n.date || '', kind: n.kind },
+    })) });
+  } catch (e) { console.warn('notifikasi', e); }
+}
+
+// Minta izin notifikasi (Android 13+ wajib). Mengembalikan true kalau diizinkan.
+export async function ensurePermission() {
+  const P = LN(); if (!P) return true;
+  try {
+    let p = await P.checkPermissions();
+    if (p.display !== 'granted') p = await P.requestPermissions();
+    return p.display === 'granted';
+  } catch { return false; }
+}
+
+export function markBackup() { settings.lastBackup = Date.now(); saveSettings(); reschedule(); }
+
+// Contoh notifikasi untuk dicoba dari layar Saya
+export async function testNotification() {
+  const P = LN();
+  if (!P) { banner('Cherry', tr('Notifikasi aktif. Begini tampilannya.')); return true; }
+  if (!(await ensurePermission())) return false;
+  await P.schedule({ notifications: [{ id: 999, title: 'Cherry', body: tr('Notifikasi aktif. Begini tampilannya.'), channelId: 'cherry', smallIcon: 'ic_stat_cherry', largeIcon: 'ic_notif_large', iconColor: '#FE0000' }] });
+  return true;
+}
+
+// Banner bergaya notifikasi di dalam aplikasi
+export function banner(title, body, date) {
+  document.querySelector('.nbanner')?.remove();
+  const b = document.createElement('div');
+  b.className = 'nbanner';
+  b.innerHTML = `<img src="assets/logo/logo_apel.svg" alt=""><div class="nb-txt"><div class="nb-head"><b>Cherry</b><span>${tr('sekarang')}</span></div><div class="nb-title">${esc(tr(title))}</div><div class="nb-body">${esc(tr(body || ''))}</div></div>`;
+  const close = () => { b.classList.add('out'); setTimeout(() => b.remove(), 320); };
+  b.onclick = () => { close(); if (date) onOpenDate?.(date); };
+  let y0 = null;
+  b.addEventListener('pointerdown', (e) => { y0 = e.clientY; });
+  b.addEventListener('pointerup', (e) => { if (y0 != null && e.clientY - y0 < -24) { e.stopPropagation(); close(); } y0 = null; });
+  document.body.appendChild(b);
+  setTimeout(close, 6000);
+}

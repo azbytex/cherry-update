@@ -1,0 +1,413 @@
+// Layar Catatan: daftar buku, folder, sampah, impor/ekspor.
+import { db } from './db.js';
+import { playPageFlip } from './sound.js';
+import { $, $$, esc, ICON, fmtStamp, openSheet, closeSheet, popover, toast, confirmDialog, promptDialog, pickFile, pushBack } from './ui.js';
+import { state, onChange, createNotebook, saveNotebook, purgeNotebook, duplicateNotebook, createFolder, deleteFolder } from './notebooks.js';
+import { openEditor, paperPickerHTML, bindPaperPicker } from './editor.js';
+import { templateThumb } from './paper.js';
+import { requireUnlock, toggleLock } from './lock.js';
+import { tr } from './i18n.js';
+// judul bawaan ikut bahasa; judul buatan pengguna tidak diubah
+const shownTitle = (t) => (t === 'Tanpa judul' || t === 'Buku baru' ? tr(t) : t);
+import { importPdf, importImages, exportNotebookPdf, renderPageImage } from './io.js';
+
+const COVER_COLORS = ['#ffd93b', '#f0442f', '#0a99f0', '#22a861', '#8b5cf6', '#ec4899', '#f59e0b', '#14b8a6', '#26262a', '#b08968',
+  '#ffb5c2', '#ffd6a5', '#fdffb6', '#caffbf', '#9bf6ff', '#a0c4ff', '#bdb2ff', '#ffc6ff', '#f4a261', '#2a9d8f', '#264653', '#e76f51', '#6d597a', '#9c6644', '#f8f4e3', '#1d3557'];
+const COVER_STYLES = { plain: 'Polos', lines: 'Garis', dots: 'Titik', band: 'Pita', grid: 'Kotak', diag: 'Serong', gingham: 'Gingham', polka: 'Polkadot',
+  hearts: 'Hati', stars: 'Bintang', flowers: 'Bunga', cherry: 'Ceri', clouds: 'Awan', waves: 'Ombak', check: 'Catur', rainbow: 'Pelangi',
+  gradient: 'Gradasi', kraft: 'Kraft', leather: 'Kulit', tape: 'Selotip', corner: 'Pojok emas', frame: 'Bingkai' };
+
+let root;
+let filter = { kind: 'all' };   // all | daily | folder | trash
+let query = '';
+const urls = new Map();
+
+export function initLibrary(el) {
+  root = el;
+  root.innerHTML = `
+    <div class="topbar">
+      <button class="ib" id="l-back" style="display:none">${ICON.back}</button>
+      <div class="title" id="l-title">Semua catatan</div>
+      <div class="spacer"></div>
+      <input class="inp" id="l-search" placeholder="Cari judul…" style="display:none;max-width:260px">
+      <button class="ib" id="l-sbtn" title="Cari">${ICON.search}</button>
+      <button class="ib" id="l-more" title="Lainnya">${ICON.more}</button>
+    </div>
+    <div class="notes-wrap">
+      <aside class="nside" id="l-side"></aside>
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0">
+        <div class="mchips" id="l-chips"></div>
+        <div class="scroll"><div class="ngrid" id="l-grid"></div></div>
+      </div>
+    </div>
+    <button class="fab yellow" id="l-fab" title="Baru">${ICON.plus}</button>`;
+  $('#l-sbtn', root).onclick = () => {
+    const s = $('#l-search', root); const show = s.style.display === 'none';
+    s.style.display = show ? '' : 'none'; if (show) s.focus(); else { s.value = ''; query = ''; render(); }
+  };
+  $('#l-search', root).oninput = (e) => { query = e.target.value.trim().toLowerCase(); renderGrid(); };
+  $('#l-back', root).onclick = () => setFilter({ kind: 'all' });
+  $('#l-fab', root).onclick = (e) => popover(e.currentTarget, [
+    { label: 'Buku catatan baru', icon: 'note', fn: newNotebookDialog },
+    { label: 'Impor PDF', icon: 'pdf', fn: doImportPdf },
+    { label: 'Impor gambar', icon: 'image', fn: doImportImages },
+    { label: 'Folder baru', icon: 'folder', fn: newFolder },
+  ]);
+  $('#l-more', root).onclick = (e) => {
+    const items = [];
+    if (filter.kind === 'folder') {
+      const f = state.folders.find((x) => x.id === filter.id);
+      items.push({ label: 'Ganti nama folder', icon: 'edit', fn: () => renameFolder(f) }, { label: 'Hapus folder', icon: 'trash', danger: true, fn: () => removeFolder(f) });
+    } else if (filter.kind === 'trash') {
+      items.push({ label: 'Kosongkan sampah', icon: 'trash', danger: true, fn: emptyTrash });
+    } else {
+      items.push({ label: 'Folder baru', icon: 'folder', fn: newFolder }, { label: 'Impor PDF', icon: 'pdf', fn: doImportPdf });
+    }
+    popover(e.currentTarget, items);
+  };
+  onChange(() => { if (!document.getElementById('editor').classList.contains('open') || root.classList.contains('active')) render(); });
+  render();
+}
+
+function setFilter(f) { filter = f; render(); $('.scroll', root).scrollTop = 0; }
+
+const visible = (n) => !n.trashed;
+function list() {
+  let l = state.notebooks;
+  if (filter.kind === 'trash') l = l.filter((n) => n.trashed);
+  else if (filter.kind === 'daily') l = l.filter((n) => visible(n) && (n.kind === 'day' || n.kind === 'month'));
+  else if (filter.kind === 'folder') l = l.filter((n) => visible(n) && n.folder === filter.id);
+  else l = l.filter((n) => visible(n) && (!n.kind || n.kind === 'note'));
+  if (query) l = l.filter((n) => n.title.toLowerCase().includes(query));
+  return l.sort((a, b) => b.updated - a.updated);
+}
+
+export function render() {
+  if (!root) return;
+  const f = filter.kind === 'folder' ? state.folders.find((x) => x.id === filter.id) : null;
+  if (filter.kind === 'folder' && !f) filter = { kind: 'all' };
+  const titles = { all: 'Semua catatan', daily: 'Catatan harian', trash: 'Sampah' };
+  $('#l-title', root).textContent = f ? f.name : titles[filter.kind];
+  $('#l-back', root).style.display = filter.kind === 'all' ? 'none' : '';
+  $('#l-fab', root).style.display = filter.kind === 'trash' ? 'none' : '';
+  const notes = state.notebooks.filter((n) => visible(n) && (!n.kind || n.kind === 'note'));
+  const daily = state.notebooks.filter((n) => visible(n) && n.kind && n.kind !== 'note');
+  const trash = state.notebooks.filter((n) => n.trashed);
+  const pageCount = state.notebooks.filter(visible).reduce((a, n) => a + n.pageIds.length, 0);
+  const item = (kind, id, icon, label, cnt, cls = '') => `<button class="nitem ${cls} ${filter.kind === kind && (!id || filter.id === id) ? 'on' : ''}" data-kind="${kind}" ${id ? `data-id="${id}"` : ''}>${ICON[icon]}<span class="grow">${esc(label)}</span><span class="cnt">${cnt}</span></button>`;
+  $('#l-side', root).innerHTML = `
+    <div class="stats"><b>${notes.length + daily.length}</b>catatan · ${pageCount} halaman · ${state.folders.length} folder</div>
+    ${item('all', null, 'note', 'Semua catatan', notes.length)}
+    ${item('daily', null, 'today', 'Catatan harian', daily.length)}
+    <div class="nitem" style="cursor:default">${ICON.folder}<span class="grow">Folder</span><button class="ib sm add" id="l-addf" title="Folder baru">${ICON.folderPlus}</button></div>
+    ${state.folders.map((x) => item('folder', x.id, 'folder', x.name, state.notebooks.filter((n) => visible(n) && n.folder === x.id).length, 'sub')).join('')}
+    ${item('trash', null, 'trash', 'Sampah', trash.length)}`;
+  $$('[data-kind]', $('#l-side', root)).forEach((b) => b.onclick = () => setFilter({ kind: b.dataset.kind, id: b.dataset.id }));
+  $('#l-addf', root).onclick = (e) => { e.stopPropagation(); newFolder(); };
+  const chip = (kind, id, label) => `<button class="chip-opt ${filter.kind === kind && (!id || filter.id === id) ? 'on' : ''}" data-kind="${kind}" ${id ? `data-id="${id}"` : ''}>${esc(label)}</button>`;
+  $('#l-chips', root).innerHTML = chip('all', null, 'Semua') + chip('daily', null, 'Harian') + state.folders.map((x) => chip('folder', x.id, x.name)).join('') + chip('trash', null, 'Sampah') + `<button class="chip-opt" id="l-addf2">+ Folder</button>`;
+  $$('[data-kind]', $('#l-chips', root)).forEach((b) => b.onclick = () => setFilter({ kind: b.dataset.kind, id: b.dataset.id }));
+  $('#l-addf2', root).onclick = newFolder;
+  renderGrid();
+}
+
+const PDF_COLORS = ['#264653', '#b08968', '#2a9d8f', '#4a5568', '#6d597a', '#e76f51', '#1d3557', '#9c6644', '#f4a261', '#8b5cf6'];
+export function getPdfCoverColor(nb) {
+  if (nb?.cover?.c) return nb.cover.c;
+  const str = nb?.id || nb?.title || 'pdf';
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+  return PDF_COLORS[Math.abs(hash) % PDF_COLORS.length];
+}
+
+function coverHTML(nb) {
+  const c = nb.cover || {};
+  if (c.kind === 'img' && c.blob) {
+    return `<div class="cover img"><img data-blob="${c.blob}" alt=""></div>`;
+  }
+  if (c.kind === 'pdf' && c.blob) {
+    const col = c.c || getPdfCoverColor(nb);
+    const s = c.s || 'plain';
+    return `<div class="cover pdf s-${s}" style="--c:${col}"><div class="pdf-window"><img data-blob="${c.blob}" alt=""></div></div>`;
+  }
+  return `<div class="cover s-${c.s || 'plain'}" style="--c:${c.c || '#ffd93b'}"><div class="label">${esc(shownTitle(nb.title))}</div></div>`;
+}
+async function hydrateImages(scope) {
+  for (const img of $$('img[data-blob]', scope)) {
+    const id = img.dataset.blob;
+    if (!urls.has(id)) { const r = await db.get('blobs', id); if (r) urls.set(id, URL.createObjectURL(r.blob)); }
+    if (urls.has(id)) img.src = urls.get(id);
+  }
+}
+
+function renderGrid() {
+  const grid = $('#l-grid', root);
+  const l = list();
+  const canNew = filter.kind === 'all' || filter.kind === 'folder';
+  // buku baru dibuat lewat tombol + (tidak ada kartu "Baru" di grid)
+  let html = '';
+  html += l.map((n, i) => `
+    <div class="nb" data-id="${n.id}" style="--i:${Math.min(i + 1, 20)}">
+      <div class="cover-box" data-open>${coverHTML(n)}${n.locked ? `<span class="lock-badge">${ICON.lock}</span>` : ''}</div>
+      <div class="meta"><div class="grow"><div class="name">${esc(shownTitle(n.title))}</div><div class="date">${fmtStamp(n.updated)} · ${n.pageIds.length} hlm</div></div>
+      <button class="caret" data-menu>${ICON.caret}</button></div>
+    </div>`).join('');
+  if (!l.length) html += `<div class="empty" style="grid-column:1/-1">${filter.kind === 'trash' ? 'Sampah kosong. Catatan yang kamu hapus menunggu di sini 30 hari.' : canNew ? 'Belum ada buku. Ketuk + untuk membuat buku baru.' : 'Belum ada catatan harian. Ketuk tanggal di Kalender, lalu tulis.'}</div>`;
+  grid.innerHTML = html;
+  hydrateImages(grid);
+  $('#l-new', grid)?.addEventListener('click', newNotebookDialog);
+  $$('.nb[data-id]', grid).forEach((card) => {
+    const nb = state.notebooks.find((n) => n.id === card.dataset.id);
+    $('[data-open]', card).onclick = (e) => filter.kind === 'trash' ? toast('Pulihkan dulu untuk membuka') : open(nb, e.currentTarget.querySelector('.cover'));
+    $('[data-menu]', card).onclick = (e) => cardMenu(e.currentTarget, nb);
+  });
+}
+
+// Buka buku: buku terbang ke tengah, sampul berayun terbuka, lalu halaman pertama memenuhi layar.
+// sedang membuka buku: ketukan berikutnya diabaikan (tidak membuka dua kali)
+let opening = false;
+export async function open(nb, coverEl) {
+  if (opening) return;
+  opening = true;
+  try { await openInner(nb, coverEl); } finally { setTimeout(() => (opening = false), 400); }
+}
+async function openInner(nb, coverEl) {
+  if (!(await requireUnlock(nb))) return;
+  let fx = null, ed = null;
+  // editor mulai dimuat saat halaman membesar, jadi tidak menunggu animasi selesai
+  const startEditor = () => (ed ||= openEditor(nb, { onClose: render }));
+  if (coverEl && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    try { fx = await bookOpenFx(nb, coverEl, startEditor); } catch { document.querySelector('.bookfx')?.remove(); fx = null; }
+  }
+  await startEditor();
+  if (fx) fx.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 180, fill: 'forwards' }).finished.then(() => fx.remove());
+}
+
+async function bookOpenFx(nb, coverEl, onOpened) {
+  const r = coverEl.getBoundingClientRect();
+  const asp = r.width / r.height;
+  // ukuran buku di tengah layar; saat terbuka (dua halaman) tetap muat
+  let H = Math.min(innerHeight * 0.6, 520), W = H * asp;
+  if (W * 2 > innerWidth * 0.9) { W = innerWidth * 0.45; H = W / asp; }
+  const cx = innerWidth / 2, cy = innerHeight / 2;
+
+  const tpl = ['plain', 'lined', 'grid', 'dot'].includes(nb.tpl) ? nb.tpl : 'lined';
+  const paper = templateThumb(tpl, nb.paper || 'white', 160);
+  const fx = document.createElement('div');
+  fx.className = 'bookfx';
+  fx.innerHTML = `<div class="bf-book" style="left:${cx - W / 2}px;top:${cy - H / 2}px;width:${W}px;height:${H}px">
+      <div class="bf-pages"><div class="bf-paper"></div></div>
+      <div class="bf-cover"><div class="bf-front"></div><div class="bf-back"></div></div>
+    </div>`;
+  const book = fx.querySelector('.bf-book'), cover = fx.querySelector('.bf-cover'), pages = fx.querySelector('.bf-pages');
+  const paperBox = fx.querySelector('.bf-paper');
+  paperBox.appendChild(paper);
+  // ganti dengan halaman pertama yang asli begitu selesai digambar
+  (async () => {
+    const pg = nb.pageIds?.[0] && await db.get('pages', nb.pageIds[0]);
+    if (!pg) return;
+    const real = await renderPageImage(pg, 520);
+    if (fx.isConnected) paperBox.replaceChildren(real);
+  })().catch(() => {});
+  const front = coverEl.cloneNode(true); front.style.transform = 'none';
+  fx.querySelector('.bf-front').appendChild(front);
+  fx.querySelector('.bf-back').style.setProperty('--c', getComputedStyle(coverEl).backgroundColor);
+  document.body.appendChild(fx);
+
+  const k = r.width / W;
+  const from = `translate(${r.left + r.width / 2 - cx}px, ${r.top + r.height / 2 - cy}px) scale(${k})`;
+  const ease = 'cubic-bezier(.3,.7,.2,1)';
+  // 1. buku diangkat ke tengah sambil sedikit miring
+  await book.animate([
+    { transform: from + ' rotate(0deg)' },
+    { transform: 'translate(0,-12px) scale(1.04) rotate(-3deg)', offset: 0.7 },
+    { transform: 'none' },
+  ], { duration: 420, easing: ease, fill: 'forwards' }).finished;
+  // 2. sampul berayun terbuka; buku bergeser supaya dua halaman pas di tengah
+  playPageFlip();
+  book.animate([{ transform: 'none' }, { transform: `translateX(${W / 2}px)` }], { duration: 620, easing: 'cubic-bezier(.45,0,.2,1)', fill: 'forwards' });
+  await cover.animate([
+    { transform: 'rotateY(0deg)' },
+    { transform: 'rotateY(-180deg)' },
+  ], { duration: 620, easing: 'cubic-bezier(.45,0,.2,1)', fill: 'forwards' }).finished;
+  // 3. halaman pertama membesar memenuhi layar
+  onOpened?.();
+  const pr = pages.getBoundingClientRect();
+  const s = Math.max(innerWidth / pr.width, innerHeight / pr.height) * 1.02;
+  const dx = cx - (pr.left + pr.width / 2), dy = cy - (pr.top + pr.height / 2);
+  fx.querySelector('.bf-back').animate([{ opacity: 1 }, { opacity: 0 }], { duration: 200, fill: 'forwards' });
+  await pages.animate([
+    { transform: 'none', borderRadius: '2px 6px 6px 2px' },
+    { transform: `translate(${dx}px, ${dy}px) scale(${s})`, borderRadius: '0' },
+  ], { duration: 360, easing: 'cubic-bezier(.5,0,.3,1)', fill: 'forwards' }).finished;
+  return fx;
+}
+
+function cardMenu(anchor, nb) {
+  if (nb.trashed) return popover(anchor, [
+    { label: 'Pulihkan', icon: 'restore', fn: async () => { nb.trashed = 0; await saveNotebook(nb); toast('Dipulihkan'); } },
+    { label: 'Hapus permanen', icon: 'trash', danger: true, fn: async () => { if (await confirmDialog(`Hapus "${nb.title}" selamanya? Tidak bisa dikembalikan.`, { ok: 'Hapus', danger: true })) purgeNotebook(nb); } },
+  ]);
+  popover(anchor, [
+    { label: 'Buka', icon: 'note', fn: () => open(nb) },
+    { label: 'Ganti nama', icon: 'edit', fn: async () => { const t = await promptDialog('Ganti nama', nb.title); if (t?.trim()) { nb.title = t.trim(); saveNotebook(nb); } } },
+    { label: 'Ganti sampul', icon: 'palette', fn: () => coverDialog(nb) },
+    { label: 'Pindahkan ke folder', icon: 'move', fn: () => moveDialog(nb) },
+    { label: nb.locked ? 'Buka kunci' : 'Kunci dengan PIN', icon: nb.locked ? 'unlock' : 'lock', fn: () => toggleLock(nb, saveNotebook) },
+    { label: 'Duplikat', icon: 'copy', fn: async () => { if (!(await requireUnlock(nb))) return; await duplicateNotebook(nb); toast('Diduplikat'); } },
+    { label: 'Ekspor ke PDF', icon: 'pdf', fn: async () => { if (await requireUnlock(nb)) exportNotebookPdf(nb); } },
+    '-',
+    { label: 'Hapus', icon: 'trash', danger: true, fn: async () => { if (!(await requireUnlock(nb))) return; nb.trashed = Date.now(); await saveNotebook(nb); toast('Dipindah ke Sampah'); } },
+  ]);
+}
+
+// ---------- Dialog buku baru ----------
+function coverPickerHTML(cover) {
+  const c = cover.c || COVER_COLORS[0];
+  return `<div class="field"><label>Warna sampul</label>
+    <div class="swatches" id="cv-col">${COVER_COLORS.map((x) => `<button class="sw ${cover.kind === 'color' && cover.c === x ? 'on' : ''}" data-c="${x}" style="background:${x}"></button>`).join('')}
+    <label class="sw" title="Warna lain" style="background:conic-gradient(red,yellow,lime,cyan,blue,magenta,red);position:relative;overflow:hidden"><input type="color" id="cv-any" value="${/^#[0-9a-f]{6}$/i.test(c) ? c : '#ff6b8b'}" style="opacity:0;position:absolute;inset:0;width:100%;height:100%"></label>
+    <button class="sw" id="cv-img" title="Pakai gambar" style="display:grid;place-items:center;background:var(--rail)">${ICON.image}</button></div></div>
+    <div class="field"><label>Motif sampul <button class="chip-opt icon-btn" id="cv-rand" style="padding:4px 10px;font-size:12px;margin-left:6px">${ICON.dice}Acak</button></label>
+    <div class="cv-motifs" id="cv-sty">${Object.entries(COVER_STYLES).map(([k, v]) => `<button class="cv-motif ${(cover.s || 'plain') === k ? 'on' : ''}" data-s="${k}" title="${v}"><div class="cover s-${k}" style="--c:${c}"></div><span>${v}</span></button>`).join('')}</div></div>`;
+}
+function bindCoverPicker(s, cover, onChange) {
+  const tint = () => $$('#cv-sty .cover', s).forEach((el) => el.style.setProperty('--c', cover.c));
+  const setColor = (c, btn) => { Object.assign(cover, { kind: 'color', c, blob: null, file: null }); $$('#cv-col .sw', s).forEach((x) => x.classList.toggle('on', x === btn)); tint(); onChange(); };
+  const setStyle = (k) => { cover.s = k; if (cover.kind !== 'color') cover.kind = 'color'; $$('#cv-sty [data-s]', s).forEach((x) => x.classList.toggle('on', x.dataset.s === k)); onChange(); };
+  $$('#cv-col [data-c]', s).forEach((b) => b.onclick = () => setColor(b.dataset.c, b));
+  $('#cv-any', s).oninput = (e) => setColor(e.target.value, e.target.parentElement);
+  $$('#cv-sty [data-s]', s).forEach((b) => b.onclick = () => setStyle(b.dataset.s));
+  motifPages(s);
+  $('#cv-rand', s).onclick = () => {
+    const keys = Object.keys(COVER_STYLES), c = COVER_COLORS[Math.floor(Math.random() * COVER_COLORS.length)];
+    setColor(c, $(`#cv-col [data-c="${c}"]`, s)); setStyle(keys[Math.floor(Math.random() * keys.length)]);
+  };
+  $('#cv-img', s).onclick = async () => { const f = await pickFile('image/*'); if (!f) return; cover.kind = 'img'; cover.file = f; $$('#cv-col .sw', s).forEach((x) => x.classList.remove('on')); $('#cv-img', s).classList.add('on'); onChange(); };
+}
+async function finalizeCover(cover) {
+  if (cover.kind === 'img' && cover.file) {
+    const bm = await createImageBitmap(cover.file); const w = Math.min(600, bm.width), h = Math.round(bm.height * w / bm.width);
+    const c = document.createElement('canvas'); c.width = w; c.height = h; c.getContext('2d').drawImage(bm, 0, 0, w, h);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.88));
+    const id = Math.random().toString(36).slice(2); await db.put('blobs', { id, blob });
+    return { kind: 'img', blob: id };
+  }
+  if (cover.kind === 'pdf') {
+    return { kind: 'pdf', blob: cover.blob, c: cover.c, s: cover.s || 'plain' };
+  }
+  return { kind: 'color', c: cover.c, s: cover.s || 'plain' };
+}
+function previewCover(s, title, cover) {
+  const box = $('#cv-prev', s); if (!box) return;
+  if (cover.kind === 'img' && cover.file) box.innerHTML = `<div class="cover img"><img src="${URL.createObjectURL(cover.file)}"></div>`;
+  else {
+    box.innerHTML = coverHTML({ title: title || tr('Buku baru'), cover });
+    hydrateImages(box);
+  }
+}
+
+function newNotebookDialog() {
+  const keys = Object.keys(COVER_STYLES);
+  const cover = { kind: 'color', c: COVER_COLORS[Math.floor(Math.random() * COVER_COLORS.length)], s: keys[Math.floor(Math.random() * keys.length)] };
+  const paper = { tpl: 'plain', paper: 'white' };
+  const s = openSheet(`
+    <h3>Buku catatan baru</h3>
+    <div class="nn-grid">
+      <div class="nn-left">
+        <div style="display:flex;gap:16px;align-items:flex-start">
+          <div id="cv-prev" class="nn-prev"></div>
+          <div class="field" style="flex:1"><label>Judul</label><input class="inp" id="nn-title" placeholder="Mis. Askep Kardiovaskular"></div>
+        </div>
+        ${coverPickerHTML(cover)}
+      </div>
+      <div class="nn-right">${paperPickerHTML(paper.tpl, paper.paper)}</div>
+    </div>
+    <div class="actions"><button class="btn ghost" id="nn-c">Batal</button><button class="btn yellow" id="nn-ok">Buat</button></div>`, { wide: true });
+  const upd = () => previewCover(s, $('#nn-title', s).value, cover);
+  upd();
+  $('#nn-title', s).oninput = upd;
+  bindPaperPicker(s, paper);
+  bindCoverPicker(s, cover, upd);
+  $('#nn-c', s).onclick = () => closeSheet();
+  $('#nn-ok', s).onclick = async () => {
+    const title = $('#nn-title', s).value.trim() || tr('Tanpa judul');
+    const nb = await createNotebook({ title, folder: filter.kind === 'folder' ? filter.id : null, cover: await finalizeCover(cover), tpl: paper.tpl, paper: paper.paper, month: paper.tpl === 'monthly' ? new Date().toISOString().slice(0, 7) : undefined });
+    closeSheet(); open(nb);
+  };
+}
+
+function coverDialog(nb) {
+  const isPdf = nb.cover?.kind === 'pdf';
+  const cover = isPdf
+    ? { kind: 'pdf', blob: nb.cover.blob, c: nb.cover.c || getPdfCoverColor(nb), s: nb.cover.s || 'plain' }
+    : { ...(nb.cover?.kind === 'color' ? nb.cover : { kind: 'color', c: '#ffd93b', s: 'plain' }) };
+  const s = openSheet(`<h3>Ganti sampul</h3>
+    <div id="cv-prev" style="width:110px;aspect-ratio:3/4;margin:0 auto 16px"></div>
+    ${coverPickerHTML(cover)}
+    <div class="actions"><button class="btn ghost" id="cd-c">Batal</button><button class="btn yellow" id="cd-ok">Simpan</button></div>`);
+  const upd = () => previewCover(s, nb.title, cover); upd();
+  bindCoverPicker(s, cover, upd);
+  $('#cd-c', s).onclick = () => closeSheet();
+  $('#cd-ok', s).onclick = async () => { nb.cover = await finalizeCover(cover); await saveNotebook(nb); closeSheet(); };
+}
+
+function moveDialog(nb) {
+  const s = openSheet(`<h3>Pindahkan "${esc(nb.title)}"</h3>
+    <button class="row click" data-f="" style="width:100%">${ICON.note}<span class="grow" style="text-align:left">Tanpa folder</span>${!nb.folder ? ICON.check : ''}</button>
+    ${state.folders.map((f) => `<button class="row click" data-f="${f.id}" style="width:100%">${ICON.folder}<span class="grow" style="text-align:left">${esc(f.name)}</span>${nb.folder === f.id ? ICON.check : ''}</button>`).join('')}
+    <div class="actions"><button class="btn ghost" id="mv-new">+ Folder baru</button><button class="btn ghost" id="mv-c">Batal</button></div>`);
+  $$('[data-f]', s).forEach((b) => { b.querySelector('svg').style.width = '22px'; const c = b.querySelectorAll('svg')[1]; if (c) c.style.width = '20px'; b.onclick = async () => { nb.folder = b.dataset.f || null; await saveNotebook(nb); closeSheet(); toast('Dipindahkan'); }; });
+  $('#mv-c', s).onclick = () => closeSheet();
+  $('#mv-new', s).onclick = async () => { const n = await promptDialog('Folder baru', '', { placeholder: 'Nama folder' }); if (n?.trim()) { const f = await createFolder(n.trim()); nb.folder = f.id; await saveNotebook(nb); toast('Dipindahkan ke ' + f.name); } };
+}
+
+// ---------- Folder ----------
+async function newFolder() { const n = await promptDialog('Folder baru', '', { placeholder: 'Mis. Semester 3' }); if (n?.trim()) { const f = await createFolder(n.trim()); setFilter({ kind: 'folder', id: f.id }); } }
+async function renameFolder(f) { const n = await promptDialog('Ganti nama folder', f.name); if (n?.trim()) { f.name = n.trim(); await db.put('folders', f); render(); } }
+async function removeFolder(f) {
+  if (!(await confirmDialog(`Hapus folder "${f.name}"? Isinya tidak ikut terhapus, hanya dipindah ke Semua catatan.`, { ok: 'Hapus folder', danger: true }))) return;
+  await deleteFolder(f); setFilter({ kind: 'all' });
+}
+async function emptyTrash() {
+  const t = state.notebooks.filter((n) => n.trashed);
+  if (!t.length) return toast('Sampah sudah kosong');
+  if (!(await confirmDialog(`Hapus ${t.length} catatan di Sampah selamanya?`, { ok: 'Kosongkan', danger: true }))) return;
+  for (const n of t) await purgeNotebook(n, false);
+  render(); toast('Sampah dikosongkan');
+}
+
+// ---------- Impor ----------
+async function doImportPdf() {
+  const f = await pickFile('application/pdf,.pdf'); if (!f) return;
+  const nb = await importPdf(f, filter.kind === 'folder' ? filter.id : null);
+  if (nb) render();
+}
+async function doImportImages() {
+  const files = await pickFile('image/*', true); if (!files?.length) return;
+  await importImages(files, filter.kind === 'folder' ? filter.id : null); render();
+}
+
+// Motif sampul: digeser per halaman (2 baris), titik penanda halaman di bawahnya
+function motifPages(root) {
+  const box = root.querySelector('#cv-sty'); if (!box) return;
+  let dots = box.nextElementSibling?.classList.contains('cv-dots') ? box.nextElementSibling : null;
+  if (!dots) { dots = document.createElement('div'); dots.className = 'cv-dots'; box.after(dots); }
+  // isi halaman terakhir dengan tempat kosong supaya bisa digeser penuh
+  box.querySelectorAll(".cv-pad").forEach((x) => x.remove());
+  const n = box.querySelectorAll(".cv-motif").length;
+  for (let i = n; i < Math.ceil(n / 10) * 10; i++) { const p = document.createElement("i"); p.className = "cv-pad"; box.appendChild(p); }
+  const pages = () => Math.max(1, Math.ceil(box.querySelectorAll(".cv-motif").length / 10));
+  const cur = () => Math.min(pages() - 1, Math.round(box.scrollLeft / Math.max(1, box.clientWidth)));
+  const draw = () => {
+    const n = pages(), c = cur();
+    if (dots.childElementCount !== n) dots.innerHTML = Array.from({ length: n }, (_, i) => `<button data-p="${i}" aria-label="Halaman ${i + 1}"></button>`).join('');
+    [...dots.children].forEach((d, i) => d.classList.toggle('on', i === c));
+    dots.hidden = n < 2;
+    dots.querySelectorAll('[data-p]').forEach((d) => (d.onclick = () => box.scrollTo({ left: +d.dataset.p * box.clientWidth, behavior: 'smooth' })));
+  };
+  box.addEventListener('scroll', () => requestAnimationFrame(draw), { passive: true });
+  new ResizeObserver(draw).observe(box);
+  // buka di halaman yang berisi motif terpilih
+  requestAnimationFrame(() => { const on = box.querySelector('.cv-motif.on'); if (on) box.scrollLeft = Math.floor(on.offsetLeft / box.clientWidth) * box.clientWidth; draw(); });
+}
