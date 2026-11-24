@@ -1,0 +1,215 @@
+// To-do: prioritas, sub-tugas, tugas berulang, dan urutan manual (geser).
+// Data lama tetap terbaca: kolom baru (prio, subs, rep, order) bersifat opsional.
+import { db, settings, saveSettings } from './db.js';
+import { reschedule } from './notify.js';
+import { playCheckChime } from './sound.js';
+import { $, $$, esc, uid, ICON, parseYmd, longDate, ymd, openSheet, closeSheet, toast, confirmDialog } from './ui.js';
+
+let todos = [];
+let root;
+
+const PRIO = [['0', 'Tidak ada'], ['1', 'Rendah'], ['2', 'Sedang'], ['3', 'Tinggi']];
+const PRIO_SHORT = { 1: 'Rendah', 2: 'Sedang', 3: 'Tinggi' };
+const REP = [['', 'Tidak'], ['daily', 'Harian'], ['weekday', 'Hari kerja'], ['weekly', 'Mingguan'], ['monthly', 'Bulanan']];
+const REP_LABEL = Object.fromEntries(REP);
+const SORTS = [['due', 'Tenggat'], ['prio', 'Prioritas'], ['manual', 'Manual']];
+const GRIP = '<svg viewBox="0 0 24 24"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>';
+const REPEAT_ICON = '<svg viewBox="0 0 24 24"><path d="M17 2l3 3-3 3"/><path d="M4 11V9a4 4 0 0 1 4-4h12"/><path d="M7 22l-3-3 3-3"/><path d="M20 13v2a4 4 0 0 1-4 4H4"/></svg>';
+
+const sortMode = () => settings.todoSort || 'due';
+
+export async function initTodo(el) {
+  root = el;
+  todos = await db.all('todos');
+  root.innerHTML = `
+    <div class="topbar"><div class="title">To-do</div><div class="spacer"></div>
+      <button class="ib" id="t-clear" title="Hapus yang selesai">${ICON.trash}</button></div>
+    <div class="scroll"><div class="pad" id="t-list"></div></div>
+    <button class="fab" id="t-fab" title="Tugas baru">${ICON.plus}</button>`;
+  $('#t-fab', root).onclick = () => edit();
+  $('#t-clear', root).onclick = async () => {
+    const done = todos.filter((t) => t.done); if (!done.length) return toast('Belum ada tugas selesai');
+    if (!(await confirmDialog(`Hapus ${done.length} tugas yang sudah selesai?`, { ok: 'Hapus', danger: true }))) return;
+    await db.delMany('todos', done.map((t) => t.id)); todos = todos.filter((t) => !t.done); render(); reschedule();
+  };
+  const list = $('#t-list', root);
+  list.addEventListener('click', async (e) => {
+    const sort = e.target.closest('[data-sort]');
+    if (sort) { settings.todoSort = sort.dataset.sort; saveSettings(); return render(); }
+    const row = e.target.closest('.td-row'); if (!row || row.classList.contains('dragging')) return;
+    const t = todos.find((x) => x.id === row.dataset.id); if (!t) return;
+    const sub = e.target.closest('[data-sub]');
+    if (sub) {
+      const s = t.subs?.find((x) => x.id === sub.dataset.sub); if (!s) return;
+      s.d = !s.d; if (s.d) playCheckChime();
+      await db.put('todos', t); render();
+      if (t.subs.every((x) => x.d) && !t.done) toast('Semua sub-tugas selesai. Centang tugasnya kalau sudah beres.');
+      return;
+    }
+    if (e.target.closest('.td-grip')) return;
+    if (e.target.closest('.check')) return setDone(t, !t.done);
+    edit(t);
+  });
+  list.addEventListener('pointerdown', (e) => { const g = e.target.closest('.td-grip'); if (g) startDrag(g.closest('.td-row'), e); });
+  render();
+}
+
+export const todoCount = () => todos.filter((t) => !t.done).length;
+export const todosDue = (key) => todos.filter((t) => t.due === key);
+export async function toggleTodo(id) {
+  const t = todos.find((x) => x.id === id); if (t) await setDone(t, !t.done);
+}
+
+// ---------- Selesai & tugas berulang ----------
+function nextDue(from, rep) {
+  const d = parseYmd(from);
+  const step = () => {
+    if (rep === 'daily') d.setDate(d.getDate() + 1);
+    else if (rep === 'weekday') { do d.setDate(d.getDate() + 1); while (d.getDay() === 0 || d.getDay() === 6); }
+    else if (rep === 'weekly') d.setDate(d.getDate() + 7);
+    else if (rep === 'monthly') { const day = parseYmd(from).getDate(); d.setDate(1); d.setMonth(d.getMonth() + 1); d.setDate(Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate())); }
+  };
+  const today = ymd(new Date());
+  step();
+  while (ymd(d) < today) step(); // tugas berulang yang terlambat lompat ke jadwal terdekat
+  return ymd(d);
+}
+
+async function setDone(t, done) {
+  t.done = done; t.doneAt = done ? Date.now() : 0;
+  if (done) playCheckChime();
+  await db.put('todos', t);
+  if (done && t.rep && !t.spawned) {
+    const next = { ...t, id: uid(), done: false, doneAt: 0, spawned: false, created: Date.now(), due: nextDue(t.due || ymd(new Date()), t.rep), subs: (t.subs || []).map((s) => ({ ...s, id: uid(), d: false })) };
+    t.spawned = true; // jangan buat salinan lagi kalau dicentang ulang
+    await db.put('todos', t); await db.put('todos', next); todos.push(next);
+    toast(`Berikutnya: ${longDate(parseYmd(next.due))}`);
+  }
+  render(); reschedule();
+}
+
+// ---------- Daftar ----------
+function sorted(list) {
+  const m = sortMode(), byDue = (a, b) => (a.due || '9999').localeCompare(b.due || '9999');
+  if (m === 'prio') return list.sort((a, b) => (b.prio || 0) - (a.prio || 0) || byDue(a, b) || a.created - b.created);
+  if (m === 'manual') return list.sort((a, b) => (a.order ?? a.created) - (b.order ?? b.created));
+  return list.sort((a, b) => byDue(a, b) || (b.prio || 0) - (a.prio || 0) || a.created - b.created);
+}
+
+function render() {
+  if (!root) return;
+  const today = ymd(new Date()), manual = sortMode() === 'manual';
+  const open = sorted(todos.filter((t) => !t.done));
+  const done = todos.filter((t) => t.done).sort((a, b) => b.doneAt - a.doneAt);
+  const row = (t) => {
+    const subs = t.subs || [], nDone = subs.filter((s) => s.d).length, late = !t.done && t.due && t.due < today;
+    const meta = [
+      t.due ? `<span class="${late ? 'td-late' : ''}">${late ? 'Terlambat · ' : ''}${t.due === today ? 'Hari ini' : longDate(parseYmd(t.due))}</span>` : '',
+      t.rep ? `<span class="td-rep">${REPEAT_ICON}${REP_LABEL[t.rep]}</span>` : '',
+      subs.length ? `<span>${nDone}/${subs.length} sub-tugas</span>` : '',
+      t.prio ? `<span class="td-pri">${PRIO_SHORT[t.prio]}</span>` : '',
+    ].filter(Boolean).join('<i class="td-dot"></i>');
+    return `
+    <div class="row click td-row ${t.done ? 'done' : ''} ${t.prio ? 'p' + t.prio : ''}" data-id="${t.id}">
+      ${manual && !t.done ? `<span class="td-grip" title="Geser untuk mengurutkan">${GRIP}</span>` : ''}
+      <button class="check">${t.done ? ICON.check : ''}</button>
+      <div class="grow"><div class="ttl">${esc(t.title)}</div>
+        ${meta ? `<div class="sub td-meta">${meta}</div>` : ''}
+        ${t.note ? `<div class="sub">${esc(t.note)}</div>` : ''}
+        ${subs.length && !t.done ? `<div class="td-subs">${subs.map((s) => `<button class="td-sub ${s.d ? 'on' : ''}" data-sub="${s.id}"><i>${s.d ? ICON.check : ''}</i><span>${esc(s.t)}</span></button>`).join('')}</div>` : ''}
+        ${subs.length ? `<div class="td-prog"><i style="width:${(100 * nDone / subs.length).toFixed(0)}%"></i></div>` : ''}
+      </div>
+    </div>`;
+  };
+  $('#t-list', root).innerHTML = !todos.length ? '<div class="empty">Belum ada tugas.<br>Ketuk + untuk menambah.</div>' :
+    `<div class="chips td-sort">${SORTS.map(([k, l]) => `<button class="chip-opt ${sortMode() === k ? 'on' : ''}" data-sort="${k}">${l}</button>`).join('')}</div>` +
+    (open.length ? `<div class="h2">Belum selesai · ${open.length}</div><div class="td-open">${open.map(row).join('')}</div>` : '') +
+    (manual && open.length > 1 ? '<div class="td-hint">Tahan ikon titik-titik lalu geser untuk mengurutkan</div>' : '') +
+    (done.length ? `<div class="h2">Selesai · ${done.length}</div>${done.map(row).join('')}` : '');
+}
+
+// ---------- Urutan manual: geser lewat pegangan ----------
+function startDrag(row, e) {
+  e.preventDefault();
+  const box = row.parentElement, rows = $$('.td-row', box), from = rows.indexOf(row);
+  const rects = rows.map((r) => r.getBoundingClientRect());
+  const gap = rects.length > 1 ? rects[1].top - rects[0].bottom : 8, h = rects[from].height + gap;
+  const y0 = e.clientY;
+  let to = from, moved = false;
+  row.classList.add('dragging');
+  row.setPointerCapture?.(e.pointerId);
+  const move = (ev) => {
+    const dy = ev.clientY - y0; if (Math.abs(dy) > 3) moved = true;
+    row.style.transform = `translateY(${dy}px)`;
+    const mid = rects[from].top + rects[from].height / 2 + dy;
+    to = from;
+    rects.forEach((r, i) => { if (i < from && mid < r.top + r.height / 2) to = Math.min(to, i); if (i > from && mid > r.top + r.height / 2) to = Math.max(to, i); });
+    rows.forEach((r, i) => { if (r === row) return; r.style.transform = i >= to && i < from ? `translateY(${h}px)` : i <= to && i > from ? `translateY(${-h}px)` : ''; });
+  };
+  const up = async () => {
+    row.removeEventListener('pointermove', move); row.removeEventListener('pointerup', up); row.removeEventListener('pointercancel', up);
+    setTimeout(() => row.classList.remove('dragging'), 0); // cegah klik ikut membuka tugas
+    if (!moved || to === from) { rows.forEach((r) => (r.style.transform = '')); return; }
+    const ids = rows.map((r) => r.dataset.id); ids.splice(to, 0, ids.splice(from, 1)[0]);
+    const changed = [];
+    ids.forEach((id, i) => { const t = todos.find((x) => x.id === id); if (t && t.order !== i) { t.order = i; changed.push(t); } });
+    await Promise.all(changed.map((t) => db.put('todos', t)));
+    render();
+  };
+  row.addEventListener('pointermove', move); row.addEventListener('pointerup', up); row.addEventListener('pointercancel', up);
+}
+
+// ---------- Tambah / ubah ----------
+function edit(t) {
+  const isNew = !t;
+  t = t || { title: '', due: '', note: '', prio: 0, rep: '', subs: [] };
+  const chips = (name, opts, val) => `<input type="hidden" id="td-${name}" value="${val}"><div class="chips" data-chips="${name}">${opts.map(([k, l]) => `<button type="button" class="chip-opt ${String(val) === k ? 'on' : ''}" data-v="${k}">${l}</button>`).join('')}</div>`;
+  const subRow = (s) => `<div class="td-erow" data-id="${s.id}"><input type="checkbox" ${s.d ? 'checked' : ''}><input class="inp" value="${esc(s.t)}" placeholder="Sub-tugas"><button type="button" class="td-x" title="Hapus">×</button></div>`;
+  const s = openSheet(`<h3>${isNew ? 'Tugas baru' : 'Ubah tugas'}</h3>
+    <div class="field"><label>Tugas</label><input class="inp" id="td-t" value="${esc(t.title)}" placeholder="Mis. Kumpulkan laporan askep"></div>
+    <div class="field"><label>Prioritas</label>${chips('p', PRIO, t.prio || 0)}</div>
+    <div class="field"><label>Tenggat (opsional)</label><input class="inp" id="td-d" type="date" value="${t.due || ''}"></div>
+    <div class="field"><label>Ulangi</label>${chips('r', REP, t.rep || '')}</div>
+    <div class="field"><label>Sub-tugas</label><div id="td-subs">${(t.subs || []).map(subRow).join('')}</div>
+      <button type="button" class="btn ghost td-add" id="td-addsub">+ Tambah sub-tugas</button></div>
+    <div class="field"><label>Catatan</label><input class="inp" id="td-n" value="${esc(t.note || '')}"></div>
+    <div class="actions">${isNew ? '' : '<button class="btn danger left" id="td-del">Hapus</button>'}<button class="btn ghost" id="td-c">Batal</button><button class="btn primary" id="td-ok">Simpan</button></div>`, { guardForm: true, onSave: () => submit() });
+  if (isNew) setTimeout(() => $('#td-t', s).focus(), 40);
+
+  $$('[data-chips]', s).forEach((g) => g.onclick = (e) => {
+    const b = e.target.closest('[data-v]'); if (!b) return;
+    $$('.chip-opt', g).forEach((x) => x.classList.toggle('on', x === b));
+    $('#td-' + g.dataset.chips, s).value = b.dataset.v;
+  });
+  const subsBox = $('#td-subs', s);
+  const addSub = (focus = true) => {
+    subsBox.insertAdjacentHTML('beforeend', subRow({ id: uid(), t: '', d: false }));
+    if (focus) subsBox.lastElementChild.querySelector('.inp').focus();
+  };
+  $('#td-addsub', s).onclick = () => addSub();
+  subsBox.addEventListener('click', (e) => { if (e.target.closest('.td-x')) e.target.closest('.td-erow').remove(); });
+  subsBox.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || !e.target.classList.contains('inp')) return;
+    e.preventDefault();
+    const r = e.target.closest('.td-erow');
+    if (r === subsBox.lastElementChild && e.target.value.trim()) addSub(); else r.nextElementSibling?.querySelector('.inp')?.focus();
+  });
+
+  $('#td-c', s).onclick = () => closeSheet();
+  if (!isNew) $('#td-del', s).onclick = async () => { await db.del('todos', t.id); todos = todos.filter((x) => x !== t); closeSheet(); render(); reschedule(); };
+  const submit = async () => {
+    const title = $('#td-t', s).value.trim(); if (!title) return $('#td-t', s).focus();
+    const rep = $('#td-r', s).value;
+    let due = $('#td-d', s).value;
+    if (rep && !due) due = ymd(new Date()); // tugas berulang butuh tanggal mulai
+    const subs = $$('.td-erow', subsBox).map((r) => ({ id: r.dataset.id, t: r.querySelector('.inp').value.trim(), d: r.querySelector('input[type=checkbox]').checked })).filter((x) => x.t);
+    Object.assign(t, { title, due, note: $('#td-n', s).value.trim(), prio: +$('#td-p', s).value || 0, rep, subs });
+    if (isNew) {
+      Object.assign(t, { id: uid(), done: false, created: Date.now(), order: Date.now() }); // tugas baru di paling bawah urutan manual
+      todos.push(t);
+    }
+    await db.put('todos', t); closeSheet(); render(); reschedule();
+  };
+  $('#td-ok', s).onclick = submit;
+  $('#td-t', s).onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+}
