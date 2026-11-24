@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<title>Cherry</title>
+<link rel="stylesheet" href="app.css">
+<style>
+  /* layar pembuka: kanvas animasi supaya tidak ada tombol play bawaan WebView / browser */
+  #splash { position: fixed; inset: 0; z-index: 1000; background: #ffe7e8; display: grid; place-items: center; transition: opacity .5s cubic-bezier(.4,0,.2,1), transform .6s cubic-bezier(.22,1,.36,1); }
+  #splash canvas { width: min(86vw, 86vh, 620px); aspect-ratio: 1; object-fit: contain; pointer-events: none; opacity: 0; background: transparent; transition: opacity .25s ease; }
+  #splash.playing canvas { opacity: 1; }
+  #splash video { position: fixed; top: -9999px; left: -9999px; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  #splash img { display: none; width: min(40vw, 220px); animation: splashPop 1.2s cubic-bezier(.22,1,.36,1) both; }
+  #splash.novideo canvas { display: none; } #splash.novideo img { display: block; }
+  #splash.out { opacity: 0; transform: scale(1.06); pointer-events: none; }
+  @keyframes splashPop { from { opacity: 0; transform: scale(.8) rotate(-8deg); } }
+</style>
+</head>
+<body>
+<div id="splash">
+  <canvas id="splash-cv"></canvas>
+  <video id="splash-v" muted playsinline autoplay preload="auto" disablepictureinpicture disableremoteplayback src="assets/splash/loading.mp4"></video>
+  <img src="assets/logo/logo_apel.svg" alt="">
+</div>
+<div class="app">
+  <nav class="rail" id="rail">
+    <button data-view="calendar">
+      <svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M8 3v4M16 3v4"/><path class="acc" d="M9 11.5h6"/></svg>
+      <span>Kalender</span>
+    </button>
+    <button data-view="notes">
+      <svg viewBox="0 0 24 24"><rect x="4.5" y="4.5" width="15" height="16.5" rx="2.5"/><path d="M9 3h6v3H9z"/><path class="acc" d="M8.5 11h7M8.5 15h5"/></svg>
+      <span>Catatan</span>
+    </button>
+    <button data-view="todo">
+      <svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="17" height="17" rx="3"/><path class="acc" d="M8 12l3 3 5-6"/></svg>
+      <span>To-do</span>
+    </button>
+    <button data-view="settings">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><rect class="acc" x="4" y="14" width="16" height="6" rx="3"/></svg>
+      <span>Saya</span>
+    </button>
+  </nav>
+
+  <main id="main">
+    <section class="view" id="view-calendar"></section>
+    <section class="view" id="view-notes"></section>
+    <section class="view" id="view-todo"></section>
+    <section class="view" id="view-settings"></section>
+  </main>
+</div>
+
+<div class="editor" id="editor"></div>
+
+<div class="scrim" id="scrim"><div class="sheet" id="sheet"></div></div>
+<div class="popover" id="popover"></div>
+<div class="toast" id="toast"></div>
+<input type="file" id="filePicker" hidden>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

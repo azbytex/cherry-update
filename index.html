@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cherry</title>
+<style>
+  :root { --bg: #ffe7e8; --card: #fff; --text: #2b1d1e; --soft: #7a6466; --accent: #e5484d; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1a1415; --card: #262021; --text: #f5eaea; --soft: #b8a5a6; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 24px 16px; }
+  main { width: min(420px, 100%); background: var(--card); border-radius: 24px; padding: 32px 24px; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,.08); }
+  h1 { margin: 0 0 6px; font-size: 30px; }
+  p { color: var(--soft); line-height: 1.55; margin: 0 0 22px; }
+  a.btn { display: block; background: var(--accent); color: #fff; text-decoration: none; font-weight: 600; padding: 15px; border-radius: 14px; font-size: 17px; }
+  small { display: block; margin-top: 14px; color: var(--soft); font-size: 13px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🍒 Cherry</h1>
+  <p>Kalender, catatan, dan to-do dalam satu aplikasi. Semua data tersimpan di HP-mu dan bisa dipakai tanpa internet.</p>
+  <a class="btn" id="dl" href="#">Unduh untuk Android</a>
+  <small id="info">Memuat versi terbaru…</small>
+  <small>Saat memasang, izinkan "Instal aplikasi tidak dikenal" jika diminta. Setelah terpasang, Cherry memperbarui dirinya sendiri.</small>
+</main>
+<script>
+  fetch('ota.json?t=' + Date.now()).then(function (r) { return r.json(); }).then(function (m) {
+    if (!m.apk) throw 0;
+    document.getElementById('dl').href = m.apk.url;
+    document.getElementById('info').textContent = 'Versi ' + m.apk.name + ' · ' + (m.apk.size / 1048576).toFixed(1) + ' MB';
+  }).catch(function () { document.getElementById('info').textContent = 'Versi terbaru belum tersedia.'; });
+</script>
+</body>
+</html>

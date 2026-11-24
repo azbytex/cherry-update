@@ -1,0 +1,147 @@
+// Update Cherry tanpa Play Store.
+//  - Update web: hanya file yang berubah yang diunduh (biasanya ratusan KB), berlaku saat Cherry dibuka lagi.
+//  - Update APK: hanya kalau ada perubahan native; diunduh lalu pemasang Android dibuka.
+// Alamat update diatur di tools/release.config.json dan ikut tertulis di www/ota.json.
+import { toast, openSheet, closeSheet, confirmDialog, esc } from './ui.js';
+
+const P = () => window.Capacitor?.Plugins || {};
+const isNative = () => !!window.Capacitor?.isNativePlatform?.();
+const SNOOZE_KEY = 'cherry.apkSnooze';
+let local = null, busy = false;
+
+async function localManifest() {
+  if (!local) local = await fetch('ota.json', { cache: 'no-store' }).then((r) => r.json()).catch(() => ({ n: 0, ver: '', files: {} }));
+  return local;
+}
+
+/** Info versi untuk ditampilkan di layar Saya. */
+export async function versionInfo() {
+  const m = await localManifest();
+  const info = isNative() ? await P().CherryUpdate?.info().catch(() => null) : null;
+  return { app: info?.versionName || '', web: m.ver || '', updated: !!info?.basePath?.includes('/ota/'), enabled: !!m.url && isNative() };
+}
+
+/** Dipanggil setelah aplikasi berhasil terbuka. */
+export function initUpdater() {
+  if (!isNative()) return;
+  P().CherryUpdate?.ready().catch(() => {});
+  localManifest().then((m) => {
+    // beri tahu sekali setelah versi berganti (update online atau APK baru)
+    let last = null; try { last = localStorage.getItem('cherry.lastVer'); localStorage.setItem('cherry.lastVer', m.ver || ''); } catch {}
+    if (last && m.ver && last !== m.ver) toast(`Cherry sudah diperbarui ke versi ${m.ver} ✨`, 3500);
+    if (m.url) setTimeout(() => checkUpdate({ silent: true }), 5000);
+  });
+}
+
+const fmtMB = (b) => (b / 1048576 >= 1 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB');
+
+export async function checkUpdate({ silent = false } = {}) {
+  if (!isNative()) { if (!silent) toast('Update tersedia di aplikasi Android'); return; }
+  const cur = await localManifest();
+  if (!cur.url) { if (!silent) toast('Alamat update belum diatur'); return; }
+  if (busy) { if (!silent) toast('Sedang memeriksa update…'); return; }
+  busy = true;
+  let phase = 'check';
+  try {
+    if (!silent) toast('Memeriksa update…');
+    const base = cur.url.replace(/\/?$/, '/');
+    const res = await fetch(base + 'ota.json?t=' + Date.now(), { cache: 'no-store' });
+    if (!res.ok) throw Object.assign(new Error('HTTP ' + res.status), { status: res.status });
+    const remote = await res.json();
+    const info = await P().CherryUpdate.info();
+    const code = Number(info.versionCode) || 0;
+
+    const apk = remote.apk && remote.apk.code > code ? remote.apk : null;
+    const webOk = remote.n > (cur.n || 0) && (remote.minNative || 0) <= code && !(info.bad || '').endsWith('/ota/' + remote.n);
+
+    if (webOk) {
+      phase = 'download';
+      const size = await downloadWeb(base, remote, cur, info, silent);
+      if (silent) toast(`Cherry ${remote.ver} siap (${fmtMB(size)}). Berlaku saat dibuka lagi.`, 3500);
+      else if (await confirmDialog(`Cherry ${remote.ver} sudah diunduh (${fmtMB(size)}). Mulai ulang sekarang?`, { ok: 'Mulai ulang', title: 'Update siap' })) await P().CherryUpdate.apply({ path: info._next, now: true });
+      return;
+    }
+    if (apk) {
+      // pengecekan otomatis: tawarkan paling sering sekali sehari per versi
+      let snooze = {}; try { snooze = JSON.parse(localStorage.getItem(SNOOZE_KEY) || '{}'); } catch {}
+      if (silent && snooze.code === apk.code && Date.now() - snooze.t < 864e5) return;
+      try { localStorage.setItem(SNOOZE_KEY, JSON.stringify({ code: apk.code, t: Date.now() })); } catch {}
+      const ok = await confirmDialog(`Cherry ${apk.name} tersedia${apk.size ? ` (${fmtMB(apk.size)})` : ''}.${apk.notes ? ' ' + apk.notes : ''} Catatanmu tidak akan hilang.`, { ok: 'Unduh & pasang', title: 'Versi baru' });
+      if (ok) await downloadApk(new URL(apk.url, base).href);
+      return;
+    }
+    if (!silent) toast('Cherry sudah versi terbaru');
+  } catch (e) {
+    console.warn('update', e);
+    if (!silent) toast(navigator.onLine === false ? 'Tidak ada internet'
+      : e.status === 404 ? 'Server update belum aktif'
+      : phase === 'download' ? 'Gagal mengunduh update. Coba lagi nanti.'
+      : 'Gagal memeriksa update. Periksa internet lalu coba lagi.', 3000);
+  } finally { busy = false; }
+}
+
+async function downloadWeb(base, remote, cur, info, silent) {
+  const FS = P().Filesystem, CU = P().CherryUpdate;
+  const rel = 'ota/' + remote.n;
+  await FS.rmdir({ path: rel, directory: 'DATA', recursive: true }).catch(() => {});
+  await FS.mkdir({ path: rel, directory: 'DATA', recursive: true });
+  const dir = decodeURIComponent((await FS.getUri({ path: rel, directory: 'DATA' })).uri.replace(/^file:\/\//, '').replace(/\/+$/, ''));
+
+  // file yang sama disalin dari versi yang sedang dipakai, sisanya diunduh
+  const same = [], need = [];
+  for (const [p, [h]] of Object.entries(remote.files)) (cur.files?.[p]?.[0] === h ? same : need).push(p);
+  const from = info.basePath?.includes('/ota/') ? info.basePath : '';
+  const st = await CU.stage({ from, to: dir, files: same });
+  need.push(...(st.failed || []));
+
+  let i = 0, bytes = 0;
+  const made = new Set();
+  const worker = async () => {
+    while (i < need.length) {
+      const p = need[i++], [h, size] = remote.files[p];
+      // Filesystem.downloadFile tidak membuat folder induk sendiri
+      const parent = p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '';
+      if (parent && !made.has(parent)) { made.add(parent); await FS.mkdir({ path: rel + '/' + parent, directory: 'DATA', recursive: true }).catch(() => {}); }
+      await FS.downloadFile({ url: base + 'files/' + h, path: rel + '/' + p, directory: 'DATA', recursive: true });
+      const s = await FS.stat({ path: rel + '/' + p, directory: 'DATA' });
+      if (Number(s.size) !== size) throw new Error('Ukuran file tidak cocok: ' + p);
+      bytes += size;
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+
+  const { apk, ...manifest } = remote;
+  await FS.writeFile({ path: rel + '/ota.json', directory: 'DATA', data: JSON.stringify(manifest), encoding: 'utf8' });
+  await CU.apply({ path: dir });
+  info._next = dir;
+
+  // bersihkan versi lama (simpan yang sedang dipakai & yang baru)
+  const keep = new Set([String(remote.n), (info.basePath || '').split('/ota/')[1]?.split('/')[0]]);
+  const list = await FS.readdir({ path: 'ota', directory: 'DATA' }).catch(() => ({ files: [] }));
+  for (const f of list.files) if (!keep.has(f.name)) await FS.rmdir({ path: 'ota/' + f.name, directory: 'DATA', recursive: true }).catch(() => {});
+  return bytes;
+}
+
+async function downloadApk(url) {
+  const FS = P().Filesystem, CU = P().CherryUpdate;
+  const s = openSheet(`<h3>Mengunduh update</h3><p id="upd-txt" style="color:var(--soft)">Menyiapkan…</p>
+    <div style="height:8px;border-radius:4px;background:var(--line);overflow:hidden"><i id="upd-bar" style="display:block;height:100%;width:0;background:var(--note);transition:width .2s"></i></div>`);
+  const txt = s.querySelector('#upd-txt'), bar = s.querySelector('#upd-bar');
+  const sub = await FS.addListener('progress', (e) => {
+    if (!e.contentLength) return;
+    bar.style.width = (100 * e.bytes / e.contentLength).toFixed(1) + '%';
+    txt.textContent = `${fmtMB(e.bytes)} dari ${fmtMB(e.contentLength)}`;
+  });
+  try {
+    await FS.deleteFile({ path: 'Cherry-update.apk', directory: 'CACHE' }).catch(() => {});
+    const r = await FS.downloadFile({ url, path: 'Cherry-update.apk', directory: 'CACHE', progress: true });
+    txt.textContent = 'Membuka pemasang…';
+    const path = r.path || (await FS.getUri({ path: 'Cherry-update.apk', directory: 'CACHE' })).uri;
+    const res = await CU.installApk({ path });
+    closeSheet();
+    if (res?.denied) toast('Izinkan "Instal aplikasi tidak dikenal" untuk Cherry, lalu coba lagi', 4000);
+  } catch (e) {
+    console.warn('apk', e);
+    txt.innerHTML = esc('Gagal mengunduh. Periksa internet lalu coba lagi.');
+  } finally { sub?.remove?.(); }
+}
