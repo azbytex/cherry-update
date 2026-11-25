@@ -1,0 +1,134 @@
+// Pengaturan & pengenalan gestur sentuhan (ketuk 2 jari, 3 jari, ketuk ganda 1 jari).
+import { settings, saveSettings } from './db.js';
+import { $, $$, openSheet, closeSheet } from './ui.js';
+
+export const DEFAULT_GESTURES = {
+  tap2: 'undo',
+  tap3: 'redo',
+  dbl1: 'none',
+  libTap2: 'pickAll',
+  libTap3: 'clearPick',
+  libDbl1: 'none',
+};
+
+export function getGestures() {
+  return { ...DEFAULT_GESTURES, ...(settings.gestures || {}) };
+}
+
+const EDITOR_ACTIONS = [
+  ['undo', 'Undo (Batalkan)'],
+  ['redo', 'Redo (Ulangi)'],
+  ['prevPage', 'Halaman sebelumnya'],
+  ['nextPage', 'Halaman berikutnya'],
+  ['zoomFit', 'Reset zoom (100%)'],
+  ['prevTool', 'Alat sebelumnya'],
+  ['none', 'Mati'],
+];
+
+const EDITOR_DBL_ACTIONS = [
+  ...EDITOR_ACTIONS.slice(0, -1),
+  ['toolSelect', 'Alat Pilih'],
+  ['toolPen', 'Pena'],
+  ['toolEraser', 'Penghapus'],
+  ['none', 'Mati'],
+];
+
+const LIB_ACTIONS = [
+  ['pickAll', 'Pilih semua / Batal pilih'],
+  ['clearPick', 'Keluar mode pilih'],
+  ['search', 'Cari catatan'],
+  ['newNote', 'Buku baru'],
+  ['none', 'Mati'],
+];
+
+/**
+ * Pasang pendeteksi ketuk multi-jari (2 jari, 3 jari) & ketuk ganda 1 jari pada elemen.
+ * Tidak mengganggu scroll, cubit-zoom, atau seret karena hanya memicu jika jari tidak bergeser (>16px) dan dilepas cepat (<350ms).
+ */
+export function attachTapGestures(el, { onTap2, onTap3, onDbl1, isBlocked } = {}) {
+  const active = new Map();
+  let seq = null;
+  let lastSingle = null;
+
+  const down = (e) => {
+    if (e.pointerType !== 'touch') return;
+    if (isBlocked?.(e)) { seq = null; return; }
+    active.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (active.size === 1) {
+      seq = { max: 1, t0: performance.now(), moved: false, starts: new Map([[e.pointerId, { x: e.clientX, y: e.clientY }]]) };
+    } else if (seq) {
+      seq.max = Math.max(seq.max, active.size);
+      seq.starts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
+  };
+
+  const move = (e) => {
+    if (e.pointerType !== 'touch' || !seq) return;
+    const st = seq.starts.get(e.pointerId);
+    if (st && Math.hypot(e.clientX - st.x, e.clientY - st.y) > 16) seq.moved = true;
+  };
+
+  const up = (e) => {
+    if (e.pointerType !== 'touch') return;
+    active.delete(e.pointerId);
+    if (active.size > 0 || !seq) return;
+    const cur = seq;
+    seq = null;
+    if (cur.moved || performance.now() - cur.t0 > 350) return;
+    if (cur.max === 2) { lastSingle = null; onTap2?.(e); return; }
+    if (cur.max === 3) { lastSingle = null; onTap3?.(e); return; }
+    if (cur.max === 1 && onDbl1) {
+      const now = performance.now();
+      if (lastSingle && now - lastSingle.t < 300 && Math.hypot(e.clientX - lastSingle.x, e.clientY - lastSingle.y) < 28) {
+        lastSingle = null;
+        onDbl1(e);
+      } else {
+        lastSingle = { t: now, x: e.clientX, y: e.clientY };
+      }
+    }
+  };
+
+  const cancel = (e) => {
+    if (e.pointerType !== 'touch') return;
+    active.delete(e.pointerId);
+    if (!active.size) seq = null;
+  };
+
+  el.addEventListener('pointerdown', down, { passive: true });
+  el.addEventListener('pointermove', move, { passive: true });
+  el.addEventListener('pointerup', up, { passive: true });
+  el.addEventListener('pointercancel', cancel, { passive: true });
+}
+
+/** Sheet pengaturan gestur (bisa dibuka dari Pengaturan atau menu titik tiga). */
+export function openGestureSettings() {
+  const g = getGestures();
+  const row = (key, title, sub, opts) => `
+    <div style="margin-bottom:14px">
+      <div style="font-weight:600;font-size:14px">${title}</div>
+      ${sub ? `<div style="font-size:12px;color:var(--soft);margin-bottom:6px">${sub}</div>` : '<div style="height:6px"></div>'}
+      <div class="chips" style="flex-wrap:wrap">${opts.map(([val, lbl]) => `<button class="chip-opt ${g[key] === val ? 'on' : ''}" data-gkey="${key}" data-gval="${val}">${lbl}</button>`).join('')}</div>
+    </div>`;
+
+  const s = openSheet(`
+    <h3>Gestur &amp; Pintasan</h3>
+    <div style="font-size:12px;font-weight:700;color:var(--soft);text-transform:uppercase;letter-spacing:.04em;margin:4px 0 10px">Di Editor Catatan</div>
+    ${row('tap2', 'Ketuk 2 jari', 'Ketuk layar cepat dengan 2 jari bersamaan', EDITOR_ACTIONS)}
+    ${row('tap3', 'Ketuk 3 jari', 'Ketuk layar cepat dengan 3 jari bersamaan', EDITOR_ACTIONS)}
+    ${row('dbl1', 'Ketuk ganda 1 jari', 'Ketuk cepat 2 kali dengan 1 jari', EDITOR_DBL_ACTIONS)}
+    <div style="font-size:12px;font-weight:700;color:var(--soft);text-transform:uppercase;letter-spacing:.04em;margin:16px 0 10px">Di Daftar Catatan</div>
+    ${row('libTap2', 'Ketuk 2 jari', 'Pintasan cepat di daftar buku', LIB_ACTIONS)}
+    ${row('libTap3', 'Ketuk 3 jari', 'Pintasan cepat di daftar buku', LIB_ACTIONS)}
+    ${row('libDbl1', 'Ketuk ganda 1 jari', 'Ketuk cepat 2 kali di area daftar buku', LIB_ACTIONS)}
+    <div class="actions"><button class="btn yellow" id="gs-ok">Selesai</button></div>`);
+
+  $$('[data-gkey]', s).forEach((b) => {
+    b.onclick = () => {
+      const k = b.dataset.gkey, v = b.dataset.gval;
+      settings.gestures = { ...getGestures(), [k]: v };
+      saveSettings();
+      $$(`[data-gkey="${k}"]`, s).forEach((x) => x.classList.toggle('on', x === b));
+    };
+  });
+  $('#gs-ok', s).onclick = () => closeSheet();
+}
