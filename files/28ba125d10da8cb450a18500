@@ -1,0 +1,229 @@
+// Font kustom (offline, lisensi OFL & impor kustom). Memuat daftar, memastikan font siap sebelum digambar di canvas, dan pemilih font.
+import { $$, esc, pickFile, uid, toast } from './ui.js';
+import { db } from './db.js';
+
+export const DEFAULT_FONT = '"Segoe UI", Roboto, system-ui, sans-serif';
+let list = [];
+let ready = null;
+
+export function initFonts() {
+  if (ready) return ready;
+  const link = document.createElement('link');
+  link.rel = 'stylesheet'; link.href = 'fonts/fonts.css';
+  document.head.appendChild(link);
+  ready = (async () => {
+    try {
+      const l = await (await fetch('fonts/fonts.json')).json();
+      list = Array.isArray(l) ? l : [];
+    } catch {
+      list = [];
+    }
+    try {
+      const saved = (await db.get('kv', 'custom_fonts'))?.value || [];
+      for (const cf of saved) {
+        try {
+          const item = await db.get('blobs', cf.id);
+          if (item?.blob) {
+            const buf = await item.blob.arrayBuffer();
+            const ff = new FontFace(cf.family, buf);
+            await ff.load();
+            document.fonts.add(ff);
+            loaded.add(cf.family + 400);
+            loaded.add(cf.family + 700);
+            if (!list.some((f) => f.family === cf.family)) {
+              list.unshift({ family: cf.family, cat: 'Kustom' });
+            }
+          }
+        } catch (e) {
+          console.warn('custom font load error', e);
+        }
+      }
+    } catch {}
+    return list;
+  })();
+  return ready;
+}
+export const fontList = () => list;
+export const cssFamily = (family) => family ? `"${family}", ${DEFAULT_FONT}` : DEFAULT_FONT;
+
+// Pastikan font sudah termuat sebelum dipakai di canvas
+const loaded = new Set();
+export async function ensureFont(family, weight = 400) {
+  if (!family || loaded.has(family + weight)) return;
+  try { await document.fonts.load(`${weight} 32px "${family}"`); } catch {}
+  loaded.add(family + weight);
+}
+export const isFontReady = (family, weight = 400) => !family || loaded.has(family + weight);
+
+const PER_PAGE = 8; // 2 kolom × 4 baris per halaman (tanpa scroll vertikal)
+
+// Panel pemilih font (dirender di dalam container). onPick(family|null)
+export function fontPicker(container, current, onPick, sample = 'Cherry') {
+  let cat = 'Semua', q = '';
+  const cats = ['Semua', ...new Set(list.map((f) => f.cat))];
+  if (!container._fpBound) {
+    container._fpBound = true;
+    container.addEventListener('fp:shown', () => container._fpAlign?.());
+  }
+
+  const draw = (jumpToCur = true) => {
+    const ql = q.trim().toLowerCase();
+    const filtered = (cat === 'Semua' ? list : list.filter((f) => f.cat === cat)).filter((f) => !ql || f.family.toLowerCase().includes(ql));
+    const allItems = [];
+    if (!ql && cat === 'Semua') allItems.push({ family: '', label: 'Bawaan', isDefault: true });
+    for (const f of filtered) allItems.push({ family: f.family, label: f.family, isDefault: false });
+
+    const pages = [];
+    for (let i = 0; i < allItems.length; i += PER_PAGE) pages.push(allItems.slice(i, i + PER_PAGE));
+    if (!pages.length) pages.push([]);
+
+    const renderItem = (it) => it.isDefault
+      ? `<button class="font-item ${!current ? 'on' : ''}" data-f=""><span class="fs" style='font-family:${DEFAULT_FONT}'>${esc(sample)}</span><small>Bawaan</small></button>`
+      : `<button class="font-item ${current === it.family ? 'on' : ''}" data-f="${esc(it.family)}"><span class="fs" data-ff="${esc(it.family)}">${esc(sample)}</span><small>${esc(it.label)}</small></button>`;
+
+    container.innerHTML = `
+      <div class="stk-tabs fp-tabs">
+        ${cats.map((c) => `<button class="stk-tab ${c === cat ? 'on' : ''}" data-cat="${c}">${c}</button>`).join('')}
+        <button class="btn ghost btn-sm" id="fp-import" style="margin-left:auto;padding:4px 10px;font-size:12px;border-radius:999px;white-space:nowrap;flex:none">+ Impor Font</button>
+      </div>
+      <input class="font-q" id="fp-q" type="search" placeholder="Cari dari ${list.length} font" value="${esc(q)}" style="width:100%;margin:0 0 8px;padding:8px 12px;border-radius:10px;border:1px solid var(--line,#ddd);font:inherit;background:var(--card,#fff);color:inherit">
+      <div class="fp-pages" id="fp-pages">
+        ${allItems.length
+          ? pages.map((pg) => `<div class="fp-page">${pg.map(renderItem).join('')}</div>`).join('')
+          : `<div class="fp-empty">Tidak ada font yang cocok</div>`}
+      </div>
+      <div class="fp-pager" id="fp-pager" ${pages.length < 2 ? 'hidden' : ''}>
+        <button type="button" class="fp-nav" id="fp-prev" aria-label="Halaman sebelumnya">‹</button>
+        <div class="cv-dots fp-dots" id="fp-dots"></div>
+        <button type="button" class="fp-nav" id="fp-next" aria-label="Halaman berikutnya">›</button>
+        <span class="fp-count" id="fp-count"></span>
+      </div>`;
+
+    const pagesEl = container.querySelector('#fp-pages');
+    const dotsEl = container.querySelector('#fp-dots');
+    const prevBtn = container.querySelector('#fp-prev');
+    const nextBtn = container.querySelector('#fp-next');
+    const countEl = container.querySelector('#fp-count');
+    const total = pages.length;
+
+    const goPage = (p, smooth = true) => {
+      const idx = Math.max(0, Math.min(total - 1, p));
+      const w = pagesEl.clientWidth;
+      if (w > 0) pagesEl.scrollTo({ left: idx * w, behavior: smooth ? 'smooth' : 'auto' });
+      // muat font di halaman aktif & sebelahnya langsung
+      for (const k of [idx - 1, idx, idx + 1]) {
+        const pgEl = pagesEl.children[k];
+        if (pgEl) pgEl.querySelectorAll('.fs[data-ff]').forEach((s) => { s.style.fontFamily = cssFamily(s.dataset.ff); });
+      }
+    };
+
+    const curPage = () => Math.max(0, Math.min(total - 1, Math.round(pagesEl.scrollLeft / Math.max(1, pagesEl.clientWidth))));
+    const drawDots = () => {
+      if (total < 2) return;
+      const c = curPage();
+      const MAX_DOTS = 7;
+      let start = 0, end = total;
+      if (total > MAX_DOTS) {
+        start = Math.max(0, Math.min(total - MAX_DOTS, c - Math.floor(MAX_DOTS / 2)));
+        end = start + MAX_DOTS;
+      }
+      dotsEl.innerHTML = Array.from({ length: end - start }, (_, k) => {
+        const p = start + k;
+        const edge = total > MAX_DOTS && ((k === 0 && start > 0) || (k === end - start - 1 && end < total));
+        return `<button type="button" class="${p === c ? 'on' : ''}${edge ? ' edge' : ''}" data-p="${p}" aria-label="Halaman ${p + 1}"></button>`;
+      }).join('');
+      dotsEl.querySelectorAll('[data-p]').forEach((d) => (d.onclick = (e) => { e.stopPropagation(); goPage(+d.dataset.p, true); }));
+      if (prevBtn) prevBtn.disabled = c <= 0;
+      if (nextBtn) nextBtn.disabled = c >= total - 1;
+      if (countEl) {
+        countEl.textContent = total > MAX_DOTS ? `${c + 1}/${total}` : '';
+        countEl.hidden = total <= MAX_DOTS;
+      }
+    };
+
+    if (prevBtn) prevBtn.onclick = (e) => { e.stopPropagation(); goPage(curPage() - 1, true); };
+    if (nextBtn) nextBtn.onclick = (e) => { e.stopPropagation(); goPage(curPage() + 1, true); };
+    let scRaf = 0;
+    pagesEl.addEventListener('scroll', () => {
+      if (scRaf) return;
+      scRaf = requestAnimationFrame(() => { scRaf = 0; drawDots(); });
+    }, { passive: true });
+    if ('ResizeObserver' in window) new ResizeObserver(() => drawDots()).observe(pagesEl);
+
+    lazyFonts(container, pagesEl);
+
+    const alignInitial = () => {
+      let target = 0;
+      if (jumpToCur && current) {
+        const idx = allItems.findIndex((it) => it.family === current);
+        if (idx >= 0) target = Math.floor(idx / PER_PAGE);
+      }
+      goPage(target, false);
+      drawDots();
+    };
+    container._fpAlign = () => requestAnimationFrame(alignInitial);
+    container._fpAlign();
+
+    const qi = container.querySelector('#fp-q');
+    qi.oninput = () => { q = qi.value; const pos = qi.selectionStart; draw(false); const n = container.querySelector('#fp-q'); n.focus(); try { n.setSelectionRange(pos, pos); } catch {} };
+    qi.onclick = (e) => e.stopPropagation();
+    const impBtn = container.querySelector('#fp-import');
+    if (impBtn) {
+      impBtn.onclick = async (e) => {
+        e.stopPropagation();
+        const file = await pickFile('.ttf,.otf,.woff,.woff2');
+        if (!file) return;
+        const fontName = file.name.replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ').trim() || 'Font Kustom';
+        try {
+          const buffer = await file.arrayBuffer();
+          const ff = new FontFace(fontName, buffer);
+          await ff.load();
+          document.fonts.add(ff);
+          loaded.add(fontName + 400);
+          loaded.add(fontName + 700);
+
+          const blobId = 'font_' + uid();
+          const blob = new Blob([buffer], { type: file.type || 'font/ttf' });
+          await db.put('blobs', { id: blobId, blob, name: fontName });
+          const saved = (await db.get('kv', 'custom_fonts'))?.value || [];
+          saved.push({ id: blobId, family: fontName, cat: 'Kustom' });
+          await db.put('kv', { id: 'custom_fonts', value: saved });
+
+          if (!list.some((f) => f.family === fontName)) {
+            list.unshift({ family: fontName, cat: 'Kustom' });
+          }
+          cat = 'Kustom';
+          current = fontName;
+          draw(true);
+          onPick(fontName);
+          toast(`Font "${fontName}" berhasil ditambahkan!`);
+        } catch (err) {
+          console.warn('Gagal memuat font kustom', err);
+          toast('Gagal memuat file font');
+        }
+      };
+    }
+
+    $$('[data-cat]', container).forEach((b) => b.onclick = (e) => { e.stopPropagation(); cat = b.dataset.cat; draw(false); });
+    $$('[data-f]', container).forEach((b) => b.onclick = async (e) => {
+      e.stopPropagation();
+      const fam = b.dataset.f || null;
+      current = fam;
+      $$('.font-item', container).forEach((x) => x.classList.toggle('on', x === b));
+      await ensureFont(fam); await ensureFont(fam, 700);
+      onPick(fam);
+    });
+  };
+  draw(true);
+}
+
+let fontIO = null;
+function lazyFonts(container, rootEl = null) {
+  fontIO?.disconnect();
+  const spans = [...container.querySelectorAll('.fs[data-ff]')];
+  if (!('IntersectionObserver' in window)) { spans.forEach((s) => (s.style.fontFamily = cssFamily(s.dataset.ff))); return; }
+  fontIO = new IntersectionObserver((ents) => {
+    for (const e of ents) if (e.isIntersecting) { const s = e.target; s.style.fontFamily = cssFamily(s.dataset.ff); fontIO.unobserve(s); }
+  }, { root: rootEl || null, rootMargin: rootEl ? '0px 100%' : '120px' });
+  spans.forEach((s) => fontIO.observe(s));
+}
