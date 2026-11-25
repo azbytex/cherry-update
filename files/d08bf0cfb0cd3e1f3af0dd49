@@ -1,0 +1,80 @@
+import { db, settings } from './db.js';
+import { uid, longDate, MONTHS_LONG } from './ui.js';
+import { A4_H, PAGE_W, randomStyle } from './paper.js';
+
+export const state = { notebooks: [], folders: [] };
+const subs = new Set();
+export const onChange = (fn) => subs.add(fn);
+export const emit = () => subs.forEach((fn) => fn());
+
+export async function loadAll() {
+  state.notebooks = await db.all('notebooks');
+  state.folders = (await db.all('folders')).sort((a, b) => a.created - b.created);
+  const old = state.notebooks.filter((n) => n.trashed && Date.now() - n.trashed > 30 * 864e5);
+  for (const n of old) await purgeNotebook(n, false);
+}
+
+export function newPage(nbId, opts = {}) {
+  const tpl = opts.tpl || 'plain';
+  const style = opts.style || (tpl === 'monthly' ? randomStyle() : undefined);
+  return { id: uid(), nb: nbId, w: PAGE_W, h: opts.h || A4_H, tpl, paper: opts.paper || 'white', bg: opts.bg || null, date: opts.date, month: opts.month, style, strokes: [], texts: [] };
+}
+
+export async function createNotebook({ title, folder = null, cover, tpl = 'plain', paper = 'white', kind = 'note', date, month, pages }) {
+  const nb = { id: uid(), kind, title: title || 'Tanpa judul', folder, cover: cover || { kind: 'color', c: '#ffd93b', s: 'plain' }, tpl, paper, date, month, pageIds: [], created: Date.now(), updated: Date.now(), trashed: 0, ink: false };
+  const list = pages || [newPage(nb.id, { tpl, paper, date, month })];
+  list.forEach((p) => { p.nb = nb.id; });
+  nb.pageIds = list.map((p) => p.id);
+  await db.putMany('pages', list);
+  await db.put('notebooks', nb);
+  state.notebooks.push(nb);
+  emit();
+  return nb;
+}
+
+export async function saveNotebook(nb) { await db.put('notebooks', nb); emit(); }
+
+export async function purgeNotebook(nb, notify = true) {
+  const pages = (await Promise.all(nb.pageIds.map((id) => db.get('pages', id)))).filter(Boolean);
+  const blobs = new Set(pages.map((p) => p.bg).filter(Boolean));
+  if (nb.cover?.blob) blobs.add(nb.cover.blob);
+  const others = state.notebooks.filter((n) => n.id !== nb.id);
+  for (const o of others) if (o.cover?.blob) blobs.delete(o.cover.blob);
+  if (nb.pdfSrc && !others.some((o) => o.pdfSrc === nb.pdfSrc)) blobs.add(nb.pdfSrc); // file PDF sumber (impor bertahap)
+  await db.delMany('pages', nb.pageIds);
+  await db.delMany('blobs', [...blobs]);
+  await db.del('notebooks', nb.id);
+  state.notebooks = others;
+  if (notify) emit();
+}
+
+export async function duplicateNotebook(nb) {
+  const pages = (await Promise.all(nb.pageIds.map((id) => db.get('pages', id)))).filter(Boolean);
+  const copy = pages.map((p) => ({ ...p, id: uid(), strokes: p.strokes.slice(), texts: p.texts.slice() }));
+  const dup = await createNotebook({ title: nb.title + ' (salinan)', folder: nb.folder, cover: { ...nb.cover }, tpl: nb.tpl, paper: nb.paper, pages: copy });
+  if (nb.pdfPending && nb.pdfSrc) { dup.pdfSrc = nb.pdfSrc; dup.pdfPending = true; await saveNotebook(dup); } // halaman PDF yang belum digambar tetap bisa dibuat
+  return dup;
+}
+
+export async function createFolder(name) {
+  const f = { id: uid(), name: name || 'Folder baru', created: Date.now() };
+  await db.put('folders', f); state.folders.push(f); emit(); return f;
+}
+export async function deleteFolder(f) {
+  for (const nb of state.notebooks.filter((n) => n.folder === f.id)) { nb.folder = null; await db.put('notebooks', nb); }
+  await db.del('folders', f.id);
+  state.folders = state.folders.filter((x) => x.id !== f.id); emit();
+}
+
+export function findDay(date) { return state.notebooks.find((n) => n.kind === 'day' && n.date === date && !n.trashed); }
+export async function getDayNotebook(date) {
+  const ex = findDay(date); if (ex) return ex;
+  const [y, m, d] = date.split('-').map(Number);
+  return createNotebook({ kind: 'day', date, title: longDate(new Date(y, m - 1, d)), tpl: 'daily', paper: 'white', cover: { kind: 'color', c: settings.calAccent, s: 'band' } });
+}
+export function findMonth(month) { return state.notebooks.find((n) => n.kind === 'month' && n.month === month && !n.trashed); }
+export async function getMonthNotebook(month) {
+  const ex = findMonth(month); if (ex) return ex;
+  const [y, m] = month.split('-').map(Number);
+  return createNotebook({ kind: 'month', month, title: `Monthly Plan ${MONTHS_LONG[m - 1]} ${y}`, tpl: 'monthly', paper: 'white', cover: { kind: 'color', c: '#26262a', s: 'lines' } });
+}

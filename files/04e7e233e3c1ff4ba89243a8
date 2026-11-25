@@ -1,0 +1,398 @@
+// Kalender bulanan yang bisa dikustomisasi (tanpa alarm).
+import { db, settings, saveSettings } from './db.js';
+import { $, $$, esc, uid, ymd, parseYmd, MONTHS, MONTHS_LONG, DAYS, DAYS_LONG, longDate, COLORS, ICON, openSheet, closeSheet, popover, toast, confirmDialog, pickFile } from './ui.js';
+import { getDayNotebook, getMonthNotebook, findDay, onChange } from './notebooks.js';
+import { openEditor, editorHeader, isEditorOpen } from './editor.js';
+import { exportIcs, parseIcs } from './io.js';
+import { todosDue, toggleTodo } from './todo.js';
+import { REMIND, reschedule, ensurePermission } from './notify.js';
+import { requireUnlock } from './lock.js';
+
+export const ACCENTS = ['#0a99f0', '#2563eb', '#7c3aed', '#db2777', '#e5484d', '#ea580c', '#d4a106', '#16a34a', '#0d9488', '#334155'];
+const REPEAT = { none: 'Tidak berulang', daily: 'Setiap hari', weekly: 'Setiap minggu', monthly: 'Setiap bulan', yearly: 'Setiap tahun' };
+
+let events = [];
+let root;
+let cursor, selected;
+const today = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
+
+export async function initCalendar(el) {
+  root = el;
+  events = await db.all('events');
+  const t = today();
+  cursor = new Date(t.getFullYear(), t.getMonth(), 1);
+  selected = ymd(t);
+  root.innerHTML = `
+    <div class="topbar">
+      <button class="ib" id="c-today" title="Hari ini">${ICON.today}</button>
+      <button class="title" id="c-title"></button>
+      <button class="ib sm" id="c-prev" title="Bulan sebelumnya">${ICON.back}</button>
+      <button class="ib sm" id="c-next" title="Bulan berikutnya">${ICON.fwd}</button>
+      <div class="spacer"></div>
+      <button class="ib" id="c-custom" title="Sesuaikan kalender">${ICON.palette}</button>
+      <button class="ib" id="c-more" title="Lainnya">${ICON.more}</button>
+    </div>
+    <div class="weekdays" id="c-wd"></div>
+    <div class="cal-grid" id="c-grid"></div>
+    <button class="fab" id="c-fab" title="Tambah acara">${ICON.plus}</button>`;
+
+  $('#c-today', root).onclick = goToday;
+  $('#c-prev', root).onclick = () => shift(-1);
+  $('#c-next', root).onclick = () => shift(1);
+  $('#c-title', root).onclick = monthPicker;
+  $('#c-custom', root).onclick = customize;
+  $('#c-fab', root).onclick = () => editEvent();
+  $('#c-more', root).onclick = (e) => popover(e.currentTarget, [
+    { label: 'Ke hari ini', icon: 'today', fn: goToday },
+    { label: `Monthly Plan ${MONTHS_LONG[cursor.getMonth()]}`, icon: 'pages', fn: openMonthPlan },
+    { label: 'Agenda mendatang', icon: 'note', fn: agenda },
+    { label: 'Sesuaikan kalender', icon: 'palette', fn: customize },
+    '-',
+    { label: 'Ekspor kalender (.ics)', icon: 'copy', fn: () => events.length ? exportIcs(events) : toast('Belum ada acara') },
+    { label: 'Impor kalender (.ics)', icon: 'restore', fn: importIcs },
+  ]);
+  onChange(() => { if (root.classList.contains('active')) render(); });
+
+  const grid = $('#c-grid', root);
+  grid.addEventListener('click', (e) => {
+    const c = e.target.closest('.cell[data-date]'); if (!c) return;
+    const key = c.dataset.date;
+    selected = key;
+    const d = parseYmd(key);
+    if (d.getMonth() !== cursor.getMonth()) { cursor = new Date(d.getFullYear(), d.getMonth(), 1); render(d > cursor ? 1 : -1); }
+    else { $$('.cell.sel', root).forEach((x) => x.classList.remove('sel')); c.classList.add('sel'); }
+    dayDetail(key);
+  });
+  // geser (swipe) untuk ganti bulan
+  let sx = null, sy = null;
+  grid.addEventListener('touchstart', (e) => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; }, { passive: true });
+  grid.addEventListener('touchend', (e) => {
+    if (sx == null) return;
+    const dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy;
+    if (Math.abs(dy) > 60 && Math.abs(dy) > Math.abs(dx)) shift(dy < 0 ? 1 : -1);
+    else if (Math.abs(dx) > 60) shift(dx < 0 ? 1 : -1);
+    sx = sy = null;
+  });
+  let lock = 0;
+  grid.addEventListener('wheel', (e) => {
+    const n = Date.now(); if (n - lock < 380 || Math.abs(e.deltaY) < 15) return;
+    lock = n; shift(e.deltaY > 0 ? 1 : -1);
+  }, { passive: true });
+  document.addEventListener('keydown', (e) => {
+    if (!root.classList.contains('active') || $('#scrim').classList.contains('open') || e.target.matches('input,textarea')) return;
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') shift(-1);
+    if (e.key === 'ArrowRight' || e.key === 'PageDown') shift(1);
+  });
+  render();
+}
+
+export function applyAccent() {
+  const r = document.documentElement.style, c = settings.calAccent || '#0a99f0';
+  r.setProperty('--cal', c);
+  // aksen catatan, tombol +, dan alat aktif memakai warna tema yang sama
+  r.setProperty('--note', c);
+  const n = parseInt(c.slice(1, 7), 16), lum = (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  r.setProperty('--note-ink', lum > 0.62 ? '#1f1f22' : '#ffffff');
+}
+export function eventCount() { return events.length; }
+export function upcomingCount() { const t = ymd(today()); return events.filter((e) => (e.repeat && e.repeat !== 'none') || e.date >= t).length; }
+export function getEvents() { return events; }
+export async function replaceEvents(list) { events = list; render(); }
+
+function goToday() { const t = today(); cursor = new Date(t.getFullYear(), t.getMonth(), 1); selected = ymd(t); render(0, true); }
+function shift(n, anim = true) { cursor = new Date(cursor.getFullYear(), cursor.getMonth() + n, 1); render(anim ? n : 0); }
+
+// ---------- Pengulangan ----------
+export function occursOn(ev, d, key) {
+  if (key < ev.date) return false;
+  if (ev.until && key > ev.until) return false;
+  const s = parseYmd(ev.date);
+  switch (ev.repeat) {
+    case 'daily': return true;
+    case 'weekly': return d.getDay() === s.getDay();
+    case 'monthly': return d.getDate() === s.getDate();
+    case 'yearly': return d.getDate() === s.getDate() && d.getMonth() === s.getMonth();
+    default: return key === ev.date;
+  }
+}
+const byTime = (a, b) => (a.time || '').localeCompare(b.time || '') || a.title.localeCompare(b.title);
+function eventsOn(d) { const key = ymd(d); return events.filter((e) => occursOn(e, d, key)).sort(byTime); }
+
+function isoWeek(d) {
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const day = t.getUTCDay() || 7; t.setUTCDate(t.getUTCDate() + 4 - day);
+  const y0 = new Date(Date.UTC(t.getUTCFullYear(), 0, 1));
+  return Math.ceil(((t - y0) / 864e5 + 1) / 7);
+}
+
+// ---------- Render ----------
+export function render(dir = 0, wave = false) {
+  if (!root) return;
+  const s = settings;
+  const t = today(), tKey = ymd(t);
+  $('#c-title', root).textContent = `${(innerWidth < 500 ? MONTHS : MONTHS_LONG)[cursor.getMonth()]} ${cursor.getFullYear()}`;
+  const cols = s.weekNumbers ? '44px repeat(7, 1fr)' : 'repeat(7, 1fr)';
+  const order = [...Array(7)].map((_, i) => (i + s.weekStart) % 7);
+  const wd = $('#c-wd', root);
+  wd.style.gridTemplateColumns = cols;
+  const curMonth = cursor.getMonth() === t.getMonth() && cursor.getFullYear() === t.getFullYear();
+  wd.innerHTML = (s.weekNumbers ? '<div class="wk">Mg</div>' : '') + order.map((d) =>
+    `<div class="${curMonth && d === t.getDay() ? 'now' : ''} ${s.redSunday && d === 0 ? 'red' : ''}">${DAYS[d]}</div>`).join('');
+
+  const offset = (cursor.getDay() - s.weekStart + 7) % 7;
+  const start = new Date(cursor); start.setDate(1 - offset);
+  const grid = $('#c-grid', root);
+  grid.style.gridTemplateColumns = cols;
+  grid.classList.toggle('cal-round', s.todayStyle === 'round');
+  let html = '';
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(start); d.setDate(start.getDate() + i);
+    const key = ymd(d);
+    if (s.weekNumbers && i % 7 === 0) html += `<div class="cell wk">${isoWeek(d)}</div>`;
+    const cls = ['cell'];
+    const other = d.getMonth() !== cursor.getMonth();
+    if (other) cls.push('other');
+    if (other && !s.showOther) cls.push('hideother');
+    if (key === tKey) cls.push('today');
+    if (key === selected) cls.push('sel');
+    if (s.redSunday && d.getDay() === 0) cls.push('red');
+    if (i % 7 === 6) cls.push('endcol');
+    const evs = eventsOn(d);
+    let body = '';
+    if (s.eventStyle === 'dot') {
+      body = evs.length ? `<div class="dots">${evs.slice(0, 6).map((e) => `<i style="background:${e.color}"></i>`).join('')}</div>` : '';
+    } else {
+      const max = 3;
+      body = `<div class="evs">${evs.slice(0, max).map((e) => `<div class="ev" style="background:${e.color}">${e.time ? e.time + ' ' : ''}${esc(e.title)}</div>`).join('')}${evs.length > max ? `<div class="more">+${evs.length - max}</div>` : ''}</div>`;
+    }
+    const hasNote = findDay(key)?.ink ? `<i class="has-note" title="Ada catatan">${ICON.pen}</i>` : '';
+    html += `<button class="${cls.join(' ')}" style="--i:${i}" data-date="${key}"><span class="num"><span>${d.getDate()}</span>${hasNote}</span>${body}</button>`;
+  }
+  grid.innerHTML = html;
+  grid.classList.remove('anim', 'wave');
+  if (dir || wave) {
+    void grid.offsetWidth;
+    grid.style.setProperty('--dir', dir > 0 ? '36px' : '-36px');
+    grid.classList.add(wave ? 'wave' : 'anim');
+  }
+}
+
+// ---------- Pemilih bulan ----------
+function monthPicker() {
+  let y = cursor.getFullYear();
+  const draw = () => {
+    const s = openSheet(`
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <button class="ib" id="mp-p">${ICON.back}</button><h3 style="margin:0">${y}</h3><button class="ib" id="mp-n">${ICON.fwd}</button>
+      </div>
+      <div class="month-grid">${MONTHS_LONG.map((m, i) => `<button class="btn ${i === cursor.getMonth() && y === cursor.getFullYear() ? 'primary' : 'ghost'}" data-m="${i}">${m}</button>`).join('')}</div>`);
+    $('#mp-p', s).onclick = () => { y--; draw(); };
+    $('#mp-n', s).onclick = () => { y++; draw(); };
+    $$('[data-m]', s).forEach((b) => b.onclick = () => { cursor = new Date(y, +b.dataset.m, 1); closeSheet(); render(); });
+  };
+  draw();
+}
+
+// ---------- Halaman harian (animasi zoom dari kotak tanggal) ----------
+const reduceMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+function zoomer(key) {
+  const d = parseYmd(key);
+  const z = document.createElement('div');
+  z.className = 'zoomer';
+  z.innerHTML = `<div class="zn">${d.getDate()}</div><div class="zd">${DAYS_LONG[d.getDay()]}<br><small>${MONTHS_LONG[d.getMonth()]} ${d.getFullYear()}</small></div>`;
+  document.body.appendChild(z);
+  return z;
+}
+const full = () => ({ left: '0px', top: '0px', width: innerWidth + 'px', height: innerHeight + 'px', borderRadius: '0px' });
+const boxOf = (r) => ({ left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px', borderRadius: '6px' });
+
+async function openDay(key, cell, animate = true) {
+  selected = key;
+  const d = parseYmd(key);
+  if (d.getMonth() !== cursor.getMonth()) { cursor = new Date(d.getFullYear(), d.getMonth(), 1); render(); }
+  else $$('.cell.sel', root).forEach((c) => c.classList.remove('sel')), cell?.classList.add('sel');
+  // buku harian yang dikunci minta PIN dulu
+  const locked = findDay(key);
+  if (locked?.locked && !(await requireUnlock(locked))) return;
+  let z = null;
+  if (animate && cell && !reduceMotion()) {
+    z = zoomer(key);
+    const a = z.animate([boxOf(cell.getBoundingClientRect()), full()], { duration: 360, easing: 'cubic-bezier(.2,.8,.2,1)', fill: 'forwards' });
+    z.classList.add('grow');
+    await a.finished;
+  }
+  const nb = await getDayNotebook(key);
+  await openEditor(nb, {
+    header: ' ',
+    onReady: (h) => fillDayHeader(h, key),
+    onClose: () => closeDay(key),
+  });
+  if (z) { await z.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 180, fill: 'forwards' }).finished; z.remove(); }
+}
+
+async function closeDay(key) {
+  render();
+  const cell = $(`.cell[data-date="${key}"]`, root);
+  if (!cell || reduceMotion() || !root.classList.contains('active')) return;
+  const z = zoomer(key); z.classList.add('grow');
+  await z.animate([full(), boxOf(cell.getBoundingClientRect())], { duration: 300, easing: 'cubic-bezier(.4,0,.2,1)', fill: 'forwards' }).finished;
+  await z.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 120, fill: 'forwards' }).finished;
+  z.remove();
+}
+
+function fillDayHeader(h, key) {
+  if (!h) return;
+  const d = parseYmd(key);
+  const evs = eventsOn(d);
+  h.innerHTML = `
+    <button class="ib sm" id="dh-prev" title="Hari sebelumnya">${ICON.back}</button>
+    <div class="dh-date"><b>${d.getDate()}</b><span>${DAYS_LONG[d.getDay()]}<br><small>${MONTHS_LONG[d.getMonth()]} ${d.getFullYear()}</small></span></div>
+    <button class="ib sm" id="dh-next" title="Hari berikutnya">${ICON.fwd}</button>
+    <div class="dh-evs">${evs.map((e) => `<button class="dh-ev" data-id="${e.id}" style="--c:${e.color}">${e.time ? `<small>${e.time}</small> ` : ''}${esc(e.title)}</button>`).join('') || '<span class="dh-none">Belum ada acara di hari ini</span>'}</div>
+    <button class="btn ghost" id="dh-add" style="flex:none">+ Acara</button>`;
+  const step = (n) => { const x = new Date(d); x.setDate(d.getDate() + n); openDay(ymd(x), null, false); };
+  $('#dh-prev', h).onclick = () => step(-1);
+  $('#dh-next', h).onclick = () => step(1);
+  $('#dh-add', h).onclick = () => editEvent(null, key, () => fillDayHeader(editorHeader(), key));
+  $$('[data-id]', h).forEach((b) => b.onclick = () => editEvent(events.find((e) => e.id === b.dataset.id), null, () => fillDayHeader(editorHeader(), key)));
+}
+
+async function openMonthPlan() {
+  const m = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}`;
+  const nb = await getMonthNotebook(m);
+  if (!(await requireUnlock(nb))) return;
+  openEditor(nb, { onClose: render });
+}
+
+async function importIcs() {
+  const f = await pickFile('.ics,text/calendar'); if (!f) return;
+  const list = parseIcs(await f.text(), settings.calAccent);
+  if (!list.length) return toast('Tidak ada acara di file itu');
+  const keys = new Set(events.map((e) => `${e.date}|${e.time}|${e.title}`));
+  const fresh = list.filter((e) => !keys.has(`${e.date}|${e.time}|${e.title}`));
+  events.push(...fresh); await db.putMany('events', fresh);
+  render(); toast(`${fresh.length} acara diimpor${list.length - fresh.length ? `, ${list.length - fresh.length} duplikat dilewati` : ''}`);
+}
+
+// ---------- Detail hari ----------
+// dibuka dari notifikasi: lompat ke tanggal itu lalu tampilkan detailnya
+export function showDate(key) { selected = key; const d = parseYmd(key); cursor = new Date(d.getFullYear(), d.getMonth(), 1); render(0, true); dayDetail(key); }
+
+function dayDetail(key) {
+  const d = parseYmd(key);
+  const evs = eventsOn(d);
+  const tds = todosDue(key);
+  const note = findDay(key);
+  const isToday = key === ymd(today());
+  const s = openSheet(`
+    <div class="dp-head">
+      <div class="dp-num" style="${isToday ? 'background:var(--cal);color:#fff' : ''}">${d.getDate()}</div>
+      <div><div class="dp-day">${DAYS_LONG[d.getDay()]}${isToday ? ' · Hari ini' : ''}</div><div class="dp-month">${MONTHS_LONG[d.getMonth()]} ${d.getFullYear()}</div></div>
+    </div>
+    <div class="h2">Acara</div>
+    ${evs.length ? evs.map((e, i) => `
+      <div class="row click dp-item" data-id="${e.id}" style="--i:${i}">
+        <span class="bar" style="background:${e.color}"></span>
+        <div class="grow"><div>${esc(e.title)}</div>
+          <div class="sub">${e.time ? e.time + (e.end ? ' – ' + e.end : '') : 'Sepanjang hari'}${e.repeat && e.repeat !== 'none' ? ' · ' + REPEAT[e.repeat] : ''}</div>
+          ${e.note ? `<div class="sub" style="white-space:pre-wrap">${esc(e.note)}</div>` : ''}</div>
+      </div>`).join('') : '<div class="dp-empty">Tidak ada acara.</div>'}
+    ${tds.length ? `<div class="h2">To-do tenggat hari ini</div>${tds.map((t, i) => `
+      <div class="row dp-item ${t.done ? 'done' : ''}" data-todo="${t.id}" style="--i:${evs.length + i}">
+        <button class="check">${t.done ? ICON.check : ''}</button><div class="grow ttl">${esc(t.title)}</div></div>`).join('')}` : ''}
+    <div class="actions">
+      <button class="btn ghost left" id="dd-note">${ICON.pen.replace('<svg', '<svg width="16" height="16" style="vertical-align:-3px;margin-right:6px"')}${note ? 'Buka catatan hari ini' : 'Tulis catatan'}</button>
+      <button class="btn ghost" id="dd-close">Tutup</button>
+      <button class="btn primary" id="dd-add">+ Acara</button>
+    </div>`);
+  $$('[data-id]', s).forEach((r) => r.onclick = () => editEvent(events.find((e) => e.id === r.dataset.id), null, () => dayDetail(key)));
+  $$('[data-todo]', s).forEach((r) => r.querySelector('.check').onclick = async () => { await toggleTodo(r.dataset.todo); dayDetail(key); });
+  $('#dd-close', s).onclick = () => closeSheet();
+  $('#dd-add', s).onclick = () => editEvent(null, key, () => dayDetail(key));
+  $('#dd-note', s).onclick = () => { closeSheet(); openDay(key, $(`.cell[data-date="${key}"]`, root)); };
+}
+
+// ---------- Tambah / ubah acara ----------
+export const newEvent = (date) => editEvent(undefined, date); // dipakai Dashboard
+function editEvent(ev, date, after) {
+  const isNew = !ev;
+  ev = ev || { title: '', date: date || selected, time: '', end: '', note: '', color: settings.calAccent, repeat: 'none', remind: settings.defaultRemind ?? '10' };
+  let color = ev.color;
+  const s = openSheet(`
+    <h3>${isNew ? 'Acara baru' : 'Ubah acara'}</h3>
+    <div class="field"><label>Judul</label><input class="inp" id="e-title" value="${esc(ev.title)}" placeholder="Mis. Ujian, praktik, deadline tugas"></div>
+    <div class="field"><label>Tanggal</label><input class="inp" id="e-date" type="date" value="${ev.date}"></div>
+    <div class="two">
+      <div class="field"><label>Mulai (opsional)</label><input class="inp" id="e-time" type="time" value="${ev.time || ''}"></div>
+      <div class="field"><label>Selesai (opsional)</label><input class="inp" id="e-end" type="time" value="${ev.end || ''}"></div>
+    </div>
+    <div class="field"><label>Ulangi</label><select class="inp" id="e-rep">${Object.entries(REPEAT).map(([k, v]) => `<option value="${k}" ${ev.repeat === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+    <div class="field"><label>Ingatkan</label><select class="inp" id="e-rem">${Object.entries(REMIND).map(([k, v]) => `<option value="${k}" ${String(ev.remind ?? '') === k ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+    <div class="field"><label>Catatan</label><textarea class="inp" id="e-note" rows="2">${esc(ev.note)}</textarea></div>
+    <div class="field"><label>Warna</label><div class="swatches">${[...new Set([settings.calAccent, ...COLORS])].map((c) => `<button class="sw ${c === color ? 'on' : ''}" data-c="${c}" style="background:${c}"></button>`).join('')}</div></div>
+    <div class="actions">
+      ${isNew ? '' : '<button class="btn danger left" id="e-del">Hapus</button>'}
+      <button class="btn ghost" id="e-cancel">Batal</button>
+      <button class="btn primary" id="e-save">Simpan</button>
+    </div>`, { guardForm: true, onSave: () => submit() }); // sudah diisi tapi belum disimpan → tanya dulu
+  if (isNew) setTimeout(() => $('#e-title', s).focus(), 40);
+  $$('.sw', s).forEach((b) => b.onclick = () => { color = b.dataset.c; $$('.sw', s).forEach((x) => x.classList.toggle('on', x === b)); });
+  $('#e-cancel', s).onclick = () => closeSheet();
+  if (!isNew) $('#e-del', s).onclick = async () => {
+    if (!(await confirmDialog(`Hapus acara "${ev.title}"?`, { ok: 'Hapus', danger: true }))) return;
+    events = events.filter((e) => e.id !== ev.id); await db.del('events', ev.id); reschedule(); render(); after?.(); toast('Acara dihapus');
+  };
+  const submit = async () => {
+    const title = $('#e-title', s).value.trim();
+    if (!title) { $('#e-title', s).focus(); return; }
+    const data = { title, date: $('#e-date', s).value || selected, time: $('#e-time', s).value, end: $('#e-end', s).value, repeat: $('#e-rep', s).value, remind: $('#e-rem', s).value, note: $('#e-note', s).value.trim(), color };
+    let rec;
+    if (isNew) { rec = { id: uid(), created: Date.now(), ...data }; events.push(rec); } else { rec = Object.assign(ev, data); }
+    await db.put('events', rec);
+    if (rec.remind !== '') ensurePermission().then(reschedule); else reschedule();
+    if (!after) { selected = data.date; const d = parseYmd(data.date); cursor = new Date(d.getFullYear(), d.getMonth(), 1); }
+    closeSheet(); render(); after?.(); toast(isNew ? 'Acara ditambahkan' : 'Acara diperbarui');
+  };
+  $('#e-save', s).onclick = submit;
+  $('#e-title', s).onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+}
+
+// ---------- Agenda ----------
+function agenda() {
+  const t = today(); const items = [];
+  for (let i = 0; i < 90 && items.length < 60; i++) {
+    const d = new Date(t); d.setDate(t.getDate() + i);
+    for (const e of eventsOn(d)) items.push({ d, e });
+  }
+  const s = openSheet(`<h3>Agenda 90 hari ke depan</h3>
+    ${items.length ? items.map(({ d, e }) => `<div class="row click" data-id="${e.id}" data-date="${ymd(d)}"><span class="bar" style="background:${e.color}"></span>
+      <div class="grow"><div>${esc(e.title)}</div><div class="sub">${longDate(d)}${e.time ? ' · ' + e.time : ''}</div></div></div>`).join('')
+      : '<div class="empty" style="padding:30px">Belum ada acara mendatang.</div>'}
+    <div class="actions"><button class="btn ghost" id="ag-c">Tutup</button></div>`);
+  $('#ag-c', s).onclick = () => closeSheet();
+  $$('.row', s).forEach((r) => r.onclick = () => { selected = r.dataset.date; const d = parseYmd(selected); cursor = new Date(d.getFullYear(), d.getMonth(), 1); closeSheet(); render(); });
+}
+
+// ---------- Kustomisasi ----------
+export function customize() {
+  const opt = (key, val, label) => `<button class="chip-opt ${settings[key] === val ? 'on' : ''}" data-k="${key}" data-v='${JSON.stringify(val)}'>${label}</button>`;
+  const s = openSheet(`
+    <h3>Sesuaikan kalender</h3>
+    <div class="field"><label>Warna utama</label><div class="swatches">${ACCENTS.map((c) => `<button class="sw ${c === settings.calAccent ? 'on' : ''}" data-acc="${c}" style="background:${c}"></button>`).join('')}
+      <label class="sw" style="background:conic-gradient(red,yellow,lime,cyan,blue,magenta,red);position:relative;overflow:hidden" title="Warna lain"><input type="color" id="cz-col" value="${settings.calAccent}" style="opacity:0;position:absolute;inset:0;width:100%;height:100%"></label></div></div>
+    <div class="field"><label>Minggu dimulai hari</label><div class="chips">${opt('weekStart', 1, 'Senin')}${opt('weekStart', 0, 'Minggu')}${opt('weekStart', 6, 'Sabtu')}</div></div>
+    <div class="field"><label>Penanda hari ini</label><div class="chips">${opt('todayStyle', 'bar', 'Blok penuh')}${opt('todayStyle', 'round', 'Bulat')}</div></div>
+    <div class="field"><label>Tampilan acara</label><div class="chips">${opt('eventStyle', 'label', 'Label judul')}${opt('eventStyle', 'dot', 'Titik warna')}</div></div>
+    <div class="field"><label>Nomor minggu</label><div class="chips">${opt('weekNumbers', false, 'Sembunyikan')}${opt('weekNumbers', true, 'Tampilkan')}</div></div>
+    <div class="field"><label>Tanggal bulan lain</label><div class="chips">${opt('showOther', true, 'Tampilkan')}${opt('showOther', false, 'Sembunyikan')}</div></div>
+    <div class="field"><label>Hari Minggu merah</label><div class="chips">${opt('redSunday', true, 'Ya')}${opt('redSunday', false, 'Tidak')}</div></div>
+    <div class="actions"><button class="btn primary" id="cz-ok">Selesai</button></div>`);
+  const apply = () => { saveSettings(); applyAccent(); render(); };
+  $$('[data-acc]', s).forEach((b) => b.onclick = () => { settings.calAccent = b.dataset.acc; $$('[data-acc]', s).forEach((x) => x.classList.toggle('on', x === b)); apply(); });
+  $('#cz-col', s).oninput = (e) => { settings.calAccent = e.target.value; $$('[data-acc]', s).forEach((x) => x.classList.remove('on')); apply(); };
+  $$('[data-k]', s).forEach((b) => b.onclick = () => {
+    settings[b.dataset.k] = JSON.parse(b.dataset.v);
+    $$(`[data-k="${b.dataset.k}"]`, s).forEach((x) => x.classList.toggle('on', x === b)); apply();
+  });
+  $('#cz-ok', s).onclick = () => closeSheet();
+}
