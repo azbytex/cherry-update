@@ -1,0 +1,117 @@
+// Kotak seleksi untuk foto/stiker: geser, ubah ukuran (pegangan ala jendela Windows), putar, hapus.
+import { ICON } from './ui.js';
+
+// container: elemen ber-position relative tempat kotak diletakkan.
+// Model dalam piksel container: { x, y, w, h, r } (x,y = pojok kiri atas sebelum diputar; r = radian)
+export function createTransformBox(container) {
+  const box = document.createElement('div');
+  box.className = 'tbox';
+  box.hidden = true;
+  box.innerHTML = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].map((h) => `<i class="tb-h h-${h}" data-h="${h}"></i>`).join('') +
+    `<button class="tb-dup" title="Duplikasi">${ICON.copy}</button>` +
+    `<button class="tb-ai" title="Tanya AI">${ICON.ai}</button>` +
+    `<i class="tb-rot" data-rot title="Putar"></i><span class="tb-size"></span><button class="tb-lock" title="Kunci"></button><button class="tb-del" title="Hapus">${ICON.trash}</button>`;
+  container.appendChild(box);
+  let m = null, opts = null;
+
+  // Item kecil: kotak seleksi diberi jarak di luar item supaya pegangan tidak menutupinya
+  const MIN_BOX = 64;
+  const dupBtn = box.querySelector('.tb-dup'), aiBtn = box.querySelector('.tb-ai'), lockBtn = box.querySelector('.tb-lock');
+  const locked = () => !!opts?.locked?.();
+  const apply = () => {
+    const px = Math.max(8, (MIN_BOX - m.w) / 2), py = Math.max(8, (MIN_BOX - m.h) / 2);
+    Object.assign(box.style, { left: m.x - px + 'px', top: m.y - py + 'px', width: m.w + 2 * px + 'px', height: m.h + 2 * py + 'px', transform: `rotate(${m.r}rad)` });
+    box.classList.toggle('small', Math.min(m.w, m.h) < 60);
+    box.classList.toggle('has-dup', !!opts?.onDuplicate);
+    box.querySelector('.tb-size').textContent = opts?.label ? opts.label(m) : '';
+    if (dupBtn) dupBtn.style.display = opts?.onDuplicate ? 'grid' : 'none';
+    if (aiBtn) aiBtn.style.display = opts?.onAskAi ? 'grid' : 'none';
+    const lk = locked();
+    box.classList.toggle('locked', lk);
+    lockBtn.style.display = opts?.onLock ? 'grid' : 'none';
+    lockBtn.innerHTML = lk ? ICON.lock : ICON.unlock;
+    lockBtn.title = lk ? 'Buka kunci' : 'Kunci';
+  };
+  // kanvas bisa sedang diputar: gerakan jari di layar diubah ke arah halaman
+  const unrot = (dx, dy) => { const r = -(opts?.viewRot?.() || 0); if (!r) return [dx, dy]; const c = Math.cos(r), s = Math.sin(r); return [dx * c - dy * s, dx * s + dy * c]; };
+
+  function drag(e, onMove, isBody = false) {
+    e.preventDefault(); e.stopPropagation();
+    const el = e.currentTarget || box;
+    try { el.setPointerCapture(e.pointerId); } catch {}
+    box.classList.add('dragging');
+    const x0 = e.clientX, y0 = e.clientY;
+    let moved = false;
+    const mv = (ev) => { if (Math.hypot(ev.clientX - x0, ev.clientY - y0) > 4) moved = true; if (!moved) return; onMove(ev); apply(); opts.onChange?.(m); };
+    const up = () => {
+      el.removeEventListener('pointermove', mv); el.removeEventListener('pointerup', up); el.removeEventListener('pointercancel', up);
+      box.classList.remove('dragging');
+      if (moved) opts.onCommit?.(m);
+      else if (isBody) opts.onTap?.();
+    };
+    el.addEventListener('pointermove', mv); el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
+  }
+
+  // geser
+  box.addEventListener('pointerdown', (e) => {
+    if (e.target !== box) return;
+    const x0 = e.clientX, y0 = e.clientY, mx = m.x, my = m.y;
+    drag(e, (ev) => { if (locked()) return; const [dx, dy] = unrot(ev.clientX - x0, ev.clientY - y0); m.x = mx + dx; m.y = my + dy; }, true);
+  });
+  // ubah ukuran (rasio tetap), sisi yang berlawanan tetap di tempat
+  box.querySelectorAll('.tb-h').forEach((h) => h.addEventListener('pointerdown', (e) => {
+    const dir = h.dataset.h;
+    const hx = dir.includes('e') ? 1 : dir.includes('w') ? -1 : 0;
+    const vy = dir.includes('s') ? 1 : dir.includes('n') ? -1 : 0;
+    const s0 = { ...m }, x0 = e.clientX, y0 = e.clientY, asp = s0.w / s0.h;
+    const cos = Math.cos(-s0.r), sin = Math.sin(-s0.r);
+    drag(e, (ev) => {
+      const [gx, gy] = unrot(ev.clientX - x0, ev.clientY - y0);
+      const lx = gx * cos - gy * sin, ly = gx * sin + gy * cos; // ke sumbu lokal
+      const dx = lx * hx, dy = ly * vy * asp;
+      if (hx && !vy && opts.sideFree) { // sisi kiri/kanan: ubah lebar saja (teks pindah baris), sisi seberang diam
+        const nw = Math.max(opts.min || 24, Math.min(opts.max?.() || 1e9, s0.w + dx));
+        const ox = hx * (nw - s0.w) / 2, c = Math.cos(s0.r), sn = Math.sin(s0.r);
+        const cx = s0.x + s0.w / 2 + ox * c, cy = s0.y + s0.h / 2 + ox * sn;
+        m.w = nw; m.side = hx; m.x = cx - nw / 2; m.y = cy - s0.h / 2; m.h = s0.h;
+        return;
+      }
+      m.side = 0;
+      const d = hx && vy ? (dx + dy) / 2 : hx ? dx : dy;
+      const nw = Math.max(opts.min || 24, Math.min(opts.max?.() || 1e9, s0.w + d)), nh = nw / asp;
+      // geser pusat agar sisi berlawanan diam
+      const ox = hx * (nw - s0.w) / 2, oy = vy * (nh - s0.h) / 2;
+      const c = Math.cos(s0.r), sn = Math.sin(s0.r);
+      const cx = s0.x + s0.w / 2 + ox * c - oy * sn, cy = s0.y + s0.h / 2 + ox * sn + oy * c;
+      m.w = nw; m.h = nh; m.x = cx - nw / 2; m.y = cy - nh / 2;
+    });
+  }));
+  // putar
+  box.querySelector('.tb-rot').addEventListener('pointerdown', (e) => {
+    drag(e, (ev) => {
+      // pusat kotak di layar (tetap benar walau kanvas diputar)
+      const br = box.getBoundingClientRect(), cx = br.left + br.width / 2, cy = br.top + br.height / 2;
+      let a = Math.atan2(ev.clientY - cy, ev.clientX - cx) + Math.PI / 2 - (opts.viewRot?.() || 0);
+      a = Math.atan2(Math.sin(a), Math.cos(a));
+      for (const snap of [0, Math.PI / 2, Math.PI, -Math.PI / 2, -Math.PI]) if (Math.abs(a - snap) < 0.07) a = snap;
+      m.r = a;
+    });
+  });
+  if (dupBtn) {
+    dupBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+    dupBtn.addEventListener('click', (e) => { e.stopPropagation(); opts?.onDuplicate?.(); });
+  }
+  if (aiBtn) {
+    aiBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+    aiBtn.addEventListener('click', (e) => { e.stopPropagation(); opts?.onAskAi?.(); });
+  }
+  lockBtn.addEventListener('pointerdown', (e) => e.stopPropagation());
+  lockBtn.addEventListener('click', (e) => { e.stopPropagation(); opts?.onLock?.(); apply(); });
+  box.querySelector('.tb-del').addEventListener('pointerdown', (e) => e.stopPropagation());
+  box.querySelector('.tb-del').addEventListener('click', (e) => { e.stopPropagation(); const o = opts; detach(); o?.onDelete?.(); });
+
+  function attach(model, o) { m = { ...model }; opts = o || {}; box.hidden = false; apply(); box.classList.remove('pop'); void box.offsetWidth; box.classList.add('pop'); }
+  function detach() { box.hidden = true; m = null; opts = null; }
+  function update(model) { if (!m) return; m = { ...model }; apply(); }
+  return { el: box, attach, detach, update, get active() { return !!m; } };
+}
