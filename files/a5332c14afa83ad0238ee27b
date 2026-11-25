@@ -1,0 +1,369 @@
+// Dashboard: satu pintu masuk untuk Kalender, Catatan, dan To-do.
+// Isi: sapaan + tombol cepat, tiga kartu bagian (gaya sampul buku), agenda 7 hari,
+// tugas yang bisa langsung dicentang, dan buku yang terakhir dibuka.
+import { settings, saveSettings } from './db.js';
+import { $, $$, esc, ICON, ymd, MONTHS_LONG, DAYS, DAYS_LONG } from './ui.js';
+import { lang } from './i18n.js';
+import { state, onChange } from './notebooks.js';
+import { getEvents, occursOn, showDate, newEvent } from './calendar.js';
+import { openTodos, toggleTodo, newTodo } from './todo.js';
+import { coverHTML, hydrateImages, open as openNotebook, newNotebookDialog } from './library.js';
+import { createSlime } from './slime.js';
+import { ensureFont } from './fonts.js';
+
+let root = null, go = () => {};
+let selDay = null;   // hari yang dipilih di strip agenda (default: hari ini)
+let lastSig = '';    // tanda isi data; render ulang hanya kalau berubah
+
+const IC = {
+  calendar: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M8 3v4M16 3v4"/><path class="acc" d="M9 11.5h6"/></svg>',
+  notes: '<svg viewBox="0 0 24 24"><rect x="4.5" y="4.5" width="15" height="16.5" rx="2.5"/><path d="M9 3h6v3H9z"/><path class="acc" d="M8.5 11h7M8.5 15h5"/></svg>',
+  todo: '<svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="17" height="17" rx="3"/><path class="acc" d="M8 12l3 3 5-6"/></svg>',
+  plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+  arrow: '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>',
+};
+// hari singkat memakai DAYS dari ui.js agar otomatis mengikuti bahasa
+
+export function initDashboard(el, navigate) {
+  root = el; go = navigate;
+  root.innerHTML = `
+    <div class="topbar"><div class="title">Dashboard</div><div class="spacer"></div></div>
+    <div class="notes-wrap">
+      <aside class="nside dside" id="d-side"></aside>
+      <div class="scroll"><div class="dmain" id="d-main">
+        <section class="dhero">
+          <div class="dhero-txt">
+            <div class="dhero-date" id="d-date"></div>
+            <h2 id="d-greet"></h2>
+            <p id="d-sum"></p>
+            <div class="dhero-acts">
+              <button class="dchip" data-act="book">${IC.plus}Buku baru</button>
+              <button class="dchip" data-act="event">${IC.plus}Acara</button>
+              <button class="dchip" data-act="todo">${IC.plus}Tugas</button>
+            </div>
+          </div>
+          <div class="dhero-art" id="d-art" aria-hidden="true">
+            <img class="dart-logo" src="assets/logo/logo_apel.svg" alt="">
+            <video class="dart-vid" muted playsinline preload="auto" disablepictureinpicture disableremoteplayback></video>
+          </div>
+          <i class="dhero-dot d1"></i><i class="dhero-dot d2"></i><i class="dhero-dot d3"></i>
+        </section>
+        <div class="dbody" id="d-body"></div>
+      </div></div>
+    </div>`;
+
+  root.addEventListener('click', (e) => {
+    const chk = e.target.closest('[data-done]');
+    if (chk) { e.stopPropagation(); chk.classList.add('ticking'); setTimeout(async () => { await toggleTodo(chk.dataset.done); refresh(); }, 260); return; }
+    const srt = e.target.closest('[data-sort]');
+    if (srt) {
+      const seg = srt.closest('.dseg'), prev = $('button.on', seg);
+      if (prev === srt || seg._slime?.busy) return; // tunggu animasi selesai
+      settings.dashTodoSort = srt.dataset.sort; saveSettings();
+      $$('button', seg).forEach((b) => { b.classList.toggle('on', b === srt); b.setAttribute('aria-pressed', b === srt); });
+      createSlime(seg, { blur: 4 }).move(prev, srt);
+      const panel = $('#d-tasks', root), tmp = document.createElement('div');
+      tmp.innerHTML = tasksHTML(openTodos(), ymd(new Date()));
+      const box = $('.dlistbox', panel);
+      box.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 110, fill: 'forwards' }).finished.then(() => {
+        box.innerHTML = $('.dlistbox', tmp).innerHTML; box.getAnimations().forEach((a) => a.cancel());
+        box.animate([{ opacity: 0, transform: 'translateY(-4px)' }, { opacity: 1, transform: 'none' }], { duration: 180, easing: 'ease-out' });
+      });
+      $('.dmore', panel).outerHTML = $('.dmore', tmp).outerHTML;
+      return;
+    }
+    const day = e.target.closest('[data-pick]');
+    if (day) { pickDay(day.dataset.pick); return; }
+    const ev = e.target.closest('[data-day]');
+    if (ev) { go('calendar'); showDate(ev.dataset.day); return; }
+    const nb = e.target.closest('[data-nb]');
+    if (nb) { const n = state.notebooks.find((x) => x.id === nb.dataset.nb); if (n) openNotebook(n, nb.querySelector('.cover')); return; }
+    const act = e.target.closest('[data-act]');
+    if (act) { ({ book: newNotebookDialog, event: () => newEvent(act.dataset.date || ymd(new Date())), todo: newTodo })[act.dataset.act]?.(); return; }
+    const b = e.target.closest('[data-go]'); if (b) go(b.dataset.go);
+  });
+  root.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.matches('[role="button"]')) { e.preventDefault(); e.target.click(); }
+  });
+  // data berubah (buku baru, acara/tugas disimpan) → segarkan diam-diam; batal = tidak ada perubahan = tidak render
+  const refresh = () => { if (root.classList.contains('active')) render(false); };
+  onChange(refresh);
+  new MutationObserver(() => { if (!$('#scrim').classList.contains('open')) setTimeout(refresh, 60); }).observe($('#scrim'), { attributes: true, attributeFilter: ['class'] });
+  $('#editor') && new MutationObserver(refresh).observe($('#editor'), { attributes: true, attributeFilter: ['class'] });
+  // animasi logo hanya jalan saat Dashboard terlihat
+  new MutationObserver(() => heroArt.sync()).observe(root, { attributes: true, attributeFilter: ['class'] });
+  document.addEventListener('visibilitychange', () => heroArt.sync());
+  heroArt.init($('#d-art', root));
+}
+
+// ---------- Logo mengambang ↔ video animasi (posisi apel sama persis) ----------
+// Video: 0–2,65 dtk apel digambar, lalu berubah jadi tulisan "cherry", hilang, dan berulang mulus.
+// Alur: logo diam mengambang 2 dtk → video lanjut dari frame apel utuh (2,65) → tulisan cherry →
+// video berulang menggambar apel lagi → di frame apel utuh kembali jadi logo mengambang.
+const APPLE_T = 2.55, FLOAT_MS = 2000; // 2,55 dtk: apel + coretan utuh, sebelum "ekor" tulisan cherry muncul
+// Saat "diam mengambang", yang tampil adalah video itu sendiri yang dijeda di frame apel utuh,
+// jadi tebal garis & posisinya selalu identik dengan animasinya (tidak ada pergantian gambar).
+// Logo SVG hanya cadangan sampai video siap / kalau video gagal dimuat.
+const heroArt = {
+  el: null, vid: null, timer: 0, raf: 0, phase: 'off', wrapped: false, lastT: 0, ready: false,
+  init(el) {
+    this.el = el; this.vid = $('video', el);
+    const v = this.vid;
+    v.onerror = () => { this.phase = 'broken'; el.classList.add('broken'); };
+    v.addEventListener('loadeddata', async () => {
+      await this.seek(APPLE_T);
+      this.ready = true; el.classList.add('ready'); // frame apel siap → ganti diam-diam dari logo cadangan
+      this.sync();
+    }, { once: true });
+    v.src = 'assets/splash/loading_transparan.webm';
+  },
+  seek(t) {
+    const v = this.vid;
+    if (Math.abs(v.currentTime - t) < 0.01) return Promise.resolve();
+    return new Promise((r) => { v.addEventListener('seeked', r, { once: true }); v.currentTime = t; });
+  },
+  visible() { return root?.classList.contains('active') && !document.hidden && !$('#editor')?.classList.contains('open'); },
+  sync() {
+    if (!this.ready || this.phase === 'broken') return;
+    if (this.visible()) { if (this.phase === 'off') this.floatThenPlay(); }
+    else this.stop();
+  },
+  async stop() {
+    clearTimeout(this.timer); cancelAnimationFrame(this.raf);
+    const wasPlaying = this.phase === 'video';
+    this.phase = 'off'; this.vid.pause();
+    if (wasPlaying) await this.seek(APPLE_T); // kembali ke frame apel, siap untuk kunjungan berikutnya
+  },
+  floatThenPlay() {
+    this.phase = 'float';
+    clearTimeout(this.timer);
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return; // kurangi gerakan: apel diam saja
+    this.timer = setTimeout(() => this.play(), FLOAT_MS);
+  },
+  async play() {
+    if (!this.visible()) return this.stop();
+    const v = this.vid;
+    try { await v.play(); } catch { this.phase = 'off'; return; } // autoplay ditolak: tetap tampil diam di frame apel
+    this.phase = 'video'; this.wrapped = false; this.lastT = v.currentTime;
+    const tick = () => {
+      if (this.phase !== 'video') return;
+      if (v.ended) { v.currentTime = 0; v.play().catch(() => {}); this.wrapped = true; }
+      const t = v.currentTime;
+      if (t + 0.5 < this.lastT) this.wrapped = true; // video berputar ke awal
+      this.lastT = t;
+      if (this.wrapped && t >= APPLE_T) { // apel utuh lagi → berhenti di frame itu dan mengambang
+        v.pause();
+        if (t - APPLE_T > 0.02) v.currentTime = APPLE_T;
+        return this.floatThenPlay();
+      }
+      this.raf = requestAnimationFrame(tick);
+    };
+    this.raf = requestAnimationFrame(tick);
+  },
+};
+
+const eventsOn = (d) => { const key = ymd(d); return getEvents().filter((ev) => occursOn(ev, d, key)).sort((a, b) => (a.time || '99').localeCompare(b.time || '99')); };
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+const greeting = (h) => (h < 11 ? 'Selamat pagi' : h < 15 ? 'Selamat siang' : h < 18 ? 'Selamat sore' : 'Selamat malam');
+
+function signature() {
+  const ev = getEvents().map((e) => [e.id, e.date, e.time, e.title, e.color, e.repeat].join('|')).join(';');
+  const td = openTodos().map((t) => [t.id, t.title, t.due, t.prio].join('|')).join(';');
+  const nb = state.notebooks.map((n) => [n.id, n.updated, n.title, n.trashed, n.cover?.c, n.pageIds.length].join('|')).join(';');
+  return [ymd(new Date()), new Date().getHours() < 11 ? 0 : new Date().getHours() < 15 ? 1 : new Date().getHours() < 18 ? 2 : 3, settings.calAccent, ev, td, nb].join('#');
+}
+
+// kalender mini bulan ini untuk sampul kartu Kalender
+function miniMonth(now) {
+  const y = now.getFullYear(), m = now.getMonth(), first = new Date(y, m, 1), days = new Date(y, m + 1, 0).getDate();
+  const lead = (first.getDay() + 6) % 7; // mulai Senin
+  let cells = '';
+  for (let i = 0; i < lead; i++) cells += '<i></i>';
+  for (let d = 1; d <= days; d++) cells += `<i class="${d === now.getDate() ? 'today' : ''} ${eventsOn(new Date(y, m, d)).length ? 'ev' : ''}">${d}</i>`;
+  const hdr = lang() === 'en' ? ['M', 'T', 'W', 'T', 'F', 'S', 'S'] : ['S', 'S', 'R', 'K', 'J', 'S', 'M'];
+  return `<div class="dmini"><div class="dmini-h">${hdr.map((x) => `<b>${x}</b>`).join('')}</div><div class="dmini-g">${cells}</div></div>`;
+}
+
+function weekDays() {
+  const now = new Date();
+  const week = [...Array(7)].map((_, i) => { const d = addDays(now, i); return { d, key: ymd(d), evs: eventsOn(d) }; });
+  if (!week.some((w) => w.key === selDay)) selDay = ymd(now);
+  return week;
+}
+// bagian yang berganti saat hari dipilih: label, daftar acara, tautan bawah
+function dayParts(cur) {
+  const todayKey = ymd(new Date()), accent = settings.calAccent || 'var(--cal)';
+  const label = cur.key === todayKey ? 'Hari ini' : `${DAYS_LONG[cur.d.getDay()]}, ${cur.d.getDate()} ${MONTHS_LONG[cur.d.getMonth()]}`;
+  const more = cur.evs.length - SHOW;
+  return {
+    sub: `<span>${label} · ${cur.evs.length} acara</span>`,
+    list: cur.evs.length ? cur.evs.slice(0, SHOW).map((ev) => `
+        <button class="drow" data-day="${cur.key}"><i class="dbar" style="background:${esc(ev.color || accent)}"></i>
+          <span class="grow"><span class="drow-t">${esc(ev.title || 'Acara')}</span><span class="drow-s">${ev.time ? esc(ev.time) + (ev.end ? ' – ' + esc(ev.end) : '') : 'Sepanjang hari'}</span></span>
+        </button>`).join('')
+      : `<div class="dnone"><span>Belum ada acara di hari ini.</span><button class="dchip" data-act="event" data-date="${cur.key}">${IC.plus}Tambah acara</button></div>`,
+    more: `<button class="dmore" ${more > 0 ? `data-day="${cur.key}"` : 'data-go="calendar"'}>${more > 0 ? `+${more} acara lainnya` : 'Buka kalender'} ${IC.arrow}</button>`,
+  };
+}
+function agendaHTML() {
+  const todayKey = ymd(new Date()), accent = settings.calAccent || 'var(--cal)';
+  const week = weekDays();
+  const cur = week.find((w) => w.key === selDay);
+  const p = dayParts(cur);
+  // susunan sama persis dengan panel Tugas: judul+tombol buat · baris kotak · label · 3 baris · tautan bawah
+  return `
+    <section class="dpanel" id="d-agenda">
+      <header><h3>Agenda minggu ini</h3><button class="dadd" data-act="event" data-date="${cur.key}" title="Tambah acara" aria-label="Tambah acara">${IC.plus}</button></header>
+      <div class="dtiles dweek">${week.map((w) => `<button class="dday ${w.key === selDay ? 'on' : ''} ${w.key === todayKey ? 'today' : ''}" data-pick="${w.key}" aria-pressed="${w.key === selDay}"><small>${DAYS[w.d.getDay()]}</small><b>${w.d.getDate()}</b><span class="ddots">${w.evs.slice(0, 3).map((ev) => `<i style="background:${esc(ev.color || accent)}"></i>`).join('')}</span></button>`).join('')}</div>
+      <div class="dsub">${p.sub}</div>
+      <div class="dlistbox">${p.list}</div>
+      ${p.more}
+    </section>`;
+}
+const SHOW = 3; // jumlah baris di panel Agenda & Tugas
+
+function tasksHTML(todos, todayKey) {
+  const order = settings.dashTodoSort === 'old' ? 'old' : 'new';
+  const list = [...todos].sort((a, b) => (order === 'new' ? (b.created || 0) - (a.created || 0) : (a.created || 0) - (b.created || 0)));
+  const late = todos.filter((t) => t.due && t.due < todayKey).length;
+  const today = todos.filter((t) => t.due === todayKey).length;
+  const more = list.length - SHOW;
+  const tile = (n, l, cls = '') => `<div class="dday dstat ${cls}"><small>${l}</small><b>${n}</b><span class="ddots"></span></div>`;
+  return `
+    <section class="dpanel" id="d-tasks">
+      <header><h3>Tugas</h3><button class="dadd" data-act="todo" title="Tambah tugas" aria-label="Tambah tugas">${IC.plus}</button></header>
+      <div class="dtiles dstats">${tile(today, 'Hari ini')}${tile(late, 'Terlambat', late ? 'warn' : '')}${tile(todos.length, 'Belum selesai')}</div>
+      <div class="dsub"><span>Urutkan</span>
+        <div class="dseg" role="group" aria-label="Urutkan tugas">
+          <button data-sort="new" class="${order === 'new' ? 'on' : ''}" aria-pressed="${order === 'new'}">Terbaru</button>
+          <button data-sort="old" class="${order === 'old' ? 'on' : ''}" aria-pressed="${order === 'old'}">Terlama</button>
+        </div>
+      </div>
+      <div class="dlistbox">${list.length ? list.slice(0, SHOW).map((t) => {
+        const isLate = t.due && t.due < todayKey;
+        const when = t.due ? (t.due === todayKey ? 'Hari ini' : isLate ? 'Terlambat' : t.due.slice(8) + '/' + t.due.slice(5, 7)) : 'Tanpa tenggat';
+        return `<div class="drow dtask p${t.prio || 0}"><button class="dcheck" data-done="${t.id}" aria-label="Tandai selesai: ${esc(t.title)}">${ICON.check}</button>
+          <span class="grow" data-go="todo" role="button" tabindex="0"><span class="drow-t">${esc(t.title)}</span><span class="drow-s ${isLate ? 'late' : ''}">${when}</span></span></div>`;
+      }).join('')
+      : `<div class="dnone"><span>Tidak ada tugas. Santai dulu 🍒</span><button class="dchip" data-act="todo">${IC.plus}Tambah tugas</button></div>`}</div>
+      <button class="dmore" data-go="todo">${more > 0 ? `+${more} tugas lainnya` : 'Lihat semua tugas'} ${IC.arrow}</button>
+    </section>`;
+}
+
+// penanda slime di strip hari & segmen urutkan (posisi awal, tanpa animasi)
+function placeSlimes() {
+  const wk = $('#d-agenda .dweek', root), sg = $('#d-tasks .dseg', root);
+  if (wk) createSlime(wk, { blur: 7 }).place($('.dday.on', wk));
+  if (sg) createSlime(sg, { blur: 4 }).place($('button.on', sg));
+}
+
+// ketuk hari: pilih hari itu + denyut 2 kali sebagai petunjuk (tidak langsung pindah / membuat acara)
+// Tidak membangun ulang strip: gumpalan gelap "melar" seperti slime ke hari tujuan lalu ekornya tersedot ikut,
+// daftar di bawahnya berganti dengan fade halus, lalu petunjuk berdenyut 2 kali.
+function pickDay(key) {
+  const panel = $('#d-agenda', root); if (!panel) return;
+  if ($('.dweek', panel)._slime?.busy) return; // tunggu animasi selesai
+  const days = $$('.dday[data-pick]', panel);
+  const from = days.findIndex((b) => b.classList.contains('on')), to = days.findIndex((b) => b.dataset.pick === key);
+  if (to < 0) return;
+  selDay = key;
+  const week = weekDays(), cur = week[to];
+  const pulse = () => {
+    for (const t of $$('.dlistbox .drow, .dnone .dchip', panel)) { t.classList.remove('hint'); void t.offsetWidth; t.classList.add('hint'); t.addEventListener('animationend', () => t.classList.remove('hint'), { once: true }); }
+  };
+  if (from === to) return pulse();
+
+  days.forEach((b, i) => { b.classList.toggle('on', i === to); b.setAttribute('aria-pressed', i === to); });
+  $('.dadd', panel).dataset.date = key;
+
+  // slime: kepala melesat duluan, tetesan tengah & ekor menyusul berurutan. Filter "goo" (SVG) meleburkan
+  // semuanya jadi satu bentuk cair: leher melengkung memanjang, menipis, lalu tersedot masuk ke hari tujuan.
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  createSlime($('.dweek', panel), { blur: 7 }).move(days[from], days[to]);
+  const dur = reduce ? 0 : 560;
+
+  // ganti isi di bawah tanpa membangun ulang panel
+  const p = dayParts(cur), box = $('.dlistbox', panel);
+  $('.dsub', panel).innerHTML = p.sub;
+  $('.dmore', panel).outerHTML = p.more;
+  box.animate([{ opacity: 1, transform: 'none' }, { opacity: 0, transform: 'translateY(4px)' }], { duration: reduce ? 0 : 120, fill: 'forwards' }).finished.then((a) => {
+    box.innerHTML = p.list;
+    box.getAnimations().forEach((x) => x.cancel());
+    if (!reduce) box.animate([{ opacity: 0, transform: 'translateY(-4px)' }, { opacity: 1, transform: 'none' }], { duration: 180, easing: 'ease-out' });
+    setTimeout(pulse, Math.max(0, dur - 140)); // berdenyut saat gumpalan tiba
+  });
+}
+
+export function render(animate = true) {
+  if (!root) return;
+  const sig = signature();
+  if (!animate && sig === lastSig) return; // tidak ada yang berubah (mis. panel dibatalkan): jangan sentuh tampilan
+  lastSig = sig;
+  const now = new Date(), todayKey = ymd(now);
+  const evs = eventsOn(now);
+  const todos = openTodos();
+  const dueToday = todos.filter((t) => t.due && t.due <= todayKey);
+  const notebooks = state.notebooks.filter((n) => !n.trashed);
+  const books = notebooks.filter((n) => !n.kind || n.kind === 'note');
+  const pages = notebooks.reduce((a, n) => a + n.pageIds.length, 0);
+  const recent = [...notebooks].sort((a, b) => b.updated - a.updated).slice(0, 6);
+  const accent = settings.calAccent || 'var(--cal)';
+  const main = $('#d-main', root);
+  main.classList.toggle('quiet', !animate); // render ulang diam-diam tanpa animasi masuk
+  if (animate) { main.classList.remove('anim'); void main.offsetWidth; main.classList.add('anim'); }
+
+  // ---- panel kiri ----
+  $('#d-side', root).innerHTML = `
+    <div class="stats"><b>${DAYS_LONG[now.getDay()]}, ${now.getDate()}</b>${MONTHS_LONG[now.getMonth()]} ${now.getFullYear()} · ${evs.length} acara · ${dueToday.length} tugas hari ini</div>
+    <button class="nitem" data-go="calendar">${IC.calendar}<span class="grow">Kalender</span><span class="cnt">${evs.length}</span></button>
+    <button class="nitem" data-go="notes">${IC.notes}<span class="grow">Catatan</span><span class="cnt">${books.length}</span></button>
+    <button class="nitem" data-go="todo">${IC.todo}<span class="grow">To-do list</span><span class="cnt">${todos.length}</span></button>
+    <div class="dside-h">Buat cepat</div>
+    <button class="nitem" data-act="book">${IC.plus}<span class="grow">Buku catatan baru</span></button>
+    <button class="nitem" data-act="event">${IC.plus}<span class="grow">Acara baru</span></button>
+    <button class="nitem" data-act="todo">${IC.plus}<span class="grow">Tugas baru</span></button>`;
+
+  // ---- sapaan (elemen tetap, hanya teks diperbarui supaya animasi logo tidak terputus) ----
+  const en = lang() === 'en';
+  const todayBits = en
+    ? [evs.length ? `<b>${evs.length} ${evs.length === 1 ? 'event' : 'events'}</b>` : '', dueToday.length ? `<b>${dueToday.length} ${dueToday.length === 1 ? 'task' : 'tasks'}</b> due` : ''].filter(Boolean)
+    : [evs.length ? `<b>${evs.length} acara</b>` : '', dueToday.length ? `<b>${dueToday.length} tugas</b> yang jatuh tempo` : ''].filter(Boolean);
+  $('#d-date', root).textContent = `${DAYS_LONG[now.getDay()]}, ${now.getDate()} ${MONTHS_LONG[now.getMonth()]} ${now.getFullYear()}`;
+  $('#d-greet', root).textContent = greeting(now.getHours()) + '!';
+  $('#d-sum', root).innerHTML = (todayBits.length ? (en ? `Today has ${todayBits.join(' and ')}.` : `Hari ini ada ${todayBits.join(' dan ')}.`) : 'Tidak ada acara hari ini.') +
+    (!todos.length ? ' Semua tugas beres, waktunya santai!' : !dueToday.length ? ` ${todos.length} tugas masih menunggu.` : '');
+
+  // ---- tiga kartu bagian ----
+  const card = (to, cover, name, meta, i) => `
+    <div class="nb dcard" style="--i:${i}">
+      <div class="cover-box" data-go="${to}" role="button" tabindex="0" aria-label="Buka ${esc(name)}">${cover}</div>
+      <div class="meta"><div class="grow"><div class="name" data-i18n>${esc(name)}</div><div class="date">${meta}</div></div></div>
+    </div>`;
+  const notesCol = recent.find((n) => n.cover?.c)?.cover.c || '#ffd93b';
+  const cards = `<div class="dgrid">${
+    card('calendar', `<div class="cover dcover s-dots" style="--c:${esc(accent)}"><div class="dplate"><div class="dplate-t">${MONTHS_LONG[now.getMonth()]}</div>${miniMonth(now)}</div></div>`,
+      'Kalender', evs.length ? `${evs.length} acara hari ini` : 'Tidak ada acara hari ini', 1) +
+    card('notes', `<div class="cover dcover s-lines" style="--c:${esc(notesCol)}"><div class="dplate"><div class="dplate-t">Catatan</div>${
+      books.length ? `<div class="dbooks">${books.slice(0, 5).map((n) => `<span class="dbook" style="--c:${esc(n.cover?.c || '#ffd93b')}"></span>`).join('')}</div>
+        <ul class="dlist">${[...books].sort((a, b) => b.updated - a.updated).slice(0, 4).map((n) => `<li>${esc(n.title || 'Tanpa judul')}</li>`).join('')}</ul>` : '<div class="dempty">Belum ada buku</div>'}</div></div>`,
+      'Catatan', `${books.length} buku · ${pages} halaman`, 2) +
+    card('todo', `<div class="cover dcover s-grid" style="--c:#22a861"><div class="dplate"><div class="dplate-t">To-do</div>${
+      todos.length ? `<ul class="dlist dtodo">${todos.slice(0, 6).map((t) => `<li class="${t.due && t.due < todayKey ? 'late' : ''}">${esc(t.title)}</li>`).join('')}</ul>` : '<div class="dempty">Semua beres ✓</div>'}</div></div>`,
+      'To-do list', `${todos.length} belum selesai${dueToday.length ? ' · ' + dueToday.length + ' jatuh tempo' : ''}`, 3)
+  }</div>`;
+
+  const tasks = tasksHTML(todos, todayKey);
+
+  // ---- terakhir dibuka ----
+  const shelf = recent.length ? `
+    <section class="dshelf">
+      <header><h3>Terakhir dibuka</h3><button class="dlink" data-go="notes">Semua catatan ${IC.arrow}</button></header>
+      <div class="dshelf-row">${recent.map((n) => `<button class="dshelf-nb" data-nb="${n.id}" title="${esc(n.title)}"><span class="cover-box">${coverHTML(n)}</span><span class="dshelf-n">${esc(n.title || 'Tanpa judul')}</span></button>`).join('')}</div>
+    </section>` : '';
+
+  $('#d-body', root).innerHTML = cards + `<div class="dcols">${agendaHTML()}${tasks}</div>` + shelf;
+  hydrateImages($('#d-body', root));
+  for (const n of recent) if (n.cover?.f) { ensureFont(n.cover.f); ensureFont(n.cover.f, 700); }
+  placeSlimes();
+  heroArt.sync();
+}
