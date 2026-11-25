@@ -1,0 +1,203 @@
+// Klien Groq API (BYOK: key disimpan lokal di perangkat saja, tidak ikut cadangan).
+import { db, settings, saveSettings } from './db.js';
+import { $, $$, esc, toast, openSheet, closeSheet } from './ui.js';
+import { tr } from './i18n.js';
+
+export const GROQ_DEFAULT_MODELS = [
+  'openai/gpt-oss-20b',
+  'openai/gpt-oss-120b',
+  'qwen/qwen3.8-27b',
+];
+
+const KEY_ID = 'groq_key';
+
+export async function getGroqKey() {
+  try {
+    const r = await db.get('kv', KEY_ID);
+    return (r?.value || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+export async function setGroqKey(key) {
+  const clean = (key || '').trim();
+  if (!clean) await db.del('kv', KEY_ID);
+  else await db.put('kv', { id: KEY_ID, value: clean });
+  return clean;
+}
+
+export function getGroqModel() {
+  return settings.groqModel || GROQ_DEFAULT_MODELS[0];
+}
+
+export function getGroqModels() {
+  const cached = Array.isArray(settings.groqModels) && settings.groqModels.length ? settings.groqModels : [];
+  return [...new Set([...cached, ...GROQ_DEFAULT_MODELS])];
+}
+
+export async function fetchGroqModels(apiKey) {
+  const key = (apiKey || await getGroqKey()).trim();
+  if (!key) throw new Error('API key belum diisi');
+  const res = await fetch('https://api.groq.com/openai/v1/models', {
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  if (!res.ok) {
+    if (res.status === 401) throw new Error('API key Groq tidak valid');
+    throw new Error(`HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  const models = (data?.data || [])
+    .map((m) => m.id)
+    .filter((id) => id && !/whisper|tts|guard|playai|orpheus/i.test(id))
+    .sort();
+  if (models.length) {
+    settings.groqModels = models;
+    if (!models.includes(getGroqModel())) {
+      settings.groqModel = models.find((m) => m.includes('gpt-oss-20b')) || models[0];
+    }
+    await saveSettings();
+  }
+  return getGroqModels();
+}
+
+export async function streamGroqChat({ apiKey, model, messages, signal, onDelta }) {
+  const key = (apiKey || await getGroqKey()).trim();
+  if (!key) throw new Error('API key belum diisi');
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    signal,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${key}`,
+    },
+    body: JSON.stringify({
+      model: model || getGroqModel(),
+      stream: true,
+      temperature: 0.6,
+      max_tokens: 2048,
+      messages,
+    }),
+  });
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try { const j = await res.json(); if (j?.error?.message) msg = j.error.message; } catch {}
+    if (res.status === 401) throw new Error('API key Groq tidak valid');
+    if (res.status === 429) throw new Error('Batas permintaan Groq tercapai. Tunggu sebentar lalu coba lagi.');
+    throw new Error(msg);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) {
+    const j = await res.json();
+    const full = j?.choices?.[0]?.message?.content || '';
+    onDelta?.(full, full);
+    return full;
+  }
+  const dec = new TextDecoder();
+  let buf = '', full = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() || '';
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (payload === '[DONE]') continue;
+      try {
+        const j = JSON.parse(payload);
+        const d = j?.choices?.[0]?.delta?.content;
+        if (d) { full += d; onDelta?.(d, full); }
+      } catch {}
+    }
+  }
+  return full;
+}
+
+export function maskKey(k) {
+  if (!k) return '';
+  return k.length <= 10 ? '••••' : `${k.slice(0, 6)}••••${k.slice(-4)}`;
+}
+
+/** Sheet pengaturan Groq API Key & pilihan model. */
+export async function openGroqSettings(onSaved) {
+  const curKey = await getGroqKey();
+  const curModel = getGroqModel();
+  const models = getGroqModels();
+
+  const s = openSheet(`
+    <h3>Asisten AI (Groq)</h3>
+    <p style="font-size:13.5px;color:var(--soft);margin:0 0 12px;line-height:1.5">Tempel API key Groq milikmu (gsk_…, gratis di console.groq.com). Key hanya tersimpan di perangkat ini dan tidak ikut file cadangan.</p>
+    <div class="field">
+      <label>Groq API Key</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input class="inp" id="gq-key" type="password" autocomplete="off" spellcheck="false" placeholder="gsk_..." value="${esc(curKey)}">
+        <button type="button" class="btn ghost" id="gq-eye" style="padding:10px 12px;flex:none">Lihat</button>
+      </div>
+    </div>
+    <div class="field">
+      <label>Model</label>
+      <div class="chips" id="gq-models" style="max-height:140px;overflow-y:auto">
+        ${models.map((m) => `<button type="button" class="chip-opt ${m === curModel ? 'on' : ''}" data-gm="${esc(m)}" style="font-size:12.5px;padding:6px 11px">${esc(m)}</button>`).join('')}
+      </div>
+    </div>
+    <div class="actions">
+      ${curKey ? '<button type="button" class="btn danger left" id="gq-del">Hapus key</button>' : ''}
+      <button type="button" class="btn ghost" id="gq-c">Batal</button>
+      <button type="button" class="btn yellow" id="gq-ok">Simpan</button>
+    </div>`);
+
+  let pickedModel = curModel;
+  const keyInp = $('#gq-key', s);
+  const eyeBtn = $('#gq-eye', s);
+  eyeBtn.onclick = () => {
+    const show = keyInp.type === 'password';
+    keyInp.type = show ? 'text' : 'password';
+    eyeBtn.textContent = tr(show ? 'Sembunyi' : 'Lihat');
+  };
+  const bindModels = () => $$('[data-gm]', s).forEach((b) => {
+    b.onclick = () => {
+      pickedModel = b.dataset.gm;
+      $$('[data-gm]', s).forEach((x) => x.classList.toggle('on', x === b));
+    };
+  });
+  bindModels();
+
+  $('#gq-c', s).onclick = () => closeSheet();
+  $('#gq-del', s)?.addEventListener('click', async () => {
+    await setGroqKey('');
+    toast('API key Groq dihapus');
+    closeSheet();
+    onSaved?.();
+  });
+  $('#gq-ok', s).onclick = async () => {
+    const val = keyInp.value.trim();
+    if (!val) {
+      await setGroqKey('');
+      settings.groqModel = pickedModel;
+      await saveSettings();
+      toast('API key Groq dihapus');
+      closeSheet();
+      onSaved?.();
+      return;
+    }
+    const okBtn = $('#gq-ok', s);
+    okBtn.disabled = true;
+    okBtn.textContent = tr('Memeriksa…');
+    try {
+      const fresh = await fetchGroqModels(val);
+      await setGroqKey(val);
+      settings.groqModel = fresh.includes(pickedModel) ? pickedModel : (fresh[0] || pickedModel);
+      await saveSettings();
+      toast('API key Groq tersimpan');
+      closeSheet();
+      onSaved?.();
+    } catch (e) {
+      toast(e.message || 'Gagal memeriksa API key');
+      okBtn.disabled = false;
+      okBtn.textContent = tr('Simpan');
+    }
+  };
+}
