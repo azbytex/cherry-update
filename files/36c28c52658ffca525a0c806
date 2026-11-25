@@ -1,0 +1,428 @@
+// Impor/ekspor: PDF, gambar, kalender (.ics), dan cadangan data.
+import { db, STORES } from './db.js';
+import { markBackup } from './notify.js';
+import { tr } from './i18n.js';
+import { uid, toast, openSheet, closeSheet, blobToDataURL, dataURLToBlob, ymd, pad } from './ui.js';
+import { PAGE_W, drawTemplate, drawStroke, drawText, templateLayout, drawChecks, drawCellSummaries } from './paper.js';
+import { noteSummariesReady, itemImageReady, drawItems } from './editor.js';
+import { ensureFont } from './fonts.js';
+import { newPage, createNotebook, saveNotebook, state } from './notebooks.js';
+import { settings } from './db.js';
+
+const Cap = () => window.Capacitor?.isNativePlatform?.() ? window.Capacitor.Plugins : null;
+
+// ---------- Simpan / bagikan file ----------
+export async function saveFile(name, blob) {
+  const P = Cap();
+  if (P?.Filesystem && P?.Share) {
+    const data = (await blobToDataURL(blob)).split(',')[1];
+    const res = await P.Filesystem.writeFile({ path: name, data, directory: 'CACHE' });
+    await P.Share.share({ title: name, url: res.uri, dialogTitle: tr('Simpan atau kirim file') });
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+// Bagikan halaman sebagai gambar PNG (WhatsApp, Instagram, galeri, dll), dengan tanda kecil Cherry di pojok
+export async function sharePageImage(pg, title) {
+  title = tr(title);
+  const c = await renderPageImage(pg, 1600);
+  try {
+    const logo = new Image(); logo.src = 'assets/logo/logo_cherry_tulisan.svg'; await logo.decode();
+    const ctx = c.getContext('2d'), w = c.width * 0.1, h = w * logo.naturalHeight / logo.naturalWidth;
+    ctx.globalAlpha = 0.75; ctx.drawImage(logo, c.width - w - c.width * 0.035, c.height - h - c.width * 0.02, w, h); ctx.globalAlpha = 1;
+  } catch {}
+  const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+  const name = safeName(title) + '.png';
+  const P = Cap();
+  if (P?.Filesystem && P?.Share) {
+    const data = (await blobToDataURL(blob)).split(',')[1];
+    const res = await P.Filesystem.writeFile({ path: name, data, directory: 'CACHE' });
+    await P.Share.share({ title, files: [res.uri], dialogTitle: tr('Bagikan gambar') });
+    return;
+  }
+  const file = new File([blob], name, { type: 'image/png' });
+  if (navigator.canShare?.({ files: [file] })) { try { await navigator.share({ files: [file], title }); return; } catch (e) { if (e.name === 'AbortError') return; } }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+}
+const safeName = (s) => (s || 'catatan').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80);
+
+function progress(title) {
+  openSheet(`<h3>${title}</h3><p id="pg-msg">Menyiapkan…</p><div style="height:8px;background:var(--rail);border-radius:4px;overflow:hidden"><div id="pg-bar" style="height:100%;width:0;background:#e0b400;transition:width .2s"></div></div>`);
+  return (done, total, msg) => {
+    const bar = document.getElementById('pg-bar'), m = document.getElementById('pg-msg');
+    if (bar) bar.style.width = (total ? done / total * 100 : 0) + '%';
+    if (m) m.textContent = msg || `${done} / ${total}`;
+  };
+}
+
+// ---------- Impor PDF → buku catatan ----------
+// Dulu: setiap halaman digambar + dikompres + teksnya diekstrak SEBELUM buku jadi (300 hlm ≈ 3–5 menit).
+// Sekarang: file PDF disimpan sekali, ukuran semua halaman dibaca (cepat), hanya halaman 1 yang digambar.
+// Buku langsung bisa dibuka; halaman lain digambar di latar belakang satu per satu, dan halaman yang
+// sedang dilihat didahulukan. Kalau aplikasi ditutup di tengah jalan, proses dilanjutkan saat dibuka lagi.
+let pdfjs;
+async function loadPdfJs() {
+  if (pdfjs) return pdfjs;
+  pdfjs = await import('../lib/pdf.min.mjs');
+  pdfjs.GlobalWorkerOptions.workerSrc = new URL('../lib/pdf.worker.min.mjs', import.meta.url).href;
+  return pdfjs;
+}
+const PDF_W = 1600; // lebar gambar halaman (px)
+const pdfDocs = new Map(); // id blob PDF → Promise<PDFDocumentProxy>
+function pdfDoc(pdfId) {
+  if (!pdfDocs.has(pdfId)) {
+    const p = (async () => {
+      const lib = await loadPdfJs();
+      const r = await db.get('blobs', pdfId);
+      if (!r) throw new Error('File PDF sumber tidak ditemukan');
+      return lib.getDocument({ data: new Uint8Array(await r.blob.arrayBuffer()) }).promise;
+    })();
+    p.catch(() => pdfDocs.delete(pdfId));
+    pdfDocs.set(pdfId, p);
+  }
+  return pdfDocs.get(pdfId);
+}
+async function pdfPageImage(page) {
+  const v0 = page.getViewport({ scale: 1 });
+  const vp = page.getViewport({ scale: Math.min(PDF_W / v0.width, 3) });
+  const c = document.createElement('canvas'); c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+  const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+  await page.render({ canvasContext: ctx, canvas: c, viewport: vp }).promise;
+  const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.86));
+  c.width = c.height = 0; // lepas memori kanvas segera
+  return blob;
+}
+// teks PDF + posisinya supaya bisa dicari dan disalin
+async function pdfPageText(lib, page) {
+  try {
+    const v0 = page.getViewport({ scale: 1 }), tc = await page.getTextContent(), k = PAGE_W / v0.width, pt = [];
+    for (const it of tc.items) {
+      if (!it.str || !it.str.trim()) continue;
+      const tx = lib.Util.transform(v0.transform, it.transform), h = Math.hypot(tx[2], tx[3]);
+      pt.push({ s: it.str, x: tx[4] * k, y: (tx[5] - h * 0.85) * k, w: it.width * k, h: h * 1.1 * k });
+    }
+    return pt;
+  } catch { return []; }
+}
+
+// halaman PDF yang gambarnya belum dibuat: buat sekarang (dipakai editor/ekspor saat halaman dibutuhkan)
+const pdfListeners = new Set();
+export const onPdfPage = (fn) => pdfListeners.add(fn);
+const inflight = new Map(); // id halaman → Promise<{ bg, pt }>
+export function ensurePdfBg(pg) {
+  if (!pg || pg.bg || !pg.src) return Promise.resolve(pg?.bg || null);
+  let job = inflight.get(pg.id);
+  if (!job) {
+    const src = pg.src;
+    job = (async () => {
+      const lib = await loadPdfJs();
+      const page = await (await pdfDoc(src.pdf)).getPage(src.n);
+      const blob = await pdfPageImage(page);
+      const pt = await pdfPageText(lib, page);
+      page.cleanup();
+      const bg = uid(); await db.put('blobs', { id: bg, blob });
+      // baca-ubah-tulis: jangan menimpa coretan yang mungkin baru disimpan editor
+      const fresh = await db.get('pages', pg.id);
+      if (fresh && !fresh.bg) { fresh.bg = bg; if (pt.length) fresh.pt = pt; delete fresh.src; await db.put('pages', fresh); }
+      return { bg: fresh?.bg || bg, pt };
+    })().finally(() => inflight.delete(pg.id));
+    inflight.set(pg.id, job);
+  }
+  return job.then((r) => {
+    if (!pg.bg) { pg.bg = r.bg; if (r.pt.length) pg.pt = r.pt; delete pg.src; }
+    pdfListeners.forEach((fn) => { try { fn(pg.id, r); } catch {} });
+    return pg.bg;
+  });
+}
+
+// antrean latar belakang: satu buku, satu halaman sekali jalan, memberi jeda supaya aplikasi tetap lancar
+const queue = []; let running = false;
+const idle = () => new Promise((r) => (window.requestIdleCallback ? requestIdleCallback(() => r(), { timeout: 400 }) : setTimeout(r, 40)));
+export function queuePdfNotebook(nbId) { if (!queue.includes(nbId)) queue.push(nbId); runQueue(); }
+export function resumePdfJobs() { for (const nb of state.notebooks) if (nb.pdfPending && !nb.trashed) queuePdfNotebook(nb.id); }
+export const pdfProgress = new Map(); // id buku → { done, total }
+async function runQueue() {
+  if (running) return; running = true;
+  try {
+    while (queue.length) {
+      const nb = state.notebooks.find((n) => n.id === queue[0]);
+      if (nb && !nb.trashed) await fillNotebook(nb);
+      queue.shift();
+    }
+  } finally { running = false; }
+}
+async function fillNotebook(nb) {
+  const total = nb.pageIds.length; let done = 0;
+  for (const id of [...nb.pageIds]) {
+    if (!state.notebooks.includes(nb) || nb.trashed) return; // dihapus di tengah jalan
+    const pg = await db.get('pages', id);
+    if (pg?.src && !pg.bg) {
+      try { await ensurePdfBg(pg); } catch (e) { console.warn('pdf halaman', e); }
+      await idle();
+    }
+    pdfProgress.set(nb.id, { done: ++done, total });
+  }
+  pdfProgress.delete(nb.id);
+  // periksa ulang: semua halaman benar-benar sudah punya gambar sebelum file sumber dilepas
+  for (const id of nb.pageIds) {
+    const pg = await db.get('pages', id);
+    if (pg && !pg.bg && pg.src) { try { await ensurePdfBg(pg); } catch { return; } } // gagal: biarkan sumbernya, coba lagi nanti
+  }
+  // selesai: lepas file PDF sumber kalau tidak dipakai buku lain (mis. salinan yang belum selesai)
+  const src = nb.pdfSrc;
+  nb.pdfPending = false;
+  if (src && !state.notebooks.some((n) => n !== nb && n.pdfSrc === src && n.pdfPending)) {
+    nb.pdfSrc = null; pdfDocs.get(src)?.then((d) => d.destroy()).catch(() => {}); pdfDocs.delete(src);
+    await db.del('blobs', src);
+  }
+  await saveNotebook(nb);
+  if (total > 20) toast(`"${nb.title}" siap: semua ${total} halaman`);
+}
+
+export async function importPdf(file, folder = null) {
+  const set = progress('Mengimpor PDF');
+  try {
+    const lib = await loadPdfJs();
+    const buf = await file.arrayBuffer();
+    // simpan file aslinya dulu (pdf.js "meminjam" buffer yang diberikan ke worker, jadi beri salinan)
+    const pdfId = uid(); await db.put('blobs', { id: pdfId, blob: new Blob([buf], { type: 'application/pdf' }) });
+    const doc = await lib.getDocument({ data: new Uint8Array(buf.slice(0)) }).promise;
+    pdfDocs.set(pdfId, Promise.resolve(doc));
+    const nbId = uid(), n = doc.numPages, pages = [];
+    // ukuran tiap halaman saja (tanpa menggambar) — cepat
+    for (let i = 1; i <= n; i++) {
+      if (i === 1 || i % 8 === 0) set(i - 1, n + 1, `Membaca halaman ${i} dari ${n}`);
+      const v0 = (await doc.getPage(i)).getViewport({ scale: 1 });
+      const np = newPage(nbId, { h: Math.round(PAGE_W * v0.height / v0.width), tpl: 'plain', paper: 'white' });
+      np.src = { pdf: pdfId, n: i };
+      pages.push(np);
+    }
+    // halaman 1 langsung digambar untuk sampul
+    set(n, n + 1, 'Menyiapkan sampul…');
+    const p1 = await doc.getPage(1);
+    const bg1 = uid(); await db.put('blobs', { id: bg1, blob: await pdfPageImage(p1) });
+    const pt1 = await pdfPageText(lib, p1); p1.cleanup();
+    pages[0].bg = bg1; if (pt1.length) pages[0].pt = pt1; delete pages[0].src;
+    const nb = await createNotebook({ title: file.name.replace(/\.pdf$/i, ''), folder, cover: { kind: 'pdf', blob: bg1 }, pages });
+    if (n > 1) { nb.pdfSrc = pdfId; nb.pdfPending = true; await saveNotebook(nb); queuePdfNotebook(nb.id); }
+    else { await db.del('blobs', pdfId); pdfDocs.delete(pdfId); doc.destroy(); }
+    set(1, 1, 'Selesai');
+    closeSheet(); toast(n > 1 ? `PDF diimpor (${n} halaman). Halaman lain disiapkan di latar belakang.` : 'PDF diimpor');
+    return nb;
+  } catch (e) {
+    console.error(e); closeSheet(); toast('Gagal membaca PDF'); return null;
+  }
+}
+
+// ---------- Gambar → halaman ----------
+export async function imageFileToPage(file, nbId) {
+  const bm = await createImageBitmap(file);
+  const w = Math.min(bm.width, 2000), h = Math.round(bm.height * w / bm.width);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); ctx.drawImage(bm, 0, 0, w, h);
+  const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.9));
+  const id = uid(); await db.put('blobs', { id, blob });
+  return newPage(nbId, { h: Math.round(PAGE_W * h / w), bg: id });
+}
+export async function importImages(files, folder = null) {
+  const set = progress('Mengimpor gambar');
+  const nbId = uid(); const pages = [];
+  for (let i = 0; i < files.length; i++) { set(i, files.length); pages.push(await imageFileToPage(files[i], nbId)); }
+  const nb = await createNotebook({ title: files[0].name.replace(/\.[^.]+$/, ''), folder, cover: { kind: 'img', blob: pages[0].bg }, pages });
+  closeSheet(); toast(`${pages.length} gambar diimpor`);
+  return nb;
+}
+
+// ---------- Ekspor buku → PDF ----------
+let jsPdfLoading;
+function loadJsPdf() {
+  return jsPdfLoading ||= new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = 'lib/jspdf.umd.min.js';
+    s.onload = () => res(window.jspdf.jsPDF); s.onerror = rej; document.head.appendChild(s);
+  });
+}
+export async function renderPageImage(pg, width = 1240) {
+  const h = Math.round(width * pg.h / pg.w);
+  const c = document.createElement('canvas'); c.width = width; c.height = h;
+  const ctx = c.getContext('2d');
+  const fams = [pg.style?.font, ...(pg.texts || []).map((t) => t.f)].filter(Boolean);
+  await Promise.all(fams.flatMap((f) => [ensureFont(f), ensureFont(f, 700)]));
+  drawTemplate(ctx, width, h, pg.tpl, pg.paper, { date: pg.date, month: pg.month, weekStart: settings.weekStart, style: pg.style });
+  if (!pg.bg && pg.src) await ensurePdfBg(pg).catch(() => {});
+  if (pg.bg) { const r = await db.get('blobs', pg.bg); if (r) ctx.drawImage(await createImageBitmap(r.blob), 0, 0, width, h); }
+  const s = width / pg.w;
+  const lay = templateLayout(pg.tpl, { date: pg.date, month: pg.month, weekStart: settings.weekStart, style: pg.style });
+  drawChecks(ctx, lay, pg.checks, s);
+  drawCellSummaries(ctx, lay, await noteSummariesReady(pg), s, pg.style?.ink);
+  if (pg.items?.length) {
+    const imgs = new Map();
+    for (const it of pg.items) imgs.set(it, await itemImageReady(it));
+    drawItems(ctx, pg.items, s, (it) => imgs.get(it));
+  }
+  for (const st of pg.strokes) drawStroke(ctx, st, s);
+  for (const t of pg.texts) drawText(ctx, t, s);
+  return c;
+}
+export async function renderPageCrop(pg, rect, poly = null, opts = {}) {
+  const pad = Math.min(22, Math.max(10, Math.round(Math.min(rect.w, rect.h) * 0.08)));
+  const x0 = Math.max(0, Math.floor(rect.x - pad));
+  const y0 = Math.max(0, Math.floor(rect.y - pad));
+  const x1 = Math.min(pg.w, Math.ceil(rect.x + rect.w + pad));
+  const y1 = Math.min(pg.h, Math.ceil(rect.y + rect.h + pad));
+  const rw = Math.max(24, x1 - x0);
+  const rh = Math.max(24, y1 - y0);
+  const renderW = Math.min(2100, Math.max(1240, Math.round(900 * pg.w / rw)));
+  const full = await renderPageImage(pg, renderW);
+  const s = full.width / pg.w;
+  const sx = Math.round(x0 * s), sy = Math.round(y0 * s);
+  const sw = Math.max(1, Math.min(full.width - sx, Math.round(rw * s)));
+  const sh = Math.max(1, Math.min(full.height - sy, Math.round(rh * s)));
+  const maxDim = Math.max(sw, sh);
+  const scaleOut = maxDim > 1200 ? 1200 / maxDim : (maxDim < 320 ? Math.min(2.2, 320 / maxDim) : 1);
+  const out = document.createElement('canvas');
+  out.width = Math.max(1, Math.round(sw * scaleOut));
+  out.height = Math.max(1, Math.round(sh * scaleOut));
+  const ks = s * scaleOut;
+  try {
+    const octx = out.getContext('2d');
+    octx.fillStyle = '#fff';
+    octx.fillRect(0, 0, out.width, out.height);
+    const clipPoly = opts.clipPoly;
+    if (clipPoly?.length >= 6) {
+      octx.save();
+      octx.beginPath();
+      octx.moveTo((clipPoly[0] - x0) * ks, (clipPoly[1] - y0) * ks);
+      for (let i = 2; i < clipPoly.length; i += 2) octx.lineTo((clipPoly[i] - x0) * ks, (clipPoly[i + 1] - y0) * ks);
+      octx.closePath();
+      octx.clip();
+    }
+    octx.drawImage(full, sx, sy, sw, sh, 0, 0, out.width, out.height);
+    if (clipPoly?.length >= 6) octx.restore();
+    if (poly?.length >= 6) {
+      octx.save();
+      octx.beginPath();
+      octx.moveTo((poly[0] - x0) * ks, (poly[1] - y0) * ks);
+      for (let i = 2; i < poly.length; i += 2) octx.lineTo((poly[i] - x0) * ks, (poly[i + 1] - y0) * ks);
+      octx.closePath();
+      octx.strokeStyle = 'rgba(229, 72, 77, 0.58)';
+      octx.lineWidth = Math.max(2, Math.round(out.width * 0.005));
+      octx.setLineDash([8, 5]);
+      octx.stroke();
+      octx.restore();
+    }
+    let url = out.toDataURL('image/jpeg', 0.86);
+    if (url.length > 3_200_000) url = out.toDataURL('image/jpeg', 0.65);
+    return opts.meta ? { url, w: out.width, h: out.height } : url;
+  } finally {
+    full.width = full.height = 0;
+    out.width = out.height = 0;
+  }
+}
+export async function exportNotebookPdf(nb, pages) {
+  const set = progress('Membuat PDF');
+  try {
+    const jsPDF = await loadJsPdf();
+    pages ||= (await Promise.all(nb.pageIds.map((id) => db.get('pages', id)))).filter(Boolean);
+    let pdf;
+    for (let i = 0; i < pages.length; i++) {
+      set(i, pages.length, `Halaman ${i + 1} dari ${pages.length}`);
+      const pg = pages[i];
+      const w = 595.28, h = w * pg.h / pg.w;
+      const fmt = [w, h], orient = w > h ? 'l' : 'p';
+      if (!pdf) pdf = new jsPDF({ unit: 'pt', format: fmt, orientation: orient, compress: true });
+      else pdf.addPage(fmt, orient);
+      const c = await renderPageImage(pg);
+      pdf.addImage(c.toDataURL('image/jpeg', 0.9), 'JPEG', 0, 0, w, h, undefined, 'FAST');
+    }
+    set(1, 1, 'Menyimpan…');
+    await saveFile(safeName(nb.title) + '.pdf', pdf.output('blob'));
+    closeSheet();
+  } catch (e) { console.error(e); closeSheet(); toast('Gagal membuat PDF'); }
+}
+
+// ---------- Kalender .ics ----------
+const icsEsc = (s) => String(s || '').replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/,/g, '\\,').replace(/;/g, '\\;');
+const icsUnesc = (s) => s.replace(/\\n/gi, '\n').replace(/\\([,;\\])/g, '$1');
+const FREQ = { daily: 'DAILY', weekly: 'WEEKLY', monthly: 'MONTHLY', yearly: 'YEARLY' };
+export async function exportIcs(events) {
+  const d8 = (s) => s.replace(/-/g, '');
+  const t6 = (t) => t.replace(':', '') + '00';
+  const nextDay = (s) => { const [y, m, d] = s.split('-').map(Number); return ymd(new Date(y, m - 1, d + 1)).replace(/-/g, ''); };
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Cherry//Kalender//ID', 'CALSCALE:GREGORIAN'];
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15) + 'Z';
+  for (const e of events) {
+    lines.push('BEGIN:VEVENT', `UID:${e.id}@cherry`, `DTSTAMP:${stamp}`, `SUMMARY:${icsEsc(e.title)}`);
+    if (e.time) {
+      lines.push(`DTSTART:${d8(e.date)}T${t6(e.time)}`);
+      if (e.end) lines.push(`DTEND:${d8(e.date)}T${t6(e.end)}`);
+    } else lines.push(`DTSTART;VALUE=DATE:${d8(e.date)}`, `DTEND;VALUE=DATE:${nextDay(e.date)}`);
+    if (FREQ[e.repeat]) lines.push(`RRULE:FREQ=${FREQ[e.repeat]}`);
+    if (e.note) lines.push(`DESCRIPTION:${icsEsc(e.note)}`);
+    lines.push(`X-CHERRY-COLOR:${e.color}`, 'END:VEVENT');
+  }
+  lines.push('END:VCALENDAR');
+  await saveFile(`kalender-cherry-${ymd(new Date())}.ics`, new Blob([lines.join('\r\n')], { type: 'text/calendar' }));
+}
+export function parseIcs(text, defaultColor) {
+  const raw = text.replace(/\r\n[ \t]/g, '').replace(/\n[ \t]/g, '').split(/\r?\n/);
+  const out = []; let cur = null;
+  for (const line of raw) {
+    if (line === 'BEGIN:VEVENT') { cur = {}; continue; }
+    if (line === 'END:VEVENT') {
+      if (cur?.date && cur.title) out.push({ id: uid(), created: Date.now(), title: cur.title, date: cur.date, time: cur.time || '', end: cur.end || '', note: cur.note || '', repeat: cur.repeat || 'none', color: cur.color || defaultColor });
+      cur = null; continue;
+    }
+    if (!cur) continue;
+    const i = line.indexOf(':'); if (i < 0) continue;
+    const key = line.slice(0, i).split(';')[0].toUpperCase(), val = line.slice(i + 1);
+    const dt = (v) => {
+      const m = v.match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2}))?(Z)?/); if (!m) return null;
+      if (m[6] && m[4]) { const d = new Date(Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5])); return { date: ymd(d), time: `${pad(d.getHours())}:${pad(d.getMinutes())}` }; }
+      return { date: `${m[1]}-${m[2]}-${m[3]}`, time: m[4] ? `${m[4]}:${m[5]}` : '' };
+    };
+    if (key === 'SUMMARY') cur.title = icsUnesc(val);
+    else if (key === 'DESCRIPTION') cur.note = icsUnesc(val);
+    else if (key === 'DTSTART') { const d = dt(val); if (d) { cur.date = d.date; cur.time = d.time; } }
+    else if (key === 'DTEND') { const d = dt(val); if (d?.time) cur.end = d.time; }
+    else if (key === 'RRULE') { const f = (val.match(/FREQ=(\w+)/) || [])[1]; cur.repeat = Object.keys(FREQ).find((k) => FREQ[k] === f) || 'none'; }
+    else if (key === 'X-CHERRY-COLOR') cur.color = val;
+  }
+  return out;
+}
+
+// ---------- Cadangan seluruh data ----------
+export async function exportBackup() {
+  const set = progress('Membuat cadangan');
+  try {
+    const data = { app: 'cherry', version: 1, created: Date.now() };
+    for (const s of STORES) {
+      set(STORES.indexOf(s), STORES.length, 'Mengumpulkan ' + s);
+      let rows = await db.all(s);
+      if (s === 'kv') rows = rows.filter((r) => r.id !== 'groq_key'); // API key tidak ikut dicadangkan
+      data[s] = s === 'blobs' ? await Promise.all(rows.map(async (r) => ({ id: r.id, data: await blobToDataURL(r.blob) }))) : rows;
+    }
+    await saveFile(`cherry-cadangan-${ymd(new Date())}.json`, new Blob([JSON.stringify(data)], { type: 'application/json' }));
+    markBackup();
+    closeSheet();
+  } catch (e) { console.error(e); closeSheet(); toast('Gagal membuat cadangan'); }
+}
+export async function importBackup(file) {
+  const set = progress('Memulihkan cadangan');
+  try {
+    const data = JSON.parse(await file.text());
+    if (data.app !== 'cherry') throw new Error('bukan file cadangan Cherry');
+    const savedGroq = await db.get('kv', 'groq_key').catch(() => null);
+    for (const s of STORES) {
+      set(STORES.indexOf(s), STORES.length, 'Memulihkan ' + s);
+      await db.clear(s);
+      let rows = data[s] || [];
+      if (s === 'blobs') rows = await Promise.all(rows.map(async (r) => ({ id: r.id, blob: await dataURLToBlob(r.data) })));
+      await db.putMany(s, rows);
+    }
+    if (savedGroq) await db.put('kv', savedGroq);
+    closeSheet(); toast('Cadangan dipulihkan'); setTimeout(() => location.reload(), 700);
+  } catch (e) { console.error(e); closeSheet(); toast('File cadangan tidak valid'); }
+}
