@@ -1,0 +1,348 @@
+// Panel chatbot AI Groq di Editor: bisa mode mengambang (geser & ubah ukuran) atau split sidebar kanan.
+import { $, esc, ICON, toast } from './ui.js';
+import { settings, saveSettings } from './db.js';
+import { tr } from './i18n.js';
+import { getGroqKey, setGroqKey, getGroqModel, pickVisionModel, fetchGroqModels, streamGroqChat, openGroqSettings } from './groq.js';
+
+const FLOAT_ICON = '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2.5"/><rect x="9" y="9" width="10" height="10" rx="1.8" fill="var(--card)"/><path d="M9 12h10"/></svg>';
+const SPLIT_ICON = '<svg viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M14.5 4.5v15"/></svg>';
+const CAM_ICON = '<svg viewBox="0 0 24 24"><path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h2l1.2-2h4.6l1.2 2h2A2.5 2.5 0 0 1 20 8.5v9A2.5 2.5 0 0 1 17.5 20h-11A2.5 2.5 0 0 1 4 17.5z"/><circle cx="12" cy="13" r="3.2"/></svg>';
+export const AI_ICON = '<svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></svg>';
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+function renderMd(raw) {
+  let s = esc(raw || '');
+  const blocks = [];
+  s = s.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, (_, code) => {
+    blocks.push(`<pre class="chat-code"><code>${code.trim()}</code></pre>`);
+    return `\u0000B${blocks.length - 1}\u0000`;
+  });
+  s = s.replace(/`([^`\n]+)`/g, '<code class="chat-ic">$1</code>');
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+  s = s.replace(/(?:^|\n)[-*] (.+)/g, '<br>• $1');
+  s = s.replace(/\n/g, '<br>');
+  s = s.replace(/\u0000B(\d+)\u0000/g, (_, i) => blocks[+i]);
+  return s;
+}
+
+export function createChatController({ editorEl, splitHost, getPageContext, getPageImage, onInsertText, onBeforeSplit, onLayoutChange, onToggle }) {
+  let open = false;
+  let mode = settings.chatMode === 'split' ? 'split' : 'float';
+  let useCtx = true;
+  let useImg = !!getPageImage;
+  let busy = false;
+  let abortCtrl = null;
+  let msgs = []; // { role: 'user'|'assistant', content: string }
+  let floatEl = null;
+  let box = { x: null, y: null, w: 320, h: 460 };
+
+  const widget = document.createElement('div');
+  widget.className = 'chat-box';
+  widget.tabIndex = -1;
+  widget.innerHTML = `
+    <div class="calc-head chat-head" data-chat-drag>
+      <span class="calc-title">${AI_ICON}<b>Asisten AI</b><button type="button" class="chat-model" id="chat-model" title="Pengaturan Groq"></button></span>
+      <div class="calc-acts">
+        <button type="button" class="calc-ib" id="chat-clear" title="Bersihkan obrolan">${ICON.trash}</button>
+        <button type="button" class="calc-ib" id="chat-mode" title="Tempel ke samping">${SPLIT_ICON}</button>
+        <button type="button" class="calc-ib" id="chat-close" title="Tutup">${ICON.close}</button>
+      </div>
+    </div>
+    <div class="chat-body" id="chat-body"></div>
+    <div class="chat-foot" id="chat-foot">
+      <div class="chat-ctx-row">
+        <button type="button" class="chip-opt chat-ctx on" id="chat-ctx">Pakai halaman ini</button>
+        <button type="button" class="chip-opt chat-ctx on" id="chat-img">${CAM_ICON}<span>Capture halaman</span></button>
+      </div>
+      <div class="chat-inp-row">
+        <textarea class="inp chat-inp" id="chat-inp" rows="1" placeholder="Tanya apa saja…"></textarea>
+        <button type="button" class="btn yellow chat-send" id="chat-send">Kirim</button>
+      </div>
+    </div>
+    <div class="calc-rz" data-chat-rz aria-hidden="true"></div>`;
+
+  const bodyEl = $('#chat-body', widget);
+  const footEl = $('#chat-foot', widget);
+  const inpEl = $('#chat-inp', widget);
+  const sendBtn = $('#chat-send', widget);
+  const ctxBtn = $('#chat-ctx', widget);
+  const imgBtn = $('#chat-img', widget);
+  if (!getPageImage) imgBtn.hidden = true;
+  const modelBtn = $('#chat-model', widget);
+  const modeBtn = $('#chat-mode', widget);
+
+  const shortModel = (m) => (m || '').split('/').pop();
+  const activeModel = () => (useImg && getPageImage ? pickVisionModel() : getGroqModel());
+
+  const renderBody = async () => {
+    const key = await getGroqKey();
+    modelBtn.textContent = shortModel(activeModel());
+    if (!key) {
+      footEl.hidden = true;
+      bodyEl.innerHTML = `
+        <div class="chat-setup">
+          <div class="chat-setup-ic">${AI_ICON}</div>
+          <h4>Masukkan API Key Groq</h4>
+          <p>Dapatkan key gratis di console.groq.com, lalu tempel di bawah. Key hanya disimpan di perangkat ini.</p>
+          <input class="inp" id="chat-key-inp" type="password" autocomplete="off" spellcheck="false" placeholder="gsk_...">
+          <button type="button" class="btn yellow" id="chat-key-save" style="width:100%">Simpan &amp; Mulai</button>
+        </div>`;
+      $('#chat-key-save', bodyEl).onclick = async () => {
+        const val = $('#chat-key-inp', bodyEl).value.trim();
+        if (!val) return toast('Tempel API key Groq dulu');
+        const btn = $('#chat-key-save', bodyEl);
+        btn.disabled = true; btn.textContent = tr('Memeriksa…');
+        try {
+          await fetchGroqModels(val);
+          await setGroqKey(val);
+          toast('API key Groq tersimpan');
+          renderBody();
+        } catch (e) {
+          toast(e.message || 'API key tidak valid');
+          btn.disabled = false; btn.textContent = tr('Simpan & Mulai');
+        }
+      };
+      return;
+    }
+
+    footEl.hidden = false;
+    if (!msgs.length) {
+      bodyEl.innerHTML = `
+        <div class="chat-empty">
+          <p>Siap membantu! Tanyakan apa saja atau pilih pintasan cepat:</p>
+          <div class="chat-quick">
+            <button type="button" class="chip-opt" data-q="Rangkum isi halaman ini secara ringkas">Rangkum halaman ini</button>
+            <button type="button" class="chip-opt" data-q="Jelaskan poin-poin penting di halaman ini dengan bahasa sederhana">Jelaskan poin penting</button>
+            <button type="button" class="chip-opt" data-q="Buat 5 soal latihan singkat beserta jawabannya dari materi ini">Buat 5 soal latihan</button>
+          </div>
+        </div>`;
+      bodyEl.querySelectorAll('[data-q]').forEach((b) => {
+        b.onclick = () => sendPrompt(b.dataset.q);
+      });
+      return;
+    }
+
+    bodyEl.innerHTML = msgs.map((m, idx) => m.role === 'user'
+      ? `<div class="chat-msg user"><div class="chat-bub">${m.hasImg ? `<span class="chat-cap-tag">${CAM_ICON}<span>Halaman di-capture</span></span>` : ''}${esc(m.content).replace(/\n/g, '<br>')}</div></div>`
+      : `<div class="chat-msg ai" data-mi="${idx}">
+          <div class="chat-bub">${m.content ? renderMd(m.content) : '<span class="chat-dots"><i></i><i></i><i></i></span>'}</div>
+          ${m.content && !m.streaming ? `<div class="chat-macts">
+            <button type="button" data-copy="${idx}">Salin</button>
+            <button type="button" data-ins="${idx}">+ Ke catatan</button>
+          </div>` : ''}
+        </div>`
+    ).join('');
+
+    bodyEl.querySelectorAll('[data-copy]').forEach((b) => {
+      b.onclick = async () => {
+        const txt = msgs[+b.dataset.copy]?.content || '';
+        try { await navigator.clipboard.writeText(txt); toast('Teks disalin'); } catch {}
+      };
+    });
+    bodyEl.querySelectorAll('[data-ins]').forEach((b) => {
+      b.onclick = () => {
+        const txt = msgs[+b.dataset.ins]?.content || '';
+        if (txt) onInsertText?.(txt);
+      };
+    });
+    bodyEl.scrollTop = bodyEl.scrollHeight;
+  };
+
+  const syncSendBtn = () => {
+    sendBtn.textContent = tr(busy ? 'Stop' : 'Kirim');
+    sendBtn.classList.toggle('danger-btn', busy);
+    inpEl.disabled = busy;
+  };
+
+  const sendPrompt = async (overrideText) => {
+    if (busy) { abortCtrl?.abort(); return; }
+    const text = (overrideText ?? inpEl.value).trim();
+    if (!text) return;
+    if (!overrideText) { inpEl.value = ''; inpEl.style.height = 'auto'; }
+
+    const ctx = useCtx ? (getPageContext?.() || '').trim() : '';
+    const wantImg = !!(useImg && getPageImage);
+
+    const userMsg = { role: 'user', content: text, hasImg: wantImg };
+    msgs.push(userMsg);
+    const aiMsg = { role: 'assistant', content: '', streaming: true };
+    msgs.push(aiMsg);
+    busy = true;
+    abortCtrl = new AbortController();
+    syncSendBtn();
+    await renderBody();
+
+    let pageImg = null;
+    if (wantImg) {
+      try { pageImg = await getPageImage(); } catch { pageImg = null; }
+      if (!pageImg) userMsg.hasImg = false;
+    }
+    if (abortCtrl.signal.aborted || !msgs.includes(aiMsg)) {
+      aiMsg.streaming = false;
+      busy = false;
+      abortCtrl = null;
+      syncSendBtn();
+      await renderBody();
+      return;
+    }
+
+    let userPayload = text;
+    if (ctx && pageImg) userPayload = `[Teks halaman saat ini]\n${ctx.slice(0, 6000)}\n\n[Pertanyaan (lihat juga gambar capture halaman terlampir)]\n${text}`;
+    else if (ctx) userPayload = `[Isi halaman saat ini]\n${ctx.slice(0, 6000)}\n\n[Pertanyaan]\n${text}`;
+    else if (pageImg) userPayload = `[Baca isi, tulisan, atau soal dari gambar capture halaman catatan saat ini]\n\n[Pertanyaan]\n${text}`;
+    userMsg.apiContent = userPayload;
+
+    const history = msgs.slice(-9, -2).map((m) => ({ role: m.role, content: m.apiContent || m.content }));
+    const curApiMsg = pageImg
+      ? { role: 'user', content: [{ type: 'text', text: userPayload }, { type: 'image_url', image_url: { url: pageImg } }] }
+      : { role: 'user', content: userPayload };
+    const sysPrompt = 'Kamu asisten belajar yang ramah dan teliti di aplikasi catatan Cherry. Jika diberikan teks dan/atau gambar capture halaman catatan, baca semua isi halaman termasuk teks PDF, tulisan tangan, gambar, tabel, dan nomor soal secara akurat sebelum menjawab. Jawab ringkas, jelas, dan dalam bahasa yang sama dengan pertanyaan pengguna.';
+
+    const runStream = (model, lastMsg) => streamGroqChat({
+      model,
+      messages: [{ role: 'system', content: sysPrompt }, ...history, lastMsg],
+      signal: abortCtrl.signal,
+      onDelta: (_, full) => {
+        aiMsg.content = full;
+        const bub = bodyEl.querySelector(`.chat-msg[data-mi="${msgs.length - 1}"] .chat-bub`);
+        if (bub) { bub.innerHTML = renderMd(full); bodyEl.scrollTop = bodyEl.scrollHeight; }
+      },
+    });
+
+    try {
+      const model = pageImg ? pickVisionModel() : getGroqModel();
+      try {
+        await runStream(model, curApiMsg);
+      } catch (e) {
+        if (pageImg && ctx && e.name !== 'AbortError' && !aiMsg.content && /image|vision|model|multimodal|not found|decommissioned/i.test(e.message || '')) {
+          userMsg.hasImg = false;
+          await runStream(getGroqModel(), { role: 'user', content: userPayload });
+        } else {
+          throw e;
+        }
+      }
+      if (!aiMsg.content) aiMsg.content = '(Tidak ada jawaban)';
+    } catch (e) {
+      if (e.name === 'AbortError') aiMsg.content = aiMsg.content || '(Dihentikan)';
+      else {
+        aiMsg.content = `⚠️ ${e.message || 'Gagal terhubung ke Groq'}`;
+      }
+    } finally {
+      aiMsg.streaming = false;
+      busy = false;
+      abortCtrl = null;
+      syncSendBtn();
+      await renderBody();
+    }
+  };
+
+  sendBtn.onclick = () => sendPrompt();
+  inpEl.oninput = () => { inpEl.style.height = 'auto'; inpEl.style.height = Math.min(110, inpEl.scrollHeight) + 'px'; };
+  inpEl.onkeydown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+  };
+  ctxBtn.onclick = () => { useCtx = !useCtx; ctxBtn.classList.toggle('on', useCtx); };
+  imgBtn.onclick = () => { useImg = !useImg; imgBtn.classList.toggle('on', useImg); modelBtn.textContent = shortModel(activeModel()); };
+  $('#chat-clear', widget).onclick = () => {
+    if (busy) abortCtrl?.abort();
+    msgs = [];
+    renderBody();
+  };
+  $('#chat-close', widget).onclick = () => close();
+  modelBtn.onclick = () => openGroqSettings(() => renderBody());
+  modeBtn.onclick = () => setMode(mode === 'float' ? 'split' : 'float');
+
+  const ensureFloat = () => {
+    if (floatEl) return floatEl;
+    floatEl = document.createElement('div');
+    floatEl.className = 'calc-float chat-float';
+    floatEl.hidden = true;
+    editorEl.appendChild(floatEl);
+
+    const head = $('[data-chat-drag]', widget);
+    const rz = $('[data-chat-rz]', widget);
+
+    const bounds = () => ({ w: editorEl.clientWidth || window.innerWidth, h: editorEl.clientHeight || window.innerHeight });
+    const applyBox = () => {
+      const b = bounds();
+      box.w = clamp(box.w, 260, Math.min(480, b.w - 16));
+      box.h = clamp(box.h, 330, Math.min(620, b.h - 76));
+      if (box.x == null) box.x = Math.max(12, b.w - box.w - 20);
+      if (box.y == null) box.y = 70;
+      box.x = clamp(box.x, 8, Math.max(8, b.w - box.w - 8));
+      box.y = clamp(box.y, 58, Math.max(58, b.h - box.h - 8));
+      Object.assign(floatEl.style, { left: box.x + 'px', top: box.y + 'px', width: box.w + 'px', height: box.h + 'px' });
+    };
+    floatEl._applyBox = applyBox;
+
+    head.onpointerdown = (e) => {
+      if (mode !== 'float' || e.target.closest('button')) return;
+      e.preventDefault();
+      const pid = e.pointerId, sx = e.clientX, sy = e.clientY, ox = box.x, oy = box.y;
+      const mv = (ev) => { if (ev.pointerId !== pid) return; box.x = ox + (ev.clientX - sx); box.y = oy + (ev.clientY - sy); applyBox(); };
+      const up = (ev) => { if (ev.pointerId !== pid) return; window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up); };
+      window.addEventListener('pointermove', mv);
+      window.addEventListener('pointerup', up); window.addEventListener('pointercancel', up);
+    };
+
+    rz.onpointerdown = (e) => {
+      if (mode !== 'float') return;
+      e.preventDefault(); e.stopPropagation();
+      const pid = e.pointerId, sx = e.clientX, sy = e.clientY, ow = box.w, oh = box.h;
+      const mv = (ev) => { if (ev.pointerId !== pid) return; box.w = ow + (ev.clientX - sx); box.h = oh + (ev.clientY - sy); applyBox(); };
+      const up = (ev) => { if (ev.pointerId !== pid) return; window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up); };
+      window.addEventListener('pointermove', mv);
+      window.addEventListener('pointerup', up); window.addEventListener('pointercancel', up);
+    };
+
+    return floatEl;
+  };
+
+  const syncMount = async () => {
+    const fl = ensureFloat();
+    widget.classList.toggle('in-split', mode === 'split');
+    modeBtn.innerHTML = mode === 'split' ? FLOAT_ICON : SPLIT_ICON;
+    modeBtn.title = tr(mode === 'split' ? 'Mode melayang' : 'Tempel ke samping');
+    onToggle?.(open);
+
+    if (!open) {
+      fl.hidden = true;
+      if (widget.parentElement === splitHost) splitHost.classList.remove('open');
+      onLayoutChange?.();
+      return;
+    }
+    await renderBody();
+    if (mode === 'split') {
+      onBeforeSplit?.();
+      fl.hidden = true;
+      splitHost.appendChild(widget);
+      splitHost.classList.add('wide-split');
+      requestAnimationFrame(() => splitHost.classList.add('open'));
+      setTimeout(() => onLayoutChange?.(), 290);
+    } else {
+      if (widget.parentElement === splitHost) {
+        splitHost.classList.remove('open', 'wide-split');
+      }
+      fl.appendChild(widget);
+      fl.hidden = false;
+      fl._applyBox();
+      onLayoutChange?.();
+    }
+  };
+
+  const setMode = (m) => {
+    mode = m === 'split' ? 'split' : 'float';
+    settings.chatMode = mode;
+    saveSettings();
+    syncMount();
+  };
+  const toggle = () => { open = !open; syncMount(); return open; };
+  const close = () => { if (!open) return; open = false; syncMount(); };
+  const closeIfSplit = () => { if (open && mode === 'split') close(); };
+  const destroy = () => { abortCtrl?.abort(); open = false; floatEl?.remove(); floatEl = null; };
+  const isOpen = () => open;
+
+  return { toggle, close, closeIfSplit, destroy, isOpen, setMode };
+}
