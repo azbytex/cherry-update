@@ -1,0 +1,174 @@
+// Sidebar (Shelf) klip capture bergaya clipboard Windows: simpan hasil snip area/laso, tempel ke halaman, salin, atau kirim ke AI.
+import { db } from './db.js';
+import { $, esc, ICON, toast, uid, dataURLToBlob } from './ui.js';
+import { AI_ICON } from './chat.js';
+
+export const SHELF_ICON = '<svg viewBox="0 0 24 24"><rect x="6" y="4.5" width="12" height="15.5" rx="2"/><path d="M9.5 4.5V3.5h5v1"/><path d="M9.5 10h5M9.5 13.5h5"/></svg>';
+const MAX_ITEMS = 20;
+
+async function copyImageToClipboard(url) {
+  try {
+    if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') return false;
+    const blob = await dataURLToBlob(url);
+    const bm = await createImageBitmap(blob);
+    const c = document.createElement('canvas'); c.width = bm.width; c.height = bm.height;
+    let png;
+    try {
+      c.getContext('2d').drawImage(bm, 0, 0);
+      png = await new Promise((res) => c.toBlob(res, 'image/png'));
+    } finally {
+      c.width = c.height = 0; bm.close?.();
+    }
+    if (!png) return false;
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function createShelfController({ stageEl, shelfHost, onStamp, onAttachAi, onAskAi, onLayoutChange, onToggle }) {
+  let open = false;
+  let items = [];
+  let dragged = null;
+
+  shelfHost.innerHTML = `
+    <div class="shelf-head">
+      <span class="shelf-title">${SHELF_ICON}<b>Klip Capture</b><span class="shelf-cnt" id="sh-cnt">0</span></span>
+      <div class="shelf-acts">
+        <button type="button" class="calc-ib" id="sh-clear" title="Bersihkan klip">${ICON.trash}</button>
+        <button type="button" class="calc-ib" id="sh-close" title="Tutup rak">${ICON.fwd}</button>
+      </div>
+    </div>
+    <div class="shelf-body" id="sh-body"></div>`;
+
+  const peek = document.createElement('button');
+  peek.type = 'button';
+  peek.className = 'shelf-peek';
+  peek.hidden = true;
+  peek.title = 'Rak Capture';
+  peek.innerHTML = `${SHELF_ICON}<span id="sh-peek-n">0</span>`;
+  stageEl.appendChild(peek);
+
+  const bodyEl = $('#sh-body', shelfHost);
+  const cntEl = $('#sh-cnt', shelfHost);
+  const peekN = $('#sh-peek-n', peek);
+
+  const persist = async () => {
+    try { await db.put('kv', { k: 'capture_shelf', v: items }); } catch {}
+  };
+
+  const render = () => {
+    cntEl.textContent = String(items.length);
+    peekN.textContent = String(items.length);
+    peek.hidden = open || !items.length;
+    $('#sh-clear', shelfHost).disabled = !items.length;
+    if (!items.length) {
+      bodyEl.innerHTML = '<div class="shelf-empty"><b>Belum ada capture</b><p>Gunakan alat Capture di sebelah kalkulator &amp; AI (mode Kotak atau Bebas).</p></div>';
+      return;
+    }
+    bodyEl.innerHTML = items.map((it) => `
+      <div class="shelf-card" data-sid="${esc(it.id)}" draggable="true">
+        <div class="shelf-img-wrap">
+          <img src="${it.url}" alt="">
+          <span class="shelf-meta">${esc(it.pageLabel || '')}${it.w && it.h ? ` • ${it.w}×${it.h}` : ''}</span>
+          <button type="button" class="shelf-rm" data-act="rm" title="Hapus">${ICON.close}</button>
+        </div>
+        <div class="shelf-card-acts">
+          <button type="button" class="shelf-btn pri" data-act="stamp" title="Tempel ke halaman">Tempel</button>
+          <button type="button" class="shelf-btn" data-act="chat" title="Lampirkan ke chat AI">+ Chat</button>
+          <button type="button" class="shelf-btn ai" data-act="ask" title="Tanya AI">${AI_ICON}</button>
+          <button type="button" class="shelf-btn" data-act="copy" title="Salin gambar">${ICON.copy}</button>
+        </div>
+      </div>`).join('');
+
+    bodyEl.querySelectorAll('.shelf-card').forEach((card) => {
+      const it = items.find((x) => x.id === card.dataset.sid);
+      if (!it) return;
+      card.addEventListener('dragstart', (e) => {
+        dragged = it;
+        e.dataTransfer?.setData('application/x-cherry-capture', it.id);
+        e.dataTransfer?.setData('text/plain', it.id);
+      });
+      card.addEventListener('dragend', () => { setTimeout(() => { dragged = null; }, 50); });
+      $('img', card).onclick = () => {
+        const ov = document.createElement('div');
+        ov.className = 'chat-zoom';
+        ov.innerHTML = `<img src="${it.url}" alt="">`;
+        ov.onclick = () => ov.remove();
+        document.body.appendChild(ov);
+      };
+      card.querySelectorAll('[data-act]').forEach((b) => {
+        b.onclick = async (e) => {
+          e.stopPropagation();
+          const act = b.dataset.act;
+          if (act === 'rm') {
+            items = items.filter((x) => x.id !== it.id);
+            await persist();
+            render();
+          } else if (act === 'stamp') {
+            onStamp?.(it);
+          } else if (act === 'chat') {
+            onAttachAi?.(it);
+          } else if (act === 'ask') {
+            onAskAi?.(it);
+          } else if (act === 'copy') {
+            const ok = await copyImageToClipboard(it.url);
+            toast(ok ? 'Gambar disalin ke papan klip' : 'Salin clipboard tidak didukung di perangkat ini; gunakan Tempel atau + Chat');
+          }
+        };
+      });
+    });
+  };
+
+  const syncOpen = () => {
+    shelfHost.classList.toggle('open', open);
+    peek.hidden = open || !items.length;
+    onToggle?.(open);
+    setTimeout(() => onLayoutChange?.(), 280);
+  };
+
+  const toggle = (force) => {
+    open = typeof force === 'boolean' ? force : !open;
+    syncOpen();
+    return open;
+  };
+
+  const addCapture = async ({ url, w, h, ctxText, pageLabel }) => {
+    if (!url) return;
+    items.unshift({ id: uid(), url, w: Math.round(w || 0), h: Math.round(h || 0), ctxText: ctxText || '', pageLabel: pageLabel || '', ts: Date.now() });
+    if (items.length > MAX_ITEMS) items.length = MAX_ITEMS;
+    await persist();
+    open = true;
+    render();
+    syncOpen();
+  };
+
+  const load = async () => {
+    try {
+      const r = await db.get('kv', 'capture_shelf');
+      if (Array.isArray(r?.v)) items = r.v.slice(0, MAX_ITEMS);
+    } catch {}
+    render();
+  };
+
+  $('#sh-close', shelfHost).onclick = () => toggle(false);
+  $('#sh-clear', shelfHost).onclick = async () => {
+    if (!items.length) return;
+    items = [];
+    await persist();
+    render();
+  };
+  peek.onclick = () => toggle(true);
+
+  load();
+
+  return {
+    toggle,
+    isOpen: () => open,
+    addCapture,
+    getDragged: () => dragged,
+    getById: (id) => items.find((x) => x.id === id) || null,
+    destroy: () => { peek.remove(); },
+  };
+}
