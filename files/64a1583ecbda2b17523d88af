@@ -1,0 +1,1042 @@
+// Kalender bulanan yang bisa dikustomisasi (tanpa alarm).
+import { db, settings, saveSettings } from './db.js';
+import { $, $$, esc, uid, ymd, parseYmd, MONTHS, MONTHS_LONG, DAYS, DAYS_LONG, longDate, COLORS, ICON, openSheet, closeSheet, popover, toast, confirmDialog, pickFile } from './ui.js';
+import { getDayNotebook, getMonthNotebook, findDay, onChange } from './notebooks.js';
+import { openEditor, editorHeader, isEditorOpen } from './editor.js';
+import { exportIcs, parseIcs } from './io.js';
+import { todosDue, toggleTodo, upsertTodoFromCalendar, deleteTodoByCalId, findTodo } from './todo.js';
+import { REMIND, reschedule, ensurePermission } from './notify.js';
+import { requireUnlock } from './lock.js';
+
+export const ACCENTS = ['#0a99f0', '#2563eb', '#7c3aed', '#db2777', '#e5484d', '#ea580c', '#d4a106', '#16a34a', '#0d9488', '#334155'];
+const REPEAT = { none: 'Tidak berulang', daily: 'Setiap hari', weekly: 'Setiap minggu', monthly: 'Setiap bulan', yearly: 'Setiap tahun' };
+
+// ---- Sinkronisasi Google Calendar via iCal + Hari Libur Nasional Indonesia ----
+const GCAL_KEY = 'gcal_data';
+const GCAL_VER = 3; // naikkan jika format parser berubah (v3: lokasi + zona waktu lengkap)
+const GCAL_HOL_KEY = 'gcal_holidays';
+const GCAL_URL_SETTING = 'gcalUrl';
+const ID_HOLIDAY_ICS = 'https://calendar.google.com/calendar/ical/id.indonesian%23holiday%40group.v.calendar.google.com/public/basic.ics';
+const HOLIDAY_COLOR = '#e5484d';
+
+// Hari libur nasional & hari besar resmi Indonesia bawaan (tetap muncul walau offline)
+const STATIC_HOLIDAYS = [
+  // Berulang setiap tahun (tanggal masehi tetap)
+  ['2025-01-01', 'Tahun Baru Masehi', 'yearly'],
+  ['2025-05-01', 'Hari Buruh Internasional', 'yearly'],
+  ['2025-06-01', 'Hari Lahir Pancasila', 'yearly'],
+  ['2025-08-17', 'Hari Kemerdekaan RI', 'yearly'],
+  ['2025-12-25', 'Hari Raya Natal', 'yearly'],
+  // 2025 (tanggal hijriah/lunar/skB)
+  ['2025-01-27', 'Isra Mikraj Nabi Muhammad SAW'],
+  ['2025-01-29', 'Tahun Baru Imlek 2576'],
+  ['2025-03-29', 'Hari Suci Nyepi 1947'],
+  ['2025-03-31', 'Hari Raya Idul Fitri 1446 H', 'none', '2025-04-01'],
+  ['2025-04-18', 'Wafat Yesus Kristus'],
+  ['2025-05-12', 'Hari Raya Waisak 2569 BE'],
+  ['2025-05-29', 'Kenaikan Yesus Kristus'],
+  ['2025-06-06', 'Hari Raya Idul Adha 1446 H'],
+  ['2025-06-27', 'Tahun Baru Islam 1447 H'],
+  ['2025-09-05', 'Maulid Nabi Muhammad SAW'],
+  // 2026
+  ['2026-01-16', 'Isra Mikraj Nabi Muhammad SAW'],
+  ['2026-02-17', 'Tahun Baru Imlek 2577'],
+  ['2026-03-19', 'Hari Suci Nyepi 1948'],
+  ['2026-03-21', 'Hari Raya Idul Fitri 1447 H', 'none', '2026-03-22'],
+  ['2026-04-03', 'Wafat Yesus Kristus'],
+  ['2026-05-14', 'Kenaikan Yesus Kristus'],
+  ['2026-05-27', 'Hari Raya Idul Adha 1447 H'],
+  ['2026-05-31', 'Hari Raya Waisak 2570 BE'],
+  ['2026-06-16', 'Tahun Baru Islam 1448 H'],
+  ['2026-08-25', 'Maulid Nabi Muhammad SAW'],
+  // 2027
+  ['2027-01-05', 'Isra Mikraj Nabi Muhammad SAW'],
+  ['2027-02-06', 'Tahun Baru Imlek 2578'],
+  ['2027-03-10', 'Hari Raya Idul Fitri 1448 H', 'none', '2027-03-11'],
+  ['2027-03-09', 'Hari Suci Nyepi 1949'],
+  ['2027-03-26', 'Wafat Yesus Kristus'],
+  ['2027-05-06', 'Kenaikan Yesus Kristus'],
+  ['2027-05-17', 'Hari Raya Idul Adha 1448 H'],
+  ['2027-05-20', 'Hari Raya Waisak 2571 BE'],
+  ['2027-06-06', 'Tahun Baru Islam 1449 H'],
+  ['2027-08-15', 'Maulid Nabi Muhammad SAW'],
+].map(([date, title, repeat = 'none', endDate = ''], idx) => ({
+  id: `id-hol-${idx}`,
+  date,
+  ...(endDate ? { endDate } : {}),
+  time: '', end: '', title, note: 'Hari Libur Nasional Indonesia',
+  repeat, color: HOLIDAY_COLOR, _holiday: true,
+}));
+
+export function getGcalUrl() { return (settings[GCAL_URL_SETTING] || '').trim(); }
+export function setGcalUrl(url) { settings[GCAL_URL_SETTING] = (url || '').trim(); return saveSettings(); }
+
+let gcalEvents = [];       // event dari Google Calendar user
+let gcalSig = '';          // tanda tangan cepat untuk cegah render ulang jika tidak ada perubahan
+let holidayOnline = [];    // tambahan hari libur dari Google public feed (opsional)
+let _syncBusy = false;
+let _lastAutoSync = 0;
+let _syncTimer = 0;
+let _listenersBound = false;
+
+// Indeks tanggal O(1) agar render & dashboard bebas lag walau ribuan event
+let _idxDirty = true;
+let _calVer = 1;
+let _mergedCache = [];
+let _dateMap = new Map();
+let _recList = [];
+
+export function calendarVersion() { return _calVer; }
+function invalidateEventIndex() {
+  _idxDirty = true;
+  _calVer++;
+}
+
+function buildSig(evs) {
+  let s = String(evs.length);
+  for (let i = 0; i < evs.length; i++) {
+    const e = evs[i];
+    s += `;${e.date}|${e.endDate || ''}|${e.time}|${e.end}|${e.title}|${e.repeat}|${e.until || ''}`;
+  }
+  return s;
+}
+
+const bustUrl = (u) => u + (u.includes('?') ? '&' : '?') + '_=' + Date.now();
+
+async function fetchIcsText(url) {
+  const fresh = bustUrl(url);
+  const capHttp = window.Capacitor?.Plugins?.CapacitorHttp;
+  if (capHttp?.get) {
+    try {
+      const r = await capHttp.get({
+        url: fresh,
+        headers: { 'Cache-Control': 'no-cache, no-store', Pragma: 'no-cache' },
+      });
+      if (r?.status >= 200 && r?.status < 300 && typeof r.data === 'string' && r.data.includes('BEGIN:VCALENDAR')) {
+        return r.data;
+      }
+    } catch {}
+  }
+  const urls = [
+    fresh,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(fresh)}`,
+    `https://corsproxy.io/?url=${encodeURIComponent(fresh)}`,
+  ];
+  let lastErr = null;
+  for (const u of urls) {
+    try {
+      const res = await fetch(u, { cache: 'no-store', signal: AbortSignal.timeout(10000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const t = await res.text();
+      if (t.includes('BEGIN:VCALENDAR')) return t;
+      lastErr = new Error('Bukan file iCal valid');
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('Gagal mengunduh iCal');
+}
+
+/** Ambil cache dari IndexedDB (dipanggil saat init) */
+async function loadGcalCache() {
+  try {
+    const r = await db.get('kv', GCAL_KEY);
+    if (r?.ver === GCAL_VER && Array.isArray(r.events)) {
+      gcalEvents = r.events;
+      gcalSig = r.sig || buildSig(gcalEvents);
+    } else {
+      // Cache versi lama (v1) bisa salah tanggal zona waktu: bersihkan agar segera fetch ulang
+      gcalEvents = [];
+      gcalSig = '';
+      if (r) db.del('kv', GCAL_KEY).catch(() => {});
+    }
+  } catch { gcalEvents = []; gcalSig = ''; }
+  try {
+    const h = await db.get('kv', GCAL_HOL_KEY);
+    if (h?.ver === GCAL_VER && Array.isArray(h.events)) holidayOnline = h.events;
+  } catch { holidayOnline = []; }
+  invalidateEventIndex();
+}
+
+/** Sinkronkan hari libur resmi Indonesia di latar belakang (maks 1x per 7 hari) */
+async function syncHolidaysBg() {
+  if (!navigator.onLine || settings.showHolidays === false) return;
+  try {
+    const cached = await db.get('kv', GCAL_HOL_KEY).catch(() => null);
+    if (cached?.ver === GCAL_VER && cached.synced && Date.now() - cached.synced < 7 * 86400000) return;
+    const text = await fetchIcsText(ID_HOLIDAY_ICS);
+    const parsed = parseIcs(text, HOLIDAY_COLOR).map((e) => ({ ...e, color: HOLIDAY_COLOR, _holiday: true }));
+    if (parsed.length) {
+      holidayOnline = parsed;
+      invalidateEventIndex();
+      await db.put('kv', { id: GCAL_HOL_KEY, ver: GCAL_VER, events: parsed, synced: Date.now() });
+      render();
+      window.dispatchEvent(new CustomEvent('cherry:gcal'));
+    }
+  } catch {}
+}
+
+/** Simpan hasil fetch ke IndexedDB */
+async function saveGcalCache(evs, sig) {
+  gcalEvents = evs;
+  gcalSig = sig;
+  invalidateEventIndex();
+  try { await db.put('kv', { id: GCAL_KEY, ver: GCAL_VER, events: evs, sig, synced: Date.now() }); } catch {}
+}
+
+/** Kapan terakhir sync berhasil */
+export async function gcalLastSync() {
+  try { const r = await db.get('kv', GCAL_KEY); return r?.synced || 0; } catch { return 0; }
+}
+
+/**
+ * Ambil & parse iCal dari URL Google Calendar.
+ * - Online  → fetch → parse → simpan IndexedDB (jika berubah) → render
+ * - Offline → pakai cache IndexedDB terakhir
+ */
+export async function syncGcal({ silent = false } = {}) {
+  const url = getGcalUrl();
+  if (!url) {
+    const had = gcalEvents.length > 0;
+    gcalEvents = [];
+    gcalSig = '';
+    invalidateEventIndex();
+    try { await db.del('kv', GCAL_KEY); } catch {}
+    if (had) {
+      render();
+      window.dispatchEvent(new CustomEvent('cherry:gcal'));
+    }
+    return { ok: false, reason: 'no_url' };
+  }
+  if (_syncBusy) return { ok: false, reason: 'busy' };
+  _syncBusy = true;
+  try {
+    if (!navigator.onLine) {
+      if (!silent) toast('Offline — menampilkan data terakhir dari cache');
+      return { ok: false, reason: 'offline' };
+    }
+    const text = await fetchIcsText(url);
+    const parsed = parseIcs(text, settings.calAccent || '#0a99f0');
+    const marked = parsed.map((e) => ({ ...e, _gcal: true }));
+    const nextSig = buildSig(marked);
+    const changed = nextSig !== gcalSig;
+    if (changed) {
+      await saveGcalCache(marked, nextSig);
+      render(0, false, silent);
+      window.dispatchEvent(new CustomEvent('cherry:gcal'));
+    } else {
+      // Tetap perbarui timestamp synced tanpa re-render DOM
+      try { await db.put('kv', { id: GCAL_KEY, ver: GCAL_VER, events: gcalEvents, sig: gcalSig, synced: Date.now() }); } catch {}
+    }
+    if (!silent) toast(`Kalender Google disinkronkan: ${marked.length} acara`);
+    return { ok: true, count: marked.length, changed };
+  } catch (err) {
+    if (!silent) toast('Gagal sinkronisasi kalender: ' + (err.message || err));
+    return { ok: false, reason: err.message };
+  } finally {
+    _syncBusy = false;
+  }
+}
+
+/** Sync cepat supaya kembali dari Google Calendar / pindah tab terasa real-time tanpa lag */
+export function triggerQuickGcalSync(minGapMs = 2000) {
+  if (!getGcalUrl() || !navigator.onLine) return;
+  const now = Date.now();
+  if (now - _lastAutoSync < minGapMs) return;
+  _lastAutoSync = now;
+  syncGcal({ silent: true });
+}
+
+let _resumeFollowT = 0;
+function onAppResume() {
+  triggerQuickGcalSync(1500);
+  // Cek ulang diam-diam 4.5 dtk kemudian jika Google Calendar baru saja menyimpan acara
+  clearTimeout(_resumeFollowT);
+  _resumeFollowT = setTimeout(() => triggerQuickGcalSync(3500), 4500);
+}
+
+/** Init sync: muat cache lalu fetch jika online; pasang listener real-time (termasuk Android App resume) */
+export async function initGcalSync() {
+  await loadGcalCache();
+  triggerQuickGcalSync(0);
+  syncHolidaysBg();
+  if (_listenersBound) return;
+  _listenersBound = true;
+  window.addEventListener('online', () => { triggerQuickGcalSync(0); syncHolidaysBg(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) onAppResume(); });
+  window.addEventListener('focus', onAppResume);
+  try {
+    const capApp = window.Capacitor?.Plugins?.App;
+    capApp?.addListener?.('appStateChange', ({ isActive }) => { if (isActive) onAppResume(); });
+    capApp?.addListener?.('resume', onAppResume);
+  } catch {}
+  clearInterval(_syncTimer);
+  _syncTimer = setInterval(() => {
+    if (!document.hidden && navigator.onLine && getGcalUrl()) triggerQuickGcalSync(9000);
+  }, 10000);
+}
+
+/** Bangun ulang indeks O(1) bila data berubah */
+function ensureIndex() {
+  if (!_idxDirty) return;
+  _idxDirty = false;
+  const localKeys = new Set(events.map((e) => `${e.date}|${e.time}|${e.title}`));
+  const gcalExtra = gcalEvents.filter((e) => !localKeys.has(`${e.date}|${e.time}|${e.title}`));
+  let hols = [];
+  if (settings.showHolidays !== false) {
+    const holSource = holidayOnline.length ? holidayOnline : STATIC_HOLIDAYS;
+    const seen = new Set([...localKeys, ...gcalExtra.map((e) => `${e.date}|${e.time}|${e.title}`)]);
+    // Gabungkan juga hari libur statis tetap (Natal, Kemerdekaan, dll) jika belum ada
+    const holSeen = new Set();
+    for (const h of [...holSource, ...STATIC_HOLIDAYS]) {
+      const k = `${h.date}|${h.title.toLowerCase()}`;
+      if (holSeen.has(k) || seen.has(`${h.date}||${h.title}`)) continue;
+      holSeen.add(k);
+      hols.push(h);
+    }
+  }
+  _mergedCache = [...events, ...gcalExtra, ...hols];
+  _dateMap = new Map();
+  _recList = [];
+  const pushDay = (k, ev) => {
+    let arr = _dateMap.get(k);
+    if (!arr) { arr = []; _dateMap.set(k, arr); }
+    arr.push(ev);
+  };
+  for (const ev of _mergedCache) {
+    if (ev.repeat && ev.repeat !== 'none') {
+      _recList.push(ev);
+      continue;
+    }
+    if (!ev.endDate || ev.endDate <= ev.date) {
+      pushDay(ev.date, ev);
+      continue;
+    }
+    // Rentang multi-hari tanpa pengulangan: indeks tiap hari (maks 60 hari ke map, lebih dari itu ke recList)
+    const s = parseYmd(ev.date), e = parseYmd(ev.endDate);
+    const days = Math.round((e - s) / 86400000);
+    if (days >= 0 && days <= 60) {
+      for (let i = 0; i <= days; i++) {
+        const d = new Date(s); d.setDate(s.getDate() + i);
+        pushDay(ymd(d), ev);
+      }
+    } else {
+      _recList.push(ev);
+    }
+  }
+}
+
+/** Semua event (lokal + Google Calendar + Hari Libur), untuk render */
+function allEvents() {
+  ensureIndex();
+  return _mergedCache;
+}
+
+let events = [];
+let root;
+let cursor, selected;
+const today = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
+
+export async function initCalendar(el) {
+  root = el;
+  events = await db.all('events');
+  await initGcalSync(); // muat cache gcal + mulai sync latar belakang
+  const t = today();
+  cursor = new Date(t.getFullYear(), t.getMonth(), 1);
+  selected = ymd(t);
+  root.innerHTML = `
+    <div class="topbar">
+      <button class="ib" id="c-today" title="Hari ini">${ICON.today}</button>
+      <button class="title" id="c-title"></button>
+      <button class="ib sm" id="c-prev" title="Bulan sebelumnya">${ICON.back}</button>
+      <button class="ib sm" id="c-next" title="Bulan berikutnya">${ICON.fwd}</button>
+      <div class="spacer"></div>
+      <button class="ib" id="c-custom" title="Sesuaikan kalender">${ICON.palette}</button>
+      <button class="ib" id="c-more" title="Lainnya">${ICON.more}</button>
+    </div>
+    <div class="weekdays" id="c-wd"></div>
+    <div class="cal-grid" id="c-grid"></div>
+    <button class="fab" id="c-fab" title="Tambah acara">${ICON.plus}</button>`;
+
+  $('#c-today', root).onclick = goToday;
+  $('#c-prev', root).onclick = () => shift(-1);
+  $('#c-next', root).onclick = () => shift(1);
+  $('#c-title', root).onclick = monthPicker;
+  $('#c-custom', root).onclick = customize;
+  $('#c-fab', root).onclick = () => editEvent();
+  $('#c-more', root).onclick = (e) => popover(e.currentTarget, [
+    { label: 'Ke hari ini', icon: 'today', fn: goToday },
+    { label: `Monthly Plan ${MONTHS_LONG[cursor.getMonth()]}`, icon: 'pages', fn: openMonthPlan },
+    { label: 'Agenda mendatang', icon: 'note', fn: agenda },
+    { label: 'Sesuaikan kalender', icon: 'palette', fn: customize },
+    '-',
+    { label: 'Sinkronkan Google Calendar', icon: 'restore', fn: () => syncGcal() },
+    '-',
+    { label: 'Ekspor kalender (.ics)', icon: 'copy', fn: () => events.length ? exportIcs(events) : toast('Belum ada acara') },
+    { label: 'Impor kalender (.ics)', icon: 'restore', fn: importIcs },
+  ]);
+  onChange(() => { if (root.classList.contains('active')) render(); });
+  window.addEventListener('cherry:todo', async (e) => {
+    const { action, todo } = e.detail || {};
+    if (!todo) return;
+    const idx = events.findIndex((x) => x.id === todo.calEventId || x.todoId === todo.id);
+    if (action === 'delete' && idx >= 0) {
+      const rem = events.splice(idx, 1)[0];
+      await db.del('events', rem.id);
+      invalidateEventIndex(); render(0, false, true);
+      window.dispatchEvent(new CustomEvent('cherry:gcal'));
+    } else if ((action === 'save' || action === 'toggle') && idx >= 0) {
+      const ev = events[idx];
+      if (todo.due) {
+        ev.title = todo.title;
+        ev.date = todo.due;
+        ev.endDate = '';
+        ev.time = todo.dueTime || '';
+        ev.end = '';
+        ev.note = todo.note || '';
+        ev.done = !!todo.done;
+        await db.put('events', ev);
+      } else {
+        events.splice(idx, 1);
+        await db.del('events', ev.id);
+      }
+      invalidateEventIndex(); render(0, false, true);
+      window.dispatchEvent(new CustomEvent('cherry:gcal'));
+    } else {
+      window.dispatchEvent(new CustomEvent('cherry:gcal'));
+    }
+  });
+
+  const grid = $('#c-grid', root);
+  grid.addEventListener('click', (e) => {
+    const c = e.target.closest('.cell[data-date]'); if (!c) return;
+    const key = c.dataset.date;
+    selected = key;
+    const d = parseYmd(key);
+    if (d.getMonth() !== cursor.getMonth()) { cursor = new Date(d.getFullYear(), d.getMonth(), 1); render(d > cursor ? 1 : -1); }
+    else { $$('.cell.sel', root).forEach((x) => x.classList.remove('sel')); c.classList.add('sel'); }
+    dayDetail(key);
+  });
+  // geser (swipe) untuk ganti bulan
+  let sx = null, sy = null;
+  grid.addEventListener('touchstart', (e) => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; }, { passive: true });
+  grid.addEventListener('touchend', (e) => {
+    if (sx == null) return;
+    const dx = e.changedTouches[0].clientX - sx, dy = e.changedTouches[0].clientY - sy;
+    if (Math.abs(dy) > 60 && Math.abs(dy) > Math.abs(dx)) shift(dy < 0 ? 1 : -1);
+    else if (Math.abs(dx) > 60) shift(dx < 0 ? 1 : -1);
+    sx = sy = null;
+  });
+  let lock = 0;
+  grid.addEventListener('wheel', (e) => {
+    const n = Date.now(); if (n - lock < 380 || Math.abs(e.deltaY) < 15) return;
+    lock = n; shift(e.deltaY > 0 ? 1 : -1);
+  }, { passive: true });
+  document.addEventListener('keydown', (e) => {
+    if (!root.classList.contains('active') || $('#scrim').classList.contains('open') || e.target.matches('input,textarea')) return;
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') shift(-1);
+    if (e.key === 'ArrowRight' || e.key === 'PageDown') shift(1);
+  });
+  render();
+}
+
+export function applyAccent() {
+  const r = document.documentElement.style, c = settings.calAccent || '#0a99f0';
+  r.setProperty('--cal', c);
+  // aksen catatan, tombol +, dan alat aktif memakai warna tema yang sama
+  r.setProperty('--note', c);
+  const n = parseInt(c.slice(1, 7), 16), lum = (0.299 * (n >> 16) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  r.setProperty('--note-ink', lum > 0.62 ? '#1f1f22' : '#ffffff');
+}
+export function eventCount() { return allEvents().length; }
+export function upcomingCount() { const t = ymd(today()); return allEvents().filter((e) => !e._holiday && ((e.repeat && e.repeat !== 'none') || (e.endDate || e.date) >= t)).length; }
+export function getEvents() { return allEvents(); }
+export async function replaceEvents(list) { events = list; invalidateEventIndex(); render(); window.dispatchEvent(new CustomEvent('cherry:gcal')); }
+
+function goToday() { const t = today(); cursor = new Date(t.getFullYear(), t.getMonth(), 1); selected = ymd(t); render(0, true); }
+function shift(n, anim = true) { cursor = new Date(cursor.getFullYear(), cursor.getMonth() + n, 1); render(anim ? n : 0); }
+
+// ---------- Pengulangan & Rentang ----------
+export function occursOn(ev, d, key) {
+  if (key < ev.date) return false;
+  if (ev.until && key > ev.until) return false;
+  if (ev.exdates?.includes(key)) return false;
+  const s = parseYmd(ev.date);
+  const iv = ev.interval || 1;
+  switch (ev.repeat) {
+    case 'daily': {
+      if (iv === 1) return true;
+      const diff = Math.round((d - s) / 86400000);
+      return diff >= 0 && diff % iv === 0;
+    }
+    case 'weekly': {
+      const dayMatch = ev.byday?.length ? ev.byday.includes(d.getDay()) : d.getDay() === s.getDay();
+      if (!dayMatch) return false;
+      if (iv === 1) return true;
+      const diffW = Math.floor((d - s) / (7 * 86400000));
+      return diffW >= 0 && diffW % iv === 0;
+    }
+    case 'monthly': {
+      if (d.getDate() !== s.getDate()) return false;
+      if (iv === 1) return true;
+      const diffM = (d.getFullYear() - s.getFullYear()) * 12 + (d.getMonth() - s.getMonth());
+      return diffM >= 0 && diffM % iv === 0;
+    }
+    case 'yearly': {
+      if (d.getDate() !== s.getDate() || d.getMonth() !== s.getMonth()) return false;
+      const diffY = d.getFullYear() - s.getFullYear();
+      return diffY >= 0 && diffY % iv === 0;
+    }
+    default: return key >= ev.date && key <= (ev.endDate || ev.date);
+  }
+}
+const byTime = (a, b) => (a._holiday ? 1 : 0) - (b._holiday ? 1 : 0) || (a.time || '').localeCompare(b.time || '') || a.title.localeCompare(b.title);
+export function eventsOn(d) {
+  ensureIndex();
+  const key = ymd(d);
+  const exact = _dateMap.get(key);
+  const rec = _recList.length ? _recList.filter((e) => occursOn(e, d, key)) : null;
+  if (!exact && (!rec || !rec.length)) return [];
+  const list = exact && rec?.length ? [...exact, ...rec] : exact ? [...exact] : rec;
+  return list.length > 1 ? list.sort(byTime) : list;
+}
+export function formatEventWhen(e) {
+  const isTask = e.kind === 'task';
+  const tStr = e.time ? (isTask ? `Tenggat ${e.time}` : e.time + (e.end ? ' – ' + e.end : '')) : (isTask ? 'Tenggat hari ini' : 'Sepanjang hari');
+  let base = tStr;
+  if (e.endDate && e.endDate > e.date) {
+    const a = parseYmd(e.date), b = parseYmd(e.endDate);
+    const sameM = a.getMonth() === b.getMonth() && a.getFullYear() === b.getFullYear();
+    const dStr = sameM ? `${a.getDate()}–${b.getDate()} ${MONTHS[b.getMonth()]}` : `${a.getDate()} ${MONTHS[a.getMonth()]} – ${b.getDate()} ${MONTHS[b.getMonth()]}`;
+    base = `${dStr} · ${tStr}`;
+  }
+  return e.location ? `${base} · 📍 ${e.location}` : base;
+}
+
+function googleCalTemplateUrl(d) {
+  const d8 = (s) => s.replace(/-/g, '');
+  const t6 = (t) => t.replace(':', '') + '00';
+  const endD = d.endDate && d.endDate >= d.date ? d.endDate : d.date;
+  let dates;
+  if (d.time) {
+    dates = `${d8(d.date)}T${t6(d.time)}/${d8(endD)}T${t6(d.end || d.time)}`;
+  } else {
+    const next = parseYmd(endD); next.setDate(next.getDate() + 1);
+    dates = `${d8(d.date)}/${d8(ymd(next))}`;
+  }
+  const p = new URLSearchParams({ action: 'TEMPLATE', text: d.title || '', dates });
+  if (d.location) p.set('location', d.location);
+  if (d.note) p.set('details', d.note);
+  return 'https://calendar.google.com/calendar/render?' + p.toString();
+}
+
+function isoWeek(d) {
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const day = t.getUTCDay() || 7; t.setUTCDate(t.getUTCDate() + 4 - day);
+  const y0 = new Date(Date.UTC(t.getUTCFullYear(), 0, 1));
+  return Math.ceil(((t - y0) / 864e5 + 1) / 7);
+}
+
+// ---------- Render ----------
+export function render(dir = 0, wave = false, quiet = false) {
+  if (!root) return;
+  const s = settings;
+  const t = today(), tKey = ymd(t);
+  $('#c-title', root).textContent = `${(innerWidth < 500 ? MONTHS : MONTHS_LONG)[cursor.getMonth()]} ${cursor.getFullYear()}`;
+  const cols = s.weekNumbers ? '44px repeat(7, 1fr)' : 'repeat(7, 1fr)';
+  const order = [...Array(7)].map((_, i) => (i + s.weekStart) % 7);
+  const wd = $('#c-wd', root);
+  wd.style.gridTemplateColumns = cols;
+  const curMonth = cursor.getMonth() === t.getMonth() && cursor.getFullYear() === t.getFullYear();
+  wd.innerHTML = (s.weekNumbers ? '<div class="wk">Mg</div>' : '') + order.map((d) =>
+    `<div class="${curMonth && d === t.getDay() ? 'now' : ''} ${s.redSunday && d === 0 ? 'red' : ''}">${DAYS[d]}</div>`).join('');
+
+  const offset = (cursor.getDay() - s.weekStart + 7) % 7;
+  const start = new Date(cursor); start.setDate(1 - offset);
+  const grid = $('#c-grid', root);
+  grid.style.gridTemplateColumns = cols;
+  grid.classList.toggle('cal-round', s.todayStyle === 'round');
+  let html = '';
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(start); d.setDate(start.getDate() + i);
+    const key = ymd(d);
+    if (s.weekNumbers && i % 7 === 0) html += `<div class="cell wk">${isoWeek(d)}</div>`;
+    const cls = ['cell'];
+    const other = d.getMonth() !== cursor.getMonth();
+    if (other) cls.push('other');
+    if (other && !s.showOther) cls.push('hideother');
+    if (key === tKey) cls.push('today');
+    if (key === selected) cls.push('sel');
+    const evs = eventsOn(d);
+    if ((s.redSunday && d.getDay() === 0) || evs.some((e) => e._holiday)) cls.push('red');
+    if (i % 7 === 6) cls.push('endcol');
+    let body = '';
+    if (s.eventStyle === 'dot') {
+      body = evs.length ? `<div class="dots">${evs.slice(0, 6).map((e) => `<i style="background:${e.color}"></i>`).join('')}</div>` : '';
+    } else {
+      const max = 3;
+      body = `<div class="evs">${evs.slice(0, max).map((e) => `<div class="ev ${e.done ? 'done' : ''}" style="background:${e.color}">${e.kind === 'task' ? (e.done ? '✓ ' : '○ ') : ''}${e.time ? e.time + ' ' : ''}${esc(e.title)}</div>`).join('')}${evs.length > max ? `<div class="more">+${evs.length - max}</div>` : ''}</div>`;
+    }
+    const hasNote = findDay(key)?.ink ? `<i class="has-note" title="Ada catatan">${ICON.pen}</i>` : '';
+    html += `<button class="${cls.join(' ')}" style="--i:${i}" data-date="${key}"><span class="num"><span>${d.getDate()}</span>${hasNote}</span>${body}</button>`;
+  }
+  grid.innerHTML = html;
+  grid.classList.toggle('quiet', quiet);
+  grid.classList.remove('anim', 'wave');
+  if (dir || wave) {
+    void grid.offsetWidth;
+    grid.style.setProperty('--dir', dir > 0 ? '36px' : '-36px');
+    grid.classList.add(wave ? 'wave' : 'anim');
+  }
+}
+
+// ---------- Pemilih bulan ----------
+function monthPicker() {
+  let y = cursor.getFullYear();
+  const draw = () => {
+    const s = openSheet(`
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <button class="ib" id="mp-p">${ICON.back}</button><h3 style="margin:0">${y}</h3><button class="ib" id="mp-n">${ICON.fwd}</button>
+      </div>
+      <div class="month-grid">${MONTHS_LONG.map((m, i) => `<button class="btn ${i === cursor.getMonth() && y === cursor.getFullYear() ? 'primary' : 'ghost'}" data-m="${i}">${m}</button>`).join('')}</div>`);
+    $('#mp-p', s).onclick = () => { y--; draw(); };
+    $('#mp-n', s).onclick = () => { y++; draw(); };
+    $$('[data-m]', s).forEach((b) => b.onclick = () => { cursor = new Date(y, +b.dataset.m, 1); closeSheet(); render(); });
+  };
+  draw();
+}
+
+// ---------- Halaman harian (animasi zoom dari kotak tanggal) ----------
+const reduceMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+function zoomer(key) {
+  const d = parseYmd(key);
+  const z = document.createElement('div');
+  z.className = 'zoomer';
+  z.innerHTML = `<div class="zn">${d.getDate()}</div><div class="zd">${DAYS_LONG[d.getDay()]}<br><small>${MONTHS_LONG[d.getMonth()]} ${d.getFullYear()}</small></div>`;
+  document.body.appendChild(z);
+  return z;
+}
+const full = () => ({ left: '0px', top: '0px', width: innerWidth + 'px', height: innerHeight + 'px', borderRadius: '0px' });
+const boxOf = (r) => ({ left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px', borderRadius: '6px' });
+
+async function openDay(key, cell, animate = true) {
+  selected = key;
+  const d = parseYmd(key);
+  if (d.getMonth() !== cursor.getMonth()) { cursor = new Date(d.getFullYear(), d.getMonth(), 1); render(); }
+  else $$('.cell.sel', root).forEach((c) => c.classList.remove('sel')), cell?.classList.add('sel');
+  // buku harian yang dikunci minta PIN dulu
+  const locked = findDay(key);
+  if (locked?.locked && !(await requireUnlock(locked))) return;
+  let z = null;
+  if (animate && cell && !reduceMotion()) {
+    z = zoomer(key);
+    const a = z.animate([boxOf(cell.getBoundingClientRect()), full()], { duration: 360, easing: 'cubic-bezier(.2,.8,.2,1)', fill: 'forwards' });
+    z.classList.add('grow');
+    await a.finished;
+  }
+  const nb = await getDayNotebook(key);
+  await openEditor(nb, {
+    header: ' ',
+    onReady: (h) => fillDayHeader(h, key),
+    onClose: () => closeDay(key),
+  });
+  if (z) { await z.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 180, fill: 'forwards' }).finished; z.remove(); }
+}
+
+async function closeDay(key) {
+  render();
+  const cell = $(`.cell[data-date="${key}"]`, root);
+  if (!cell || reduceMotion() || !root.classList.contains('active')) return;
+  const z = zoomer(key); z.classList.add('grow');
+  await z.animate([full(), boxOf(cell.getBoundingClientRect())], { duration: 300, easing: 'cubic-bezier(.4,0,.2,1)', fill: 'forwards' }).finished;
+  await z.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 120, fill: 'forwards' }).finished;
+  z.remove();
+}
+
+function fillDayHeader(h, key) {
+  if (!h) return;
+  const d = parseYmd(key);
+  const evs = eventsOn(d);
+  h.innerHTML = `
+    <button class="ib sm" id="dh-prev" title="Hari sebelumnya">${ICON.back}</button>
+    <div class="dh-date"><b>${d.getDate()}</b><span>${DAYS_LONG[d.getDay()]}<br><small>${MONTHS_LONG[d.getMonth()]} ${d.getFullYear()}</small></span></div>
+    <button class="ib sm" id="dh-next" title="Hari berikutnya">${ICON.fwd}</button>
+    <div class="dh-evs">${evs.map((e) => `<button class="dh-ev" data-id="${e.id}" style="--c:${e.color}">${e.time ? `<small>${e.time}</small> ` : ''}${esc(e.title)}</button>`).join('') || '<span class="dh-none">Belum ada acara di hari ini</span>'}</div>
+    <button class="btn ghost" id="dh-add" style="flex:none">+ Acara</button>`;
+  const step = (n) => { const x = new Date(d); x.setDate(d.getDate() + n); openDay(ymd(x), null, false); };
+  $('#dh-prev', h).onclick = () => step(-1);
+  $('#dh-next', h).onclick = () => step(1);
+  $('#dh-add', h).onclick = () => editEvent(null, key, () => fillDayHeader(editorHeader(), key));
+  $$('[data-id]', h).forEach((b) => b.onclick = () => {
+    const ev = events.find((e) => e.id === b.dataset.id);
+    if (ev) editEvent(ev, null, () => fillDayHeader(editorHeader(), key));
+  });
+}
+
+async function openMonthPlan() {
+  const m = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}`;
+  const nb = await getMonthNotebook(m);
+  if (!(await requireUnlock(nb))) return;
+  openEditor(nb, { onClose: render });
+}
+
+async function importIcs() {
+  const f = await pickFile('.ics,text/calendar'); if (!f) return;
+  const list = parseIcs(await f.text(), settings.calAccent);
+  if (!list.length) return toast('Tidak ada acara di file itu');
+  const keys = new Set(events.map((e) => `${e.date}|${e.time}|${e.title}`));
+  const fresh = list.filter((e) => !keys.has(`${e.date}|${e.time}|${e.title}`));
+  events.push(...fresh); await db.putMany('events', fresh);
+  invalidateEventIndex();
+  render();
+  window.dispatchEvent(new CustomEvent('cherry:gcal'));
+  toast(`${fresh.length} acara diimpor${list.length - fresh.length ? `, ${list.length - fresh.length} duplikat dilewati` : ''}`);
+}
+
+// ---------- Detail hari ----------
+// dibuka dari notifikasi: lompat ke tanggal itu lalu tampilkan detailnya
+export function showDate(key) { selected = key; const d = parseYmd(key); cursor = new Date(d.getFullYear(), d.getMonth(), 1); render(0, true); dayDetail(key); }
+
+function dayDetail(key) {
+  const d = parseYmd(key);
+  const evs = eventsOn(d);
+  const tds = todosDue(key);
+  const note = findDay(key);
+  const isToday = key === ymd(today());
+  const ro = (e) => e._holiday;
+  const s = openSheet(`
+    <div class="dp-head">
+      <div class="dp-num" style="${isToday ? 'background:var(--cal);color:#fff' : ''}">${d.getDate()}</div>
+      <div><div class="dp-day">${DAYS_LONG[d.getDay()]}${isToday ? ' · Hari ini' : ''}</div><div class="dp-month">${MONTHS_LONG[d.getMonth()]} ${d.getFullYear()}</div></div>
+    </div>
+    <div class="h2">Acara</div>
+    ${evs.length ? evs.map((e, i) => `
+      <div class="row ${ro(e) ? '' : 'click'} dp-item ${e.done ? 'done' : ''}" ${ro(e) ? '' : `data-ev="${esc(e.id)}"`} style="--i:${i}">
+        <span class="bar" style="background:${e.color}"></span>
+        <div class="grow"><div>${e.kind === 'task' ? (e.done ? '✓ ' : '○ ') : ''}${esc(e.title)}${e._gcal ? ' <small style="opacity:.55;font-size:11px">Google</small>' : e._holiday ? ' <small style="color:#e5484d;font-size:11px">Libur</small>' : ''}</div>
+          <div class="sub">${esc(formatEventWhen(e))}${e.repeat && e.repeat !== 'none' ? ' · ' + REPEAT[e.repeat] : ''}</div>
+          ${e.note && !e._holiday ? `<div class="sub" style="white-space:pre-wrap">${esc(e.note)}</div>` : ''}</div>
+      </div>`).join('') : '<div class="dp-empty">Tidak ada acara.</div>'}
+    ${tds.length ? `<div class="h2">To-do tenggat hari ini</div>${tds.map((t, i) => `
+      <div class="row dp-item ${t.done ? 'done' : ''}" data-todo="${t.id}" style="--i:${evs.length + i}">
+        <button class="check">${t.done ? ICON.check : ''}</button>
+        <div class="grow"><div class="ttl">${esc(t.title)}</div>${t.dueTime ? `<div class="sub">Tenggat jam ${esc(t.dueTime)}</div>` : ''}</div>
+      </div>`).join('')}` : ''}
+    <div class="actions">
+      <button class="btn ghost left" id="dd-note">${ICON.pen.replace('<svg', '<svg width="16" height="16" style="vertical-align:-3px;margin-right:6px"')}${note ? 'Buka catatan hari ini' : 'Tulis catatan'}</button>
+      <button class="btn ghost" id="dd-close">Tutup</button>
+      <button class="btn primary" id="dd-add">+ Acara</button>
+    </div>`);
+  $$('[data-ev]', s).forEach((r) => r.onclick = () => {
+    const ev = allEvents().find((e) => e.id === r.dataset.ev);
+    if (ev && !ev._holiday) editEvent(ev, null, () => dayDetail(key));
+  });
+  $$('[data-todo]', s).forEach((r) => r.querySelector('.check').onclick = async () => { await toggleTodo(r.dataset.todo); dayDetail(key); });
+  $('#dd-close', s).onclick = () => closeSheet();
+  $('#dd-add', s).onclick = () => editEvent(null, key, () => dayDetail(key));
+  $('#dd-note', s).onclick = () => { closeSheet(); openDay(key, $(`.cell[data-date="${key}"]`, root)); };
+}
+
+// ---------- Tambah / ubah acara (gaya Google Calendar: Acara & Tugas) ----------
+export const newEvent = (date) => editEvent(undefined, date); // dipakai Dashboard
+function editEvent(ev, date, after) {
+  const isGcal = !!ev?._gcal;
+  const isNew = !ev;
+  ev = ev || { title: '', kind: 'event', date: date || selected, endDate: '', time: '', end: '', location: '', note: '', color: settings.calAccent, repeat: 'none', remind: settings.defaultRemind ?? '10' };
+  let kind = ev.kind === 'task' ? 'task' : 'event';
+  let color = ev.color || settings.calAccent;
+  const linkedTodo = ev.todoId ? findTodo(ev.todoId) : null;
+  const initSubs = linkedTodo?.subs || [];
+  let timeOpen = !!(ev.time || ev.end || (ev.endDate && ev.endDate > ev.date));
+
+  const fmtDateChip = (ds) => {
+    if (!ds) return '';
+    const d = parseYmd(ds);
+    return `${DAYS_LONG[d.getDay()]}, ${d.getDate()} ${MONTHS_LONG[d.getMonth()]}`;
+  };
+  const subRow = (sub) => `<div class="td-erow" data-id="${sub.id}"><input type="checkbox" ${sub.d ? 'checked' : ''}><input class="inp" value="${esc(sub.t)}" placeholder="Sub-tugas"><button type="button" class="td-mv" data-mv="-1" title="Naik">↑</button><button type="button" class="td-mv" data-mv="1" title="Turun">↓</button><button type="button" class="td-x" title="Hapus">×</button></div>`;
+
+  const s = openSheet(`
+    <div class="gcal-mhead">
+      <input class="gcal-title-inp" id="e-title" value="${esc(ev.title)}" placeholder="Tambahkan judul">
+      <div class="gcal-tabs" id="e-kind-tabs" role="tablist">
+        <button type="button" class="gcal-tab ${kind === 'event' ? 'on' : ''}" data-kind="event">Acara</button>
+        <button type="button" class="gcal-tab ${kind === 'task' ? 'on' : ''}" data-kind="task">Tugas</button>
+      </div>
+    </div>
+    ${isGcal ? `<div class="gcal-ro-note">Acara dari Google Calendar (iCal hanya-baca). Ubah di Google Calendar atau simpan salinan lokal di Cherry.</div>` : ''}
+
+    <div class="gcal-row" id="e-time-row">
+      <svg class="gcal-ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+      <div class="gcal-row-body">
+        <div class="gcal-sum-line">
+          <div class="gcal-sum-txt">
+            <div id="e-sum-date">${esc(fmtDateChip(ev.date))}${ev.endDate && ev.endDate > ev.date ? ' – ' + esc(fmtDateChip(ev.endDate)) : ''}</div>
+            <small id="e-sum-rep">${esc(REPEAT[ev.repeat || 'none'])}</small>
+          </div>
+          <button type="button" class="gcal-pill-btn ${timeOpen ? 'on' : ''}" id="e-time-toggle">${timeOpen ? 'Tutup waktu' : 'Tambah jam'}</button>
+        </div>
+        <div class="cal-expand ${timeOpen ? 'open' : ''}" id="e-time-box">
+          <div class="cal-expand-in">
+            <div class="two" style="margin-top:10px">
+              <div class="field"><label id="e-date-lbl">${kind === 'task' ? 'Tanggal tenggat' : 'Tanggal mulai'}</label><input class="inp" id="e-date" type="date" value="${ev.date}"></div>
+              <div class="field" id="e-enddate-wrap" ${kind === 'task' ? 'hidden' : ''}><label>Sampai tanggal</label><input class="inp" id="e-end-date" type="date" value="${ev.endDate || ''}" min="${ev.date}"></div>
+            </div>
+            <div class="two" id="e-hm-wrap" ${!ev.time && timeOpen === false ? '' : ''}>
+              <div class="field"><label id="e-time-lbl">${kind === 'task' ? 'Jam tenggat' : 'Jam mulai'}</label><input class="inp" id="e-time" type="time" value="${ev.time || ''}"></div>
+              <div class="field" id="e-end-wrap" ${kind === 'task' ? 'hidden' : ''}><label>Jam selesai</label><input class="inp" id="e-end" type="time" value="${ev.end || ''}"></div>
+            </div>
+            <div class="gcal-time-opts">
+              <label class="gcal-chk"><input type="checkbox" id="e-allday" ${!ev.time ? 'checked' : ''}><span>Sepanjang hari</span></label>
+              <select class="gcal-sel" id="e-rep">${Object.entries(REPEAT).map(([k, v]) => `<option value="${k}" ${ev.repeat === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gcal-pane ${kind === 'event' ? 'show' : ''}" id="e-pane-event">
+      <div class="gcal-row">
+        <svg class="gcal-ic" viewBox="0 0 24 24"><path d="M12 21s-6-5.4-6-10a6 6 0 1 1 12 0c0 4.6-6 10-6 10z"/><circle cx="12" cy="11" r="2.2"/></svg>
+        <div class="gcal-row-body"><input class="gcal-line-inp" id="e-loc" value="${esc(ev.location || '')}" placeholder="Tambahkan lokasi"></div>
+      </div>
+      <div class="gcal-row">
+        <svg class="gcal-ic" viewBox="0 0 24 24"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+        <div class="gcal-row-body">
+          <select class="gcal-sel full" id="e-rem">${Object.entries(REMIND).map(([k, v]) => `<option value="${k}" ${String(ev.remind ?? '') === k ? 'selected' : ''}>Ingatkan: ${v}</option>`).join('')}</select>
+        </div>
+      </div>
+    </div>
+
+    <div class="gcal-pane ${kind === 'task' ? 'show' : ''}" id="e-pane-task">
+      <div class="gcal-row">
+        <svg class="gcal-ic" viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+        <div class="gcal-row-body">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+            <span class="gcal-subh">Sub-tugas (masuk ke To-do list)</span>
+            <div class="td-subsort"><button type="button" class="td-sortbtn" id="e-sub-undone">⇅ Belum</button><button type="button" class="td-sortbtn" id="e-sub-az">A–Z</button></div>
+          </div>
+          <div id="e-subs">${initSubs.map(subRow).join('')}</div>
+          <button type="button" class="btn ghost td-add" id="e-addsub">+ Tambah sub-tugas</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="gcal-row">
+      <svg class="gcal-ic" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+      <div class="gcal-row-body"><textarea class="gcal-line-inp" id="e-note" rows="2" placeholder="Tambahkan deskripsi atau catatan">${esc(ev.note || '')}</textarea></div>
+    </div>
+
+    <div class="gcal-row">
+      <svg class="gcal-ic" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M8 3v4M16 3v4"/></svg>
+      <div class="gcal-row-body">
+        <div class="swatches" style="gap:7px">${[...new Set([settings.calAccent, ...COLORS])].map((c) => `<button type="button" class="sw ${c === color ? 'on' : ''}" data-c="${c}" style="background:${c}"></button>`).join('')}</div>
+      </div>
+    </div>
+
+    <div class="actions">
+      ${!isNew && !isGcal ? '<button type="button" class="btn danger left" id="e-del">Hapus</button>' : ''}
+      ${isGcal ? '<button type="button" class="btn ghost left" id="e-gcal-open">Buka di Google Calendar</button>' : ''}
+      <button type="button" class="btn ghost" id="e-cancel">Batal</button>
+      <button type="button" class="btn primary" id="e-save">${isGcal ? 'Simpan salinan' : 'Simpan'}</button>
+    </div>`, { guardForm: !isGcal, onSave: () => submit() });
+
+  if (isNew) setTimeout(() => $('#e-title', s).focus(), 40);
+  const pickCol = (c) => { color = c; $$('.sw', s).forEach((x) => x.classList.toggle('on', x.dataset.c === c)); };
+  $$('.sw', s).forEach((b) => b.onclick = () => pickCol(b.dataset.c));
+
+  const tToggle = $('#e-time-toggle', s), tBox = $('#e-time-box', s);
+  const dStart = $('#e-date', s), dEnd = $('#e-end-date', s), tStart = $('#e-time', s), tEnd = $('#e-end', s);
+  const allDay = $('#e-allday', s), repSel = $('#e-rep', s), hmWrap = $('#e-hm-wrap', s);
+  const sumDate = $('#e-sum-date', s), sumRep = $('#e-sum-rep', s);
+
+  const syncSummary = () => {
+    const a = dStart.value || selected, b = kind === 'event' ? dEnd.value : '';
+    const tm = allDay.checked ? '' : tStart.value;
+    const te = allDay.checked || kind === 'task' ? '' : tEnd.value;
+    const dStr = fmtDateChip(a) + (b && b > a ? ' – ' + fmtDateChip(b) : '');
+    const tStr = tm ? ` · ${tm}${te ? ' – ' + te : ''}` : '';
+    sumDate.textContent = dStr + tStr;
+    sumRep.textContent = REPEAT[repSel.value || 'none'];
+  };
+  const syncAllDay = () => {
+    hmWrap.style.display = allDay.checked ? 'none' : '';
+    if (allDay.checked) { tStart.value = ''; tEnd.value = ''; }
+    else if (!tStart.value) { tStart.value = kind === 'task' ? '23:59' : '09:00'; }
+    syncSummary();
+  };
+  syncAllDay();
+
+  tToggle.onclick = () => {
+    const on = !tBox.classList.contains('open');
+    tBox.classList.toggle('open', on);
+    tToggle.classList.toggle('on', on);
+    tToggle.textContent = on ? 'Tutup waktu' : 'Tambah jam';
+    if (on && allDay.checked && !tStart.value) {
+      allDay.checked = false;
+      syncAllDay();
+    }
+  };
+  allDay.onchange = syncAllDay;
+  dStart.onchange = () => { if (dEnd.value && dEnd.value < dStart.value) dEnd.value = dStart.value; dEnd.min = dStart.value; syncSummary(); };
+  dEnd.onchange = syncSummary;
+  tStart.onchange = () => { if (tStart.value) allDay.checked = false; syncSummary(); };
+  tEnd.onchange = () => { if (tEnd.value) allDay.checked = false; syncSummary(); };
+  repSel.onchange = syncSummary;
+
+  const syncKindUI = () => {
+    $$('[data-kind]', s).forEach((b) => b.classList.toggle('on', b.dataset.kind === kind));
+    $('#e-pane-event', s).classList.toggle('show', kind === 'event');
+    $('#e-pane-task', s).classList.toggle('show', kind === 'task');
+    $('#e-enddate-wrap', s).hidden = kind === 'task';
+    $('#e-end-wrap', s).hidden = kind === 'task';
+    $('#e-date-lbl', s).textContent = kind === 'task' ? 'Tanggal tenggat' : 'Tanggal mulai';
+    $('#e-time-lbl', s).textContent = kind === 'task' ? 'Jam tenggat' : 'Jam mulai';
+    syncSummary();
+  };
+  $$('[data-kind]', s).forEach((b) => b.onclick = () => { kind = b.dataset.kind; syncKindUI(); });
+
+  // Sub-tugas (mode Tugas): tambah, naik/turun, & sortir smooth
+  const subsBox = $('#e-subs', s);
+  const addSub = (focus = true) => {
+    subsBox.insertAdjacentHTML('beforeend', subRow({ id: uid(), t: '', d: false }));
+    if (focus) subsBox.lastElementChild.querySelector('.inp').focus();
+  };
+  const sortSubsUI = (cmp) => {
+    const rows = [...$$('.td-erow', subsBox)];
+    if (rows.length < 2) return;
+    rows.sort(cmp).forEach((r) => {
+      r.classList.add('td-erow-anim');
+      subsBox.appendChild(r);
+      r.addEventListener('animationend', () => r.classList.remove('td-erow-anim'), { once: true });
+    });
+  };
+  $('#e-addsub', s).onclick = () => addSub();
+  $('#e-sub-undone', s).onclick = () => sortSubsUI((a, b) => Number(a.querySelector('input[type=checkbox]').checked) - Number(b.querySelector('input[type=checkbox]').checked));
+  $('#e-sub-az', s).onclick = () => sortSubsUI((a, b) => a.querySelector('.inp').value.localeCompare(b.querySelector('.inp').value));
+  subsBox.addEventListener('click', (e) => {
+    if (e.target.closest('.td-x')) { e.target.closest('.td-erow').remove(); return; }
+    const mv = e.target.closest('.td-mv');
+    if (mv) {
+      const row = mv.closest('.td-erow'), dir = +mv.dataset.mv;
+      const sib = dir < 0 ? row.previousElementSibling : row.nextElementSibling;
+      if (!sib) return;
+      row.classList.add('td-erow-anim');
+      if (dir < 0) subsBox.insertBefore(row, sib); else subsBox.insertBefore(sib, row);
+      row.addEventListener('animationend', () => row.classList.remove('td-erow-anim'), { once: true });
+    }
+  });
+  subsBox.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || !e.target.classList.contains('inp')) return;
+    e.preventDefault();
+    const r = e.target.closest('.td-erow');
+    if (r === subsBox.lastElementChild && e.target.value.trim()) addSub(); else r.nextElementSibling?.querySelector('.inp')?.focus();
+  });
+
+  $('#e-cancel', s).onclick = () => closeSheet();
+  if (isGcal) {
+    $('#e-gcal-open', s).onclick = () => {
+      const url = googleCalTemplateUrl({
+        title: $('#e-title', s).value.trim() || ev.title,
+        date: dStart.value || ev.date,
+        endDate: dEnd.value || ev.endDate,
+        time: allDay.checked ? '' : tStart.value,
+        end: allDay.checked ? '' : tEnd.value,
+        location: $('#e-loc', s).value.trim(),
+        note: $('#e-note', s).value.trim(),
+      });
+      window.open(url, '_blank', 'noopener');
+    };
+  }
+  if (!isNew && !isGcal) $('#e-del', s).onclick = async () => {
+    if (!(await confirmDialog(`Hapus ${kind === 'task' ? 'tugas' : 'acara'} "${ev.title}"?`, { ok: 'Hapus', danger: true }))) return;
+    events = events.filter((e) => e.id !== ev.id);
+    if (ev.todoId || ev.kind === 'task') await deleteTodoByCalId(ev.id, ev.todoId);
+    invalidateEventIndex();
+    await db.del('events', ev.id); reschedule(); render();
+    window.dispatchEvent(new CustomEvent('cherry:gcal'));
+    after?.(); toast('Dihapus');
+  };
+
+  const submit = async () => {
+    const title = $('#e-title', s).value.trim();
+    if (!title) { $('#e-title', s).focus(); return; }
+    const startD = dStart.value || selected;
+    let endD = kind === 'event' ? dEnd.value : '';
+    if (endD && endD <= startD) endD = '';
+    const tm = allDay.checked ? '' : tStart.value;
+    const te = allDay.checked || kind === 'task' ? '' : tEnd.value;
+    const loc = kind === 'event' ? $('#e-loc', s).value.trim() : '';
+    const note = $('#e-note', s).value.trim();
+    const rep = repSel.value || 'none';
+    const rem = $('#e-rem', s).value;
+    const calId = (isNew || isGcal) ? uid() : ev.id;
+
+    let todoId = ev.todoId || '';
+    if (kind === 'task') {
+      const subs = $$('.td-erow', subsBox).map((r) => ({ id: r.dataset.id, t: r.querySelector('.inp').value.trim(), d: r.querySelector('input[type=checkbox]').checked })).filter((x) => x.t);
+      const repMap = { daily: 'daily', weekly: 'weekly', monthly: 'monthly' };
+      const td = await upsertTodoFromCalendar({
+        todoId, calEventId: calId, title, due: startD, dueTime: tm, note, rep: repMap[rep] || '', subs,
+      });
+      todoId = td.id;
+    } else if (!isNew && !isGcal && todoId) {
+      await deleteTodoByCalId(ev.id, todoId);
+      todoId = '';
+    }
+
+    const data = { title, kind, date: startD, endDate: endD, time: tm, end: te, location: loc, note, repeat: rep, remind: rem, color, todoId };
+    let rec;
+    if (isNew || isGcal) { rec = { id: calId, created: Date.now(), ...data }; events.push(rec); }
+    else { rec = Object.assign(ev, data); }
+    invalidateEventIndex();
+    await db.put('events', rec);
+    if (rec.remind !== '') ensurePermission().then(reschedule); else reschedule();
+    if (!after) { selected = data.date; const d = parseYmd(data.date); cursor = new Date(d.getFullYear(), d.getMonth(), 1); }
+    closeSheet(); render();
+    window.dispatchEvent(new CustomEvent('cherry:gcal'));
+    after?.(); toast(isGcal ? 'Disimpan sebagai acara lokal' : isNew ? (kind === 'task' ? 'Tugas masuk ke Kalender & To-do' : 'Acara ditambahkan') : 'Diperbarui');
+  };
+  $('#e-save', s).onclick = submit;
+  $('#e-title', s).onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+}
+
+// ---------- Agenda ----------
+function agenda() {
+  const t = today(); const items = [];
+  for (let i = 0; i < 90 && items.length < 60; i++) {
+    const d = new Date(t); d.setDate(t.getDate() + i);
+    for (const e of eventsOn(d)) items.push({ d, e });
+  }
+  const s = openSheet(`<h3>Agenda 90 hari ke depan</h3>
+    ${items.length ? items.map(({ d, e }) => `<div class="row click" data-id="${e.id}" data-date="${ymd(d)}"><span class="bar" style="background:${e.color}"></span>
+      <div class="grow"><div>${esc(e.title)}</div><div class="sub">${longDate(d)}${e.time ? ' · ' + e.time : ''}</div></div></div>`).join('')
+      : '<div class="empty" style="padding:30px">Belum ada acara mendatang.</div>'}
+    <div class="actions"><button class="btn ghost" id="ag-c">Tutup</button></div>`);
+  $('#ag-c', s).onclick = () => closeSheet();
+  $$('.row', s).forEach((r) => r.onclick = () => { selected = r.dataset.date; const d = parseYmd(selected); cursor = new Date(d.getFullYear(), d.getMonth(), 1); closeSheet(); render(); });
+}
+
+// ---------- Kustomisasi ----------
+export function customize() {
+  const holOn = settings.showHolidays !== false;
+  const opt = (key, val, label) => `<button class="chip-opt ${(key === 'showHolidays' ? holOn === val : settings[key] === val) ? 'on' : ''}" data-k="${key}" data-v='${JSON.stringify(val)}'>${label}</button>`;
+  const s = openSheet(`
+    <h3>Sesuaikan kalender</h3>
+    <div class="field"><label>Warna utama</label><div class="swatches">${ACCENTS.map((c) => `<button class="sw ${c === settings.calAccent ? 'on' : ''}" data-acc="${c}" style="background:${c}"></button>`).join('')}
+      <label class="sw" style="background:conic-gradient(red,yellow,lime,cyan,blue,magenta,red);position:relative;overflow:hidden" title="Warna lain"><input type="color" id="cz-col" value="${settings.calAccent}" style="opacity:0;position:absolute;inset:0;width:100%;height:100%"></label></div></div>
+    <div class="field"><label>Minggu dimulai hari</label><div class="chips">${opt('weekStart', 1, 'Senin')}${opt('weekStart', 0, 'Minggu')}${opt('weekStart', 6, 'Sabtu')}</div></div>
+    <div class="field"><label>Penanda hari ini</label><div class="chips">${opt('todayStyle', 'bar', 'Blok penuh')}${opt('todayStyle', 'round', 'Bulat')}</div></div>
+    <div class="field"><label>Tampilan acara</label><div class="chips">${opt('eventStyle', 'label', 'Label judul')}${opt('eventStyle', 'dot', 'Titik warna')}</div></div>
+    <div class="field"><label>Nomor minggu</label><div class="chips">${opt('weekNumbers', false, 'Sembunyikan')}${opt('weekNumbers', true, 'Tampilkan')}</div></div>
+    <div class="field"><label>Tanggal bulan lain</label><div class="chips">${opt('showOther', true, 'Tampilkan')}${opt('showOther', false, 'Sembunyikan')}</div></div>
+    <div class="field"><label>Hari Minggu merah</label><div class="chips">${opt('redSunday', true, 'Ya')}${opt('redSunday', false, 'Tidak')}</div></div>
+    <div class="field"><label>Hari libur nasional (Indonesia)</label><div class="chips">${opt('showHolidays', true, 'Tampilkan')}${opt('showHolidays', false, 'Sembunyikan')}</div></div>
+    <div class="actions"><button class="btn primary" id="cz-ok">Selesai</button></div>`);
+  const apply = () => { invalidateEventIndex(); saveSettings(); applyAccent(); render(); window.dispatchEvent(new CustomEvent('cherry:gcal')); };
+  $$('[data-acc]', s).forEach((b) => b.onclick = () => { settings.calAccent = b.dataset.acc; $$('[data-acc]', s).forEach((x) => x.classList.toggle('on', x === b)); apply(); });
+  $('#cz-col', s).oninput = (e) => { settings.calAccent = e.target.value; $$('[data-acc]', s).forEach((x) => x.classList.remove('on')); apply(); };
+  $$('[data-k]', s).forEach((b) => b.onclick = () => {
+    settings[b.dataset.k] = JSON.parse(b.dataset.v);
+    $$(`[data-k="${b.dataset.k}"]`, s).forEach((x) => x.classList.toggle('on', x === b)); apply();
+  });
+  $('#cz-ok', s).onclick = () => closeSheet();
+}
