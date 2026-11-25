@@ -1,0 +1,229 @@
+// Pengubah notasi LaTeX & Markdown ke tampilan matematika yang bersih dan mudah dibaca.
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+const TEX_SYMS = {
+  times: '×', cdot: '·', div: '÷', pm: '±', mp: '∓', ast: '∗', star: '⋆',
+  leq: '≤', le: '≤', geq: '≥', ge: '≥', neq: '≠', ne: '≠', approx: '≈', equiv: '≡', sim: '∼', simeq: '≃', prop: '∝', propto: '∝',
+  to: '→', rightarrow: '→', leftarrow: '←', leftrightarrow: '↔', mapsto: '↦',
+  Rightarrow: '⇒', Leftarrow: '⇐', Leftrightarrow: '⇔', implies: '⇒', iff: '⇔',
+  circ: '°', degree: '°', infty: '∞', partial: '∂', nabla: '∇',
+  sum: '∑', prod: '∏', int: '∫', iint: '∬', oint: '∮',
+  in: '∈', notin: '∉', subset: '⊂', subseteq: '⊆', supset: '⊃', supseteq: '⊇',
+  cup: '∪', cap: '∩', emptyset: '∅', varnothing: '∅', forall: '∀', exists: '∃', neg: '¬', land: '∧', lor: '∨',
+  therefore: '∴', because: '∵', angle: '∠', measuredangle: '∡', triangle: '△', perp: '⊥', parallel: '∥', cong: '≅',
+  alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ε', varepsilon: 'ε', zeta: 'ζ', eta: 'η',
+  theta: 'θ', vartheta: 'θ', iota: 'ι', kappa: 'κ', lambda: 'λ', mu: 'μ', nu: 'ν', xi: 'ξ',
+  pi: 'π', varpi: 'π', rho: 'ρ', sigma: 'σ', tau: 'τ', upsilon: 'υ', phi: 'φ', varphi: 'φ', chi: 'χ', psi: 'ψ', omega: 'ω',
+  Gamma: 'Γ', Delta: 'Δ', Theta: 'Θ', Lambda: 'Λ', Xi: 'Ξ', Pi: 'Π', Sigma: 'Σ', Phi: 'Φ', Psi: 'Ψ', Omega: 'Ω',
+  ldots: '…', cdots: '⋯', vdots: '⋮', ddots: '⋱', prime: '′',
+};
+
+const MATH_FUNCS = new Set(['sin', 'cos', 'tan', 'cot', 'sec', 'csc', 'arcsin', 'arccos', 'arctan', 'sinh', 'cosh', 'tanh', 'log', 'ln', 'lg', 'lim', 'max', 'min', 'sup', 'inf', 'mod', 'gcd', 'lcm', 'det', 'exp']);
+
+const SUP_MAP = { 0: '⁰', 1: '¹', 2: '²', 3: '³', 4: '⁴', 5: '⁵', 6: '⁶', 7: '⁷', 8: '⁸', 9: '⁹', '+': '⁺', '-': '⁻', '−': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', n: 'ⁿ', i: 'ⁱ' };
+const SUB_MAP = { 0: '₀', 1: '₁', 2: '₂', 3: '₃', 4: '₄', 5: '₅', 6: '₆', 7: '₇', 8: '₈', 9: '₉', '+': '₊', '-': '₋', '−': '₋', '=': '₌', '(': '₍', ')': '₎', a: 'ₐ', e: 'ₑ', h: 'ₕ', i: 'ᵢ', j: 'ⱼ', k: 'ₖ', l: 'ₗ', m: 'ₘ', n: 'ₙ', o: 'ₒ', p: 'ₚ', r: 'ᵣ', s: 'ₛ', t: 'ₜ', u: 'ᵤ', v: 'ᵥ', x: 'ₓ' };
+
+function makeReader(str) {
+  let i = 0;
+  const skipWs = () => { while (i < str.length && str[i] === ' ') i++; };
+  const readBraces = (open = '{', close = '}') => {
+    let depth = 1, start = ++i;
+    while (i < str.length && depth > 0) {
+      if (str[i] === '\\') { i += 2; continue; }
+      if (str[i] === open) depth++;
+      else if (str[i] === close) depth--;
+      if (depth > 0) i++;
+    }
+    const inner = str.slice(start, i);
+    if (str[i] === close) i++;
+    return inner;
+  };
+  const readCmd = () => {
+    const start = ++i;
+    while (i < str.length && /[a-zA-Z]/.test(str[i])) i++;
+    if (i === start && i < str.length) i++;
+    return str.slice(start, i);
+  };
+  const readArg = () => {
+    skipWs();
+    if (i >= str.length) return '';
+    if (str[i] === '{') return readBraces('{', '}');
+    if (str[i] === '\\') { const c = readCmd(); return '\\' + c; }
+    return str[i++];
+  };
+  return { get pos() { return i; }, set pos(v) { i = v; }, skipWs, readBraces, readCmd, readArg };
+}
+
+export function texToHtml(str) {
+  const r = makeReader(String(str || ''));
+  let out = '';
+  while (r.pos < str.length) {
+    const ch = str[r.pos];
+    if (ch === '\\') {
+      const cmd = r.readCmd();
+      if (cmd === '\\') { out += '<br>'; continue; }
+      if (cmd === ',' || cmd === ';' || cmd === ':' || cmd === ' ') { out += ' '; continue; }
+      if (cmd === '!') continue;
+      if ('{}%$&_#'.includes(cmd)) { out += esc(cmd); continue; }
+      if (cmd === 'frac' || cmd === 'dfrac' || cmd === 'tfrac' || cmd === 'cfrac') {
+        const num = texToHtml(r.readArg());
+        const den = texToHtml(r.readArg());
+        out += `<span class="m-frac"><span class="m-num">${num}</span><span class="m-den">${den}</span></span>`;
+      } else if (cmd === 'sqrt') {
+        r.skipWs();
+        const idx = str[r.pos] === '[' ? r.readBraces('[', ']') : '';
+        const body = texToHtml(r.readArg());
+        out += `${idx ? `<sup class="m-rt">${texToHtml(idx)}</sup>` : ''}<span class="m-rad">√</span><span class="m-sqrt">${body}</span>`;
+      } else if (cmd === 'text' || cmd === 'textrm' || cmd === 'mathrm' || cmd === 'operatorname') {
+        out += `<span class="m-txt">${esc(r.readArg())}</span>`;
+      } else if (cmd === 'mathbf' || cmd === 'boldsymbol' || cmd === 'textbf') {
+        out += `<b>${texToHtml(r.readArg())}</b>`;
+      } else if (cmd === 'overline' || cmd === 'bar') {
+        out += `<span class="m-bar">${texToHtml(r.readArg())}</span>`;
+      } else if (cmd === 'left' || cmd === 'right' || cmd === 'big' || cmd === 'Big' || cmd === 'bigg' || cmd === 'Bigg') {
+        r.skipWs();
+        if (str[r.pos] === '.') r.pos++;
+      } else if (cmd === 'begin' || cmd === 'end') {
+        const env = r.readArg();
+        if (cmd === 'begin' && env === 'cases') out += '{ ';
+      } else if (cmd === 'quad' || cmd === 'qquad') {
+        out += ' \u00A0 ';
+      } else if (cmd === 'binom') {
+        const a = texToHtml(r.readArg()), b = texToHtml(r.readArg());
+        out += `(${a} atas ${b})`;
+      } else if (TEX_SYMS[cmd]) {
+        out += esc(TEX_SYMS[cmd]);
+      } else if (MATH_FUNCS.has(cmd)) {
+        out += `<span class="m-fn">${esc(cmd)}</span>`;
+      } else {
+        out += esc(cmd);
+      }
+    } else if (ch === '^') {
+      r.pos++;
+      out += `<sup>${texToHtml(r.readArg())}</sup>`;
+    } else if (ch === '_') {
+      r.pos++;
+      out += `<sub>${texToHtml(r.readArg())}</sub>`;
+    } else if (ch === '{') {
+      out += texToHtml(r.readBraces('{', '}'));
+    } else if (ch === '}') {
+      r.pos++;
+    } else if (ch === '-') {
+      r.pos++;
+      out += '−';
+    } else {
+      r.pos++;
+      out += esc(ch);
+    }
+  }
+  return out;
+}
+
+function mapChars(s, map) {
+  let out = '';
+  for (const c of s) {
+    if (!map[c]) return null;
+    out += map[c];
+  }
+  return out;
+}
+
+export function texToPlain(str) {
+  const r = makeReader(String(str || ''));
+  let out = '';
+  while (r.pos < str.length) {
+    const ch = str[r.pos];
+    if (ch === '\\') {
+      const cmd = r.readCmd();
+      if (cmd === '\\') { out += '\n'; continue; }
+      if (cmd === ',' || cmd === ';' || cmd === ':' || cmd === ' ' || cmd === 'quad' || cmd === 'qquad') { out += ' '; continue; }
+      if (cmd === '!') continue;
+      if ('{}%$&_#'.includes(cmd)) { out += cmd; continue; }
+      if (cmd === 'frac' || cmd === 'dfrac' || cmd === 'tfrac' || cmd === 'cfrac') {
+        const a = texToPlain(r.readArg()).trim();
+        const b = texToPlain(r.readArg()).trim();
+        const na = /\s/.test(a) ? `(${a})` : a;
+        const nb = /\s/.test(b) ? `(${b})` : b;
+        out += `${na}/${nb}`;
+      } else if (cmd === 'sqrt') {
+        r.skipWs();
+        const idx = str[r.pos] === '[' ? texToPlain(r.readBraces('[', ']')).trim() : '';
+        const body = texToPlain(r.readArg()).trim();
+        const prefix = idx ? (mapChars(idx, SUP_MAP) || `${idx}`) : '';
+        out += `${prefix}√${body.length > 1 && /[+\-*/\s]/.test(body) ? `(${body})` : body}`;
+      } else if (cmd === 'text' || cmd === 'textrm' || cmd === 'mathrm' || cmd === 'operatorname' || cmd === 'mathbf' || cmd === 'boldsymbol' || cmd === 'textbf' || cmd === 'overline' || cmd === 'bar') {
+        out += texToPlain(r.readArg());
+      } else if (cmd === 'left' || cmd === 'right' || cmd === 'big' || cmd === 'Big' || cmd === 'bigg' || cmd === 'Bigg') {
+        r.skipWs();
+        if (str[r.pos] === '.') r.pos++;
+      } else if (cmd === 'begin' || cmd === 'end') {
+        r.readArg();
+      } else if (TEX_SYMS[cmd]) {
+        out += TEX_SYMS[cmd];
+      } else {
+        out += cmd;
+      }
+    } else if (ch === '^') {
+      r.pos++;
+      const a = texToPlain(r.readArg()).trim();
+      if (a === '°') { out += '°'; continue; }
+      const mapped = mapChars(a, SUP_MAP);
+      out += mapped || (a.length > 1 ? `^(${a})` : `^${a}`);
+    } else if (ch === '_') {
+      r.pos++;
+      const a = texToPlain(r.readArg()).trim();
+      const mapped = mapChars(a, SUB_MAP);
+      out += mapped || `_${a}`;
+    } else if (ch === '{') {
+      out += texToPlain(r.readBraces('{', '}'));
+    } else if (ch === '}') {
+      r.pos++;
+    } else {
+      r.pos++;
+      out += ch;
+    }
+  }
+  return out;
+}
+
+export function formatChatMd(raw) {
+  let s = String(raw || '');
+  const blocks = [];
+  const hold = (html) => { blocks.push(html); return `\u0000B${blocks.length - 1}\u0000`; };
+
+  // 1. Blok kode & kode sebaris dilindungi lebih dulu
+  s = s.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, (_, code) => hold(`<pre class="chat-code"><code>${esc(code.trim())}</code></pre>`));
+  s = s.replace(/`([^`\n]+)`/g, (_, code) => hold(`<code class="chat-ic">${esc(code)}</code>`));
+
+  // 2. Rumus LaTeX block (\[...\] atau $$...$$) dan inline (\(...\) atau $...$)
+  s = s.replace(/\\\[([\s\S]*?)\\\]/g, (_, m) => hold(`<div class="math-blk">${texToHtml(m.trim())}</div>`));
+  s = s.replace(/\$\$([\s\S]*?)\$\$/g, (_, m) => hold(`<div class="math-blk">${texToHtml(m.trim())}</div>`));
+  s = s.replace(/\\\(([\s\S]*?)\\\)/g, (_, m) => hold(`<span class="math-in">${texToHtml(m.trim())}</span>`));
+  s = s.replace(/(^|[^\\$])\$(?!\s)([^$\n]*?\S|\S)\$(?!\d)/g, (_, pre, m) => `${pre}${hold(`<span class="math-in">${texToHtml(m.trim())}</span>`)}`);
+
+  // 3. Escape teks biasa + konversi pangkat sederhana di luar LaTeX (mis. 3^3 atau x^2)
+  s = esc(s);
+  s = s.replace(/\b([A-Za-z0-9)\]])\^(-?\d+|[a-zA-Z])\b/g, '$1<sup>$2</sup>');
+  s = s.replace(/(?:^|\n)#{1,4} +(.+)/g, (_, t) => hold(`<div class="chat-h">${t}</div>`));
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+  s = s.replace(/(^|\n)[-*•] +(.+)/g, '$1• $2');
+  s = s.replace(/\n{3,}/g, '\n\n').replace(/\n/g, '<br>');
+  s = s.replace(/\u0000B(\d+)\u0000/g, (_, i) => blocks[+i]);
+  s = s.replace(/(?:<br>)*(<(?:div|pre) class="(?:math-blk|chat-h|chat-code)">)/g, '$1');
+  s = s.replace(/(<\/(?:div|pre)>)(?:<br>)+/g, '$1');
+  return s;
+}
+
+export function latexToPlain(raw) {
+  let s = String(raw || '');
+  s = s.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, (_, c) => c.trim());
+  s = s.replace(/`([^`\n]+)`/g, '$1');
+  s = s.replace(/\\\[([\s\S]*?)\\\]/g, (_, m) => texToPlain(m.trim()));
+  s = s.replace(/\$\$([\s\S]*?)\$\$/g, (_, m) => texToPlain(m.trim()));
+  s = s.replace(/\\\(([\s\S]*?)\\\)/g, (_, m) => texToPlain(m.trim()));
+  s = s.replace(/(^|[^\\$])\$(?!\s)([^$\n]*?\S|\S)\$(?!\d)/g, (_, pre, m) => `${pre}${texToPlain(m.trim())}`);
+  s = s.replace(/\b([A-Za-z0-9)\]])\^(-?\d+)\b/g, (_, b, e) => `${b}${mapChars(e, SUP_MAP) || `^${e}`}`);
+  s = s.replace(/(^|\n)#{1,4} +/g, '$1');
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '$1');
+  return s.trim();
+}
