@@ -1,0 +1,288 @@
+// Kalkulator sederhana untuk Editor: mode mengambang (geser & ubah ukuran) atau split sidebar kanan, dengan pratinjau hasil langsung & transisi halus.
+import { $, ICON, toast } from './ui.js';
+import { settings, saveSettings } from './db.js';
+import { tr } from './i18n.js';
+
+const FLOAT_ICON = '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2.5"/><rect x="9" y="9" width="10" height="10" rx="1.8" fill="var(--card)"/><path d="M9 12h10"/></svg>';
+const SPLIT_ICON = '<svg viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M14.5 4.5v15"/></svg>';
+const CALC_SVG = '<svg viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="2.5"/><path d="M8.5 7.5h7"/><circle cx="9" cy="11.5" r=".9" fill="currentColor"/><circle cx="12" cy="11.5" r=".9" fill="currentColor"/><circle cx="15" cy="11.5" r=".9" fill="currentColor"/><circle cx="9" cy="14.5" r=".9" fill="currentColor"/><circle cx="12" cy="14.5" r=".9" fill="currentColor"/><circle cx="15" cy="14.5" r=".9" fill="currentColor"/><circle cx="9" cy="17.5" r=".9" fill="currentColor"/><path d="M12 17.5h3"/></svg>';
+export const CALC_ICON = CALC_SVG;
+
+const KEYS = [
+  ['C', 'clear', 'fn'], ['⌫', 'back', 'fn'], ['%', 'pct', 'fn'], ['÷', '/', 'op'],
+  ['7', '7', ''], ['8', '8', ''], ['9', '9', ''], ['×', '*', 'op'],
+  ['4', '4', ''], ['5', '5', ''], ['6', '6', ''], ['−', '-', 'op'],
+  ['1', '1', ''], ['2', '2', ''], ['3', '3', ''], ['+', '+', 'op'],
+  ['±', 'neg', 'fn'], ['0', '0', ''], ['.', '.', ''], ['=', 'eq', 'eq'],
+];
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+function safeEval(expr) {
+  const clean = expr.replace(/×/g, '*').replace(/÷/g, '/').replace(/−/g, '-').replace(/(\d+(?:\.\d+)?)%/g, '($1/100)');
+  if (!clean || !/^[0-9+\-*/().\s]+$/.test(clean)) return null;
+  try {
+    const res = Function(`"use strict"; return (${clean})`)();
+    if (typeof res !== 'number' || !Number.isFinite(res)) return null;
+    return String(Number(res.toPrecision(12)));
+  } catch {
+    return null;
+  }
+}
+
+export function createCalcController({ editorEl, splitHost, onBeforeSplit, onLayoutChange, onToggle }) {
+  let open = false;
+  let mode = settings.calcMode === 'split' ? 'split' : 'float';
+  let expr = '';
+  let val = '0';
+  let hasNum = false;
+  let justEq = false;
+  let lastPreview = '';
+  let floatEl = null;
+  let box = { x: null, y: null, w: 268, h: 382 };
+
+  const widget = document.createElement('div');
+  widget.className = 'calc-box';
+  widget.tabIndex = -1;
+  widget.innerHTML = `
+    <div class="calc-head" data-calc-drag>
+      <span class="calc-title">${CALC_SVG}<b>Kalkulator</b></span>
+      <div class="calc-acts">
+        <button type="button" class="calc-ib" id="calc-mode" title="Tempel ke samping">${SPLIT_ICON}</button>
+        <button type="button" class="calc-ib" id="calc-close" title="Tutup">${ICON.close}</button>
+      </div>
+    </div>
+    <div class="calc-disp" id="calc-copy" title="Salin hasil">
+      <div class="calc-expr" id="calc-expr"></div>
+      <div class="calc-val" id="calc-val">0</div>
+      <div class="calc-prev" id="calc-prev" hidden></div>
+    </div>
+    <div class="calc-grid">
+      ${KEYS.map(([lbl, act, cls]) => `<button type="button" class="calc-k ${cls}" data-ck="${act}">${lbl}</button>`).join('')}
+    </div>
+    <div class="calc-rz" data-calc-rz aria-hidden="true"></div>`;
+
+  const exprEl = $('#calc-expr', widget);
+  const valEl = $('#calc-val', widget);
+  const prevEl = $('#calc-prev', widget);
+  const modeBtn = $('#calc-mode', widget);
+
+  const anim = (el, frames, dur = 180) => {
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    el.getAnimations().forEach((a) => a.cancel());
+    el.animate(frames, { duration: dur, easing: 'cubic-bezier(.22,1,.36,1)' });
+  };
+
+  const fmtExpr = (s) => s.replace(/\*/g, '×').replace(/\//g, '÷').replace(/-/g, '−');
+
+  const renderDisp = (kind = 'type') => {
+    const exprTxt = fmtExpr(expr);
+    const exprChanged = exprEl.textContent !== exprTxt;
+    exprEl.textContent = exprTxt;
+
+    const valChanged = valEl.textContent !== val;
+    valEl.textContent = val;
+
+    // hitung preview otomatis tanpa perlu menekan "="
+    const live = !justEq && expr && hasNum ? safeEval(expr + val) : null;
+    lastPreview = live || '';
+
+    if (kind === 'eq') {
+      prevEl.hidden = true;
+      prevEl.textContent = '';
+      if (exprChanged) anim(exprEl, [{ opacity: 0.4, transform: 'translateY(8px)' }, { opacity: 1, transform: 'none' }], 220);
+      anim(valEl, [{ opacity: 0.55, transform: 'translateY(14px) scale(.84)' }, { opacity: 1, transform: 'none' }], 240);
+      return;
+    }
+
+    if (live) {
+      const wasHidden = prevEl.hidden;
+      const prevTxt = `= ${live}`;
+      const prevChanged = prevEl.textContent !== prevTxt;
+      prevEl.hidden = false;
+      prevEl.textContent = prevTxt;
+      if (wasHidden) anim(prevEl, [{ opacity: 0, transform: 'translateY(-4px)' }, { opacity: 1, transform: 'none' }], 180);
+      else if (prevChanged) anim(prevEl, [{ opacity: 0.65, transform: 'translateY(3px)' }, { opacity: 1, transform: 'none' }], 140);
+    } else {
+      prevEl.hidden = true;
+      prevEl.textContent = '';
+    }
+
+    if (kind === 'clear') {
+      anim(valEl, [{ opacity: 0.4, transform: 'scale(.95)' }, { opacity: 1, transform: 'none' }], 160);
+    } else if (exprChanged && kind === 'op') {
+      anim(exprEl, [{ opacity: 0.5, transform: 'translateX(6px)' }, { opacity: 1, transform: 'none' }], 160);
+    } else if (valChanged) {
+      anim(valEl, [{ opacity: 0.78, transform: 'translateY(3px) scale(.985)' }, { opacity: 1, transform: 'none' }], 130);
+    }
+  };
+
+  const press = (act) => {
+    if (act === 'clear') { expr = ''; val = '0'; hasNum = false; justEq = false; return renderDisp('clear'); }
+    if (act === 'back') {
+      if (justEq) { expr = ''; justEq = false; }
+      val = val.length > 1 ? val.slice(0, -1) : '0';
+      if (val === '-') val = '0';
+      hasNum = val !== '0' || !!expr;
+      if (val === '0' && expr) hasNum = false;
+      return renderDisp('type');
+    }
+    if (act === 'neg') {
+      if (justEq) { expr = ''; justEq = false; }
+      if (val !== '0') val = val.startsWith('-') ? val.slice(1) : '-' + val;
+      return renderDisp('type');
+    }
+    if (act === 'pct') {
+      if (justEq) { expr = ''; justEq = false; }
+      const n = parseFloat(val);
+      if (Number.isFinite(n)) { val = String(Number((n / 100).toPrecision(12))); hasNum = true; }
+      return renderDisp('type');
+    }
+    if (/^[0-9]$/.test(act)) {
+      if (justEq) { expr = ''; val = act; justEq = false; }
+      else val = (!hasNum || val === '0') ? act : (val.length < 16 ? val + act : val);
+      hasNum = true;
+      return renderDisp('type');
+    }
+    if (act === '.') {
+      if (justEq) { expr = ''; val = '0.'; justEq = false; }
+      else if (!hasNum) val = '0.';
+      else if (!val.includes('.')) val += '.';
+      hasNum = true;
+      return renderDisp('type');
+    }
+    if (['+', '-', '*', '/'].includes(act)) {
+      if (justEq) { expr = `${val} ${act} `; justEq = false; hasNum = false; val = '0'; return renderDisp('op'); }
+      if (expr && !hasNum && /[+\-*/]\s$/.test(expr)) {
+        expr = expr.slice(0, -2) + act + ' ';
+      } else {
+        expr += `${val} ${act} `;
+        val = '0';
+        hasNum = false;
+      }
+      return renderDisp('op');
+    }
+    if (act === 'eq') {
+      const full = expr ? (hasNum ? expr + val : expr.replace(/[+\-*/]\s$/, '')) : val;
+      const out = safeEval(full);
+      if (out == null) { toast('Hitungan tidak valid'); return; }
+      expr = full + ' =';
+      val = out;
+      hasNum = true;
+      justEq = true;
+      return renderDisp('eq');
+    }
+  };
+
+  widget.addEventListener('click', (e) => {
+    const k = e.target.closest('[data-ck]');
+    if (k) press(k.dataset.ck);
+  });
+  $('#calc-copy', widget).onclick = async () => {
+    const out = lastPreview || val;
+    try { await navigator.clipboard.writeText(out); toast(tr('Teks disalin') + ': ' + out); } catch {}
+  };
+  $('#calc-close', widget).onclick = () => close();
+  modeBtn.onclick = () => setMode(mode === 'float' ? 'split' : 'float');
+
+  widget.addEventListener('keydown', (e) => {
+    if (e.key >= '0' && e.key <= '9') { e.preventDefault(); press(e.key); }
+    else if (['+', '-', '*', '/', '.'].includes(e.key)) { e.preventDefault(); press(e.key); }
+    else if (e.key === 'Enter' || e.key === '=') { e.preventDefault(); press('eq'); }
+    else if (e.key === 'Backspace') { e.preventDefault(); press('back'); }
+    else if (e.key === 'Escape') { e.preventDefault(); close(); }
+  });
+
+  // drag & resize di mode melayang (dengan batas aman di dalam editor)
+  const ensureFloat = () => {
+    if (floatEl) return floatEl;
+    floatEl = document.createElement('div');
+    floatEl.className = 'calc-float';
+    floatEl.hidden = true;
+    editorEl.appendChild(floatEl);
+
+    const head = $('[data-calc-drag]', widget);
+    const rz = $('[data-calc-rz]', widget);
+
+    const bounds = () => ({ w: editorEl.clientWidth || window.innerWidth, h: editorEl.clientHeight || window.innerHeight });
+    const applyBox = () => {
+      const b = bounds();
+      box.w = clamp(box.w, 232, Math.min(420, b.w - 16));
+      box.h = clamp(box.h, 320, Math.min(560, b.h - 76));
+      if (box.x == null) box.x = Math.max(12, b.w - box.w - 20);
+      if (box.y == null) box.y = 74;
+      box.x = clamp(box.x, 8, Math.max(8, b.w - box.w - 8));
+      box.y = clamp(box.y, 58, Math.max(58, b.h - box.h - 8));
+      Object.assign(floatEl.style, { left: box.x + 'px', top: box.y + 'px', width: box.w + 'px', height: box.h + 'px' });
+    };
+    floatEl._applyBox = applyBox;
+
+    head.onpointerdown = (e) => {
+      if (mode !== 'float' || e.target.closest('button')) return;
+      e.preventDefault();
+      const pid = e.pointerId, sx = e.clientX, sy = e.clientY, ox = box.x, oy = box.y;
+      const mv = (ev) => { if (ev.pointerId !== pid) return; box.x = ox + (ev.clientX - sx); box.y = oy + (ev.clientY - sy); applyBox(); };
+      const up = (ev) => { if (ev.pointerId !== pid) return; window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up); };
+      window.addEventListener('pointermove', mv);
+      window.addEventListener('pointerup', up); window.addEventListener('pointercancel', up);
+    };
+
+    rz.onpointerdown = (e) => {
+      if (mode !== 'float') return;
+      e.preventDefault(); e.stopPropagation();
+      const pid = e.pointerId, sx = e.clientX, sy = e.clientY, ow = box.w, oh = box.h;
+      const mv = (ev) => { if (ev.pointerId !== pid) return; box.w = ow + (ev.clientX - sx); box.h = oh + (ev.clientY - sy); applyBox(); };
+      const up = (ev) => { if (ev.pointerId !== pid) return; window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up); };
+      window.addEventListener('pointermove', mv);
+      window.addEventListener('pointerup', up); window.addEventListener('pointercancel', up);
+    };
+
+    return floatEl;
+  };
+
+  const syncMount = () => {
+    const fl = ensureFloat();
+    widget.classList.toggle('in-split', mode === 'split');
+    modeBtn.innerHTML = mode === 'split' ? FLOAT_ICON : SPLIT_ICON;
+    modeBtn.title = tr(mode === 'split' ? 'Mode melayang' : 'Tempel ke samping');
+    onToggle?.(open);
+
+    if (!open) {
+      fl.hidden = true;
+      if (widget.parentElement === splitHost) {
+        splitHost.classList.remove('open', 'wide-split');
+        widget.remove();
+      }
+      onLayoutChange?.();
+      return;
+    }
+    if (mode === 'split') {
+      onBeforeSplit?.();
+      fl.hidden = true;
+      splitHost.classList.remove('wide-split');
+      splitHost.appendChild(widget);
+      requestAnimationFrame(() => splitHost.classList.add('open'));
+      setTimeout(() => onLayoutChange?.(), 290);
+    } else {
+      if (widget.parentElement === splitHost) splitHost.classList.remove('open', 'wide-split');
+      fl.appendChild(widget);
+      fl.hidden = false;
+      fl._applyBox();
+      onLayoutChange?.();
+    }
+  };
+
+  const setMode = (m) => {
+    mode = m === 'split' ? 'split' : 'float';
+    settings.calcMode = mode;
+    saveSettings();
+    syncMount();
+  };
+  const toggle = () => { open = !open; syncMount(); return open; };
+  const close = () => { if (!open) return; open = false; syncMount(); };
+  const closeIfSplit = () => { if (open && mode === 'split') close(); };
+  const destroy = () => { open = false; floatEl?.remove(); floatEl = null; };
+  const isOpen = () => open;
+
+  return { toggle, close, closeIfSplit, destroy, isOpen, setMode };
+}
