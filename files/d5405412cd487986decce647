@@ -1,0 +1,3197 @@
+// Editor kertas: tulis tangan dengan pena/stylus, stabilo, penghapus, bentuk, teks.
+import { db, settings, saveSettings } from './db.js';
+import { $, $$, esc, ICON, toast, swallowTap, popover, openSheet, closeSheet, confirmDialog, promptDialog, pushBack, pickFile, uid, ymd, askUnsaved } from './ui.js';
+import { PAGE_W, A4_H, TEMPLATES, PAPERS, PAPER_CATS, drawTemplate, drawStroke, drawLastSegment, drawText, strokeHit, textHit, defaultInk, templateThumb, TEXT_LH, TEXT_FONT, snapToLines, BASE_LIFT, templateLayout, checkAt, drawChecks, wrapLines, cellAt, drawCellSummaries, textBox, measurer } from './paper.js';
+import { openRichNote, normNote, pickImage, plainText } from './richnote.js';
+import { stickerPicker, stickerAspect, isMine, mineId, isEmoji, isFluent, stickerImage, stickerImageReady } from './stickers.js';
+import { createTransformBox } from './transformbox.js';
+import { ensureFont, fontPicker, cssFamily } from './fonts.js';
+import { randomStyle, DEFAULT_MONTH_STYLE, DATE_SHAPES } from './paper.js';
+import { MONTHS_LONG, DAYS_LONG } from './ui.js';
+import { ensureScribbleReady, scribPlugin, scribLang } from './scribble.js';
+import { createSlime } from './slime.js';
+import { playPageFlip, playStickerPop, playPencilTouch, playCheckChime, playTrashCrumple } from './sound.js';
+import { getGestures, openGestureSettings, attachTapGestures } from './gestures.js';
+
+const SPREAD_ICON = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6s1.5-2 5-2 5 2 5 2v14s-1.5-2-5-2-5 2-5 2z"/><path d="M12 6s1.5-2 5-2 5 2 5 2v14s-1.5-2-5-2-5 2-5 2z"/></svg>';
+
+const metaOf = (pg) => ({ date: pg.date, month: pg.month, weekStart: settings.weekStart, style: pg.style, today: ymd(new Date()) });
+async function pageFonts(pg) {
+  const fams = new Set();
+  if (pg.style?.font) fams.add(pg.style.font);
+  for (const t of pg.texts || []) if (t.f) fams.add(t.f);
+  await Promise.all([...fams].flatMap((f) => [ensureFont(f), ensureFont(f, 700)]));
+}
+const STICKER_ICON = '<svg viewBox="0 0 24 24"><path d="M20.5 12.5A8.5 8.5 0 1 1 11.5 3.5c0 4.5 4.5 9 9 9z"/><path d="M11.5 3.5c0 4.5 4.5 9 9 9-4.2 0-9 3.8-9 8"/><circle cx="8.5" cy="11" r="1" style="fill:currentColor"/><path d="M7.5 15.5q2 2 4 0"/></svg>';
+
+// ---------- Stiker & foto di halaman: item { t:'stk'|'img', v|blob, x, y, w, h, r } (satuan halaman, x,y = pusat) ----------
+const itemBms = new Map();
+function itemImage(it, onload) {
+  if (it.t === 'stk' && !isMine(it.v)) return isEmoji(it.v) ? 'emoji' : stickerImage(it.v, onload);
+  const bid = it.t === 'stk' ? mineId(it.v) : it.blob;
+  let e = itemBms.get(bid);
+  if (!e) { e = { bm: null }; e.p = getBitmap(bid).then((bm) => { e.bm = bm; return bm; }); itemBms.set(bid, e); }
+  if (!e.bm && onload) e.p.then((bm) => bm && onload());
+  return e.bm;
+}
+export async function itemImageReady(it) {
+  if (it.t === 'stk' && isMine(it.v)) return getBitmap(mineId(it.v));
+  if (it.t === 'stk') return isEmoji(it.v) ? 'emoji' : stickerImageReady(it.v);
+  return getBitmap(it.blob);
+}
+export function drawItems(ctx, items, s, getImg) {
+  if (!items?.length) return;
+  for (const it of items) {
+    const img = getImg(it);
+    ctx.save();
+    ctx.translate(it.x * s, it.y * s); ctx.rotate(it.r || 0);
+    const w = it.w * s, h = it.h * s;
+    if (img === 'emoji') {
+      ctx.font = `${h * 0.86}px "Segoe UI Emoji","Noto Color Emoji","Apple Color Emoji",sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.shadowColor = 'rgba(0,0,0,.18)'; ctx.shadowBlur = 3 * s; ctx.shadowOffsetY = 2 * s;
+      ctx.fillText(it.v, 0, h * 0.04);
+    } else if (it.t === 'img') {
+      const b = Math.max(4, w * 0.035);
+      ctx.shadowColor = 'rgba(0,0,0,.25)'; ctx.shadowBlur = 10 * s; ctx.shadowOffsetY = 4 * s;
+      ctx.fillStyle = '#fff'; ctx.fillRect(-w / 2, -h / 2, w, h);
+      ctx.shadowColor = 'transparent';
+      if (img) ctx.drawImage(img, -w / 2 + b, -h / 2 + b, w - 2 * b, h - 2 * b);
+      else { ctx.fillStyle = '#e5e7eb'; ctx.fillRect(-w / 2 + b, -h / 2 + b, w - 2 * b, h - 2 * b); }
+    } else if (img) {
+      ctx.shadowColor = 'rgba(0,0,0,.18)'; ctx.shadowBlur = 4 * s; ctx.shadowOffsetY = 2 * s;
+      ctx.drawImage(img, -w / 2, -h / 2, w, h);
+    }
+    ctx.restore();
+  }
+}
+function itemAt(pg, pt) {
+  const items = pg.items || [];
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i], c = Math.cos(-(it.r || 0)), sn = Math.sin(-(it.r || 0));
+    const dx = pt.x - it.x, dy = pt.y - it.y;
+    const lx = dx * c - dy * sn, ly = dx * sn + dy * c;
+    // area sentuh minimal ±28 satuan supaya stiker kecil tetap gampang dipilih
+    if (Math.abs(lx) <= Math.max(it.w / 2 + 6, 28) && Math.abs(ly) <= Math.max(it.h / 2 + 6, 28)) return it;
+  }
+  return null;
+}
+import { newPage, saveNotebook } from './notebooks.js';
+import { exportNotebookPdf, imageFileToPage, sharePageImage, ensurePdfBg, onPdfPage, renderPageImage } from './io.js';
+
+const PEN_COLORS = ['#1f1f22', '#e5484d', '#0a99f0', '#22a861', '#f59e0b', '#8b5cf6', '#ffffff'];
+const HL_COLORS = ['#ffe14d', '#7ee787', '#7cc4ff', '#ff9ecf', '#ffb84d'];
+const LASSO_ICON = '<svg viewBox="0 0 24 24"><path d="M12 4c4.6 0 8 2.3 8 5.3S16.6 14.6 12 14.6 4 12.3 4 9.3 7.4 4 12 4z" stroke-dasharray="3 2.4"/><path d="M7.5 13.6c-.9 1.2-.6 2.8.8 3.3 1.3.5 1.9 1.7 1.2 3.1"/></svg>';
+const SIZES = { pen: [2.5, 4.5, 8], hl: [16, 26, 40], eraser: [10, 24, 48], shape: [2.5, 4.5, 8], text: [22, 32, 48], scribble: [2, 3.2, 5] };
+const SHAPES = { line: 'Garis', rect: 'Kotak', ellipse: 'Lingkaran', arrow: 'Panah' , free: 'Bentuk bebas' };
+
+let E = null; // state editor yang sedang terbuka
+
+const bitmaps = new Map();
+async function getBitmap(id) {
+  if (bitmaps.has(id)) return bitmaps.get(id);
+  const p = db.get('blobs', id).then((r) => r ? createImageBitmap(r.blob) : null);
+  bitmaps.set(id, p); return p;
+}
+
+const BRUSH_PROFILES = [
+  { id: 'pen', label: 'Pena Tinta (Gel / Fountain)', icon: 'pen' },
+  { id: 'ballpoint', label: 'Ballpoint (Pulpen)', icon: 'ballpoint' },
+  { id: 'pencil', label: 'Pensil (Grafit)', icon: 'pencil' },
+  { id: 'calligraphy', label: 'Kaligrafi (Chisel)', icon: 'calligraphy' },
+  { id: 'brush', label: 'Kuas Lukis (Art Brush)', icon: 'brush' },
+];
+
+function eraserMenu(anchor) {
+  const P = pens(), m = P.eraser.m || 'area';
+  const set = (v) => { P.eraser.m = v; saveSettings(); syncToolbar(); toast(v === 'obj' ? 'Penghapus: hapus per objek' : 'Penghapus: hapus manual'); };
+  popover(anchor, [
+    { label: (m === 'area' ? '✓ ' : '') + 'Hapus manual', icon: 'eraser', fn: () => set('area') },
+    { label: (m === 'obj' ? '✓ ' : '') + 'Hapus per objek', icon: 'trash', fn: () => set('obj') },
+  ]);
+}
+function brushMenu(anchor) {
+  const P = pens();
+  const curB = P.pen.b || 'pen';
+  const items = BRUSH_PROFILES.map((bp) => ({
+    label: (curB === bp.id ? '✓ ' : '') + bp.label,
+    icon: bp.icon,
+    fn: () => selectBrush(bp.id)
+  }));
+  popover(anchor, items);
+}
+
+function selectBrush(b) {
+  pens().pen.b = b;
+  saveSettings();
+  syncToolbar();
+  const p = BRUSH_PROFILES.find((x) => x.id === b);
+  toast('Kuas: ' + (p?.label || b));
+}
+
+function pens() {
+  settings.pens ||= { pen: { c: PEN_COLORS[0], z: 1, b: 'pen', w: 4.5 }, hl: { c: HL_COLORS[0], z: 1, w: 26 }, eraser: { z: 1, w: 24 }, shape: { c: PEN_COLORS[0], z: 1, k: 'line', w: 4.5 }, text: { c: PEN_COLORS[0], z: 1, w: 32 } };
+  settings.pens.pen ||= { c: PEN_COLORS[0], z: 1, b: 'pen', w: 4.5 };
+  settings.pens.pen.b ||= 'pen';
+  settings.pens.scribble ||= { z: 1, w: 3.2 }; // tebal tulisan tangan Scribble (sebelum jadi teks)
+  return settings.pens;
+}
+
+// =====================================================================
+let edOpening = null;
+export async function openEditor(nb, opts = {}) {
+  // panggilan ganda saat editor masih dibuka: pakai proses yang sama, jangan buka lagi
+  if (edOpening) return edOpening;
+  edOpening = openEditorInner(nb, opts);
+  try { return await edOpening; } finally { edOpening = null; }
+}
+async function openEditorInner(nb, { header, onClose, onReady } = {}) {
+  if (E) await closeEditor(true);
+  const pages = (await Promise.all(nb.pageIds.map((id) => db.get('pages', id)))).filter(Boolean);
+  if (!pages.length) { const p = newPage(nb.id, { tpl: nb.tpl, paper: nb.paper }); pages.push(p); nb.pageIds = [p.id]; await db.put('pages', p); }
+  E = { nb, pages, els: new Map(), tool: 'select', zoom: 1, rot: 0, undo: [], redo: [], dirty: new Set(), cur: 0, onClose, penSeen: false, zoomK0: () => 1 };
+  const ed = $('#editor');
+  ed.innerHTML = `
+    <div class="etop">
+      <button class="tool" id="ed-back" title="Kembali">${ICON.back}</button>
+      <button class="etitle" id="ed-title" title="Ganti nama">${esc(nb.title)}</button>
+      <div class="sep"></div>
+      <div class="etools">${toolbarHTML()}</div>
+      <button class="tool" id="ed-more" title="Lainnya">${ICON.more}</button>
+    </div>
+    <div class="esub" id="ed-sub"></div>
+    <div class="ebody">
+      ${header ? `<div class="dayhead" id="ed-header">${header}</div>` : ''}
+      <div class="stk-dock" id="ed-stk" hidden></div>
+      <div class="pages" id="ed-pages"><div class="pages-inner" id="ed-inner"></div></div>
+      <button class="pflip-btn pflip-prev" id="ed-prev-spread" hidden title="Halaman sebelumnya">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+      <button class="pflip-btn pflip-next" id="ed-next-spread" hidden title="Halaman berikutnya">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </button>
+      <div class="ebottom">
+        <button class="pill" id="ed-zout">${ICON.zoomOut}</button>
+        <button class="pill" id="ed-zlabel">100%</button>
+        <button class="pill" id="ed-zin">${ICON.zoomIn}</button>
+        <button class="pill rot-chip" id="ed-rot" hidden title="Kembalikan tegak"></button>
+        <button class="pill" id="ed-spread" title="Mode 2 halaman (buku)">${SPREAD_ICON}</button>
+        <button class="pill" id="ed-ind" title="Ke halaman…">1/1</button>
+      </div>
+    </div>`;
+  ed.classList.add('open');
+  E.removeBack = pushBack(() => closeEditor(false, true));
+
+  $('#ed-back').onclick = () => closeEditor();
+  $('#ed-title').onclick = async () => {
+    const t = await promptDialog('Ganti nama', nb.title); if (t == null || !t.trim()) return;
+    nb.title = t.trim(); $('#ed-title').textContent = nb.title; nb.updated = Date.now(); saveNotebook(nb);
+  };
+  $$('[data-tool]', ed).forEach((b) => b.onclick = () => {
+    // alat yang punya pilihan: ketuk lagi = buka/tutup baris pilihan di bawah toolbar
+    if (SUB_TOOLS.includes(b.dataset.tool) && E.tool === b.dataset.tool) { E.subOff = !E.subOff; return syncSub(); }
+    setTool(b.dataset.tool);
+  });
+  $('#ed-ind').onclick = pagePicker;
+  $('#ed-undo').onclick = undo;
+  $('#ed-img').onclick = () => addPhoto('gallery');
+  $('#ed-redo').onclick = redo;
+  $('#ed-stylus').onclick = () => {
+    settings.stylusOnly = !settings.stylusOnly; saveSettings(); syncToolbar();
+    toast(settings.stylusOnly ? 'Mode stylus: stylus untuk menulis. Dua jari untuk geser, zoom, dan putar.' : 'Jari bisa menulis. Dua jari untuk geser dan zoom.', 2800);
+    if (!settings.stylusOnly && !E.penSeen) resetRotation();
+  };
+  $('#ed-add').onclick = () => addPage();
+  $('#ed-more').onclick = (e) => moreMenu(e.currentTarget);
+  $('#ed-zin').onclick = () => setZoom(E.zoom * 1.25);
+  $('#ed-rot').onclick = () => resetRotation();
+  $('#ed-zout').onclick = () => setZoom(E.zoom / 1.25);
+  $('#ed-zlabel').onclick = (e) => {
+    popover(e.currentTarget, [
+      { label: '100% (Normal)', fn: () => setZoom(1) },
+      { label: '200%', fn: () => setZoom(2) },
+      { label: '300%', fn: () => setZoom(3) },
+      { label: '500% (Maksimal)', fn: () => setZoom(5) },
+      '-',
+      { label: 'Pas di Layar', fn: () => setZoom(1) },
+    ]);
+  };
+  $('#ed-prev-spread').onclick = () => prevSpread();
+  $('#ed-next-spread').onclick = () => nextSpread();
+  $('#ed-spread').onclick = () => {
+    const cur = isSpreadActive(), keep = E.cur; // tetap di halaman yang sama setelah ganti mode
+    E.spreadMode = cur ? 'single' : 'spread';
+    layout();
+    goToPage(keep);
+    toast(E.spreadMode === 'spread' ? 'Mode 2 Halaman (Buku)' : 'Mode 1 Halaman');
+    playPageFlip();
+  };
+
+  const pagesEl = $('#ed-pages');
+  E.pagesEl = pagesEl; E.inner = $('#ed-inner');
+  const runEdGesture = (act) => {
+    if (!E || !act || act === 'none') return;
+    if (act === 'undo') undo();
+    else if (act === 'redo') redo();
+    else if (act === 'prevPage') goToPage(Math.max(0, E.cur - 1));
+    else if (act === 'nextPage') goToPage(Math.min(E.pages.length - 1, E.cur + 1));
+    else if (act === 'zoomFit') setZoom(1);
+    else if (act === 'prevTool') { if (E.prevTool) setTool(E.prevTool); }
+    else if (act === 'toolSelect') setTool('select');
+    else if (act === 'toolPen') setTool('pen');
+    else if (act === 'toolEraser') setTool('eraser');
+  };
+  E.runEdGesture = runEdGesture;
+  E.io = new IntersectionObserver(onIntersect, { root: pagesEl, rootMargin: '900px 110%' });
+  pages.forEach((p, i) => mountPage(p, i));
+  layout();
+  pagesEl.addEventListener('scroll', onScroll, { passive: true });
+  bindPointers(pagesEl);
+  E.ro = new ResizeObserver(() => { layout(); rerenderVisible(); });
+  E.ro.observe(pagesEl);
+  setTool(E.tool);
+  onReady?.($('#ed-header'));
+}
+
+export function editorHeader() { return $('#ed-header'); }
+export function flushEditor() { return flush(); }
+export function isEditorOpen() { return !!E; }
+
+export async function closeEditor(silent = false, fromBack = false) {
+  closeFind();
+  if (!E) return;
+  const st = E;
+  commitTextInput();
+  deselectItem();
+  await flush();
+  if (!fromBack) st.removeBack?.();
+  st.io.disconnect(); st.ro.disconnect();
+  E = null;
+  bitmaps.clear();
+  const ed = $('#editor');
+  ed.classList.remove('open'); ed.innerHTML = '';
+  if (!silent) st.onClose?.();
+}
+
+// ---------- Halaman ----------
+function mountPage(pg, index) {
+  const el = document.createElement('div');
+  el.className = index < 6 ? 'page' : 'page far'; // halaman jauh dilewati browser sampai mendekati layar
+  el.innerHTML = '<canvas class="c-bg"></canvas><canvas class="c-ink"></canvas><canvas class="c-live"></canvas><span class="pno"></span>';
+  // tombol hapus halaman di bawah tiap halaman
+  const del = document.createElement('button'); del.className = 'pdel'; del.title = 'Hapus halaman'; del.innerHTML = ICON.trash;
+  del.onclick = (e) => { e.stopPropagation(); E.cur = E.pages.indexOf(pg); deletePage(); };
+  el.appendChild(del);
+  el._pg = pg;
+  const rec = { el, bg: el.children[0], ink: el.children[1], live: el.children[2], pno: el.children[3], pdel: del, rendered: false, visible: false };
+  E.els.set(pg.id, rec);
+  const ref = E.inner.children[index];
+  E.inner.insertBefore(el, ref || null);
+  E.io.observe(el);
+  return rec;
+}
+function numberPages() { const one = E.pages.length < 2; E.pages.forEach((p, i) => { const r = E.els.get(p.id); const t = `${i + 1}`; if (r.pno.textContent !== t) r.pno.textContent = t; r.pdel.hidden = one; }); updateIndicator(); }
+
+function isSpreadActive() {
+  if (!E || E.pages.length < 2) return false;
+  if (E.spreadMode === 'spread') return true;
+  if (E.spreadMode === 'single') return false;
+  const w = E.pagesEl.clientWidth, h = E.pagesEl.clientHeight;
+  return w >= 660 && w > h * 0.92;
+}
+
+function totalSpreads() {
+  if (!E || !E.pages.length) return 0;
+  return Math.ceil(E.pages.length / 2);
+}
+
+function currentSpreadIndex() {
+  if (!E || !E.pages.length || !isSpreadActive()) return 0;
+  const spreadW = (E.spreadPw || 300) * 2 + (E.spreadGap || 60);
+  if (!spreadW) return 0;
+  const idx = Math.round(E.pagesEl.scrollLeft / spreadW);
+  return Math.max(0, Math.min(totalSpreads() - 1, idx));
+}
+
+function spreadScrollLeft(idx) {
+  if (!E || !isSpreadActive()) return 0;
+  const spreadW = (E.spreadPw || 300) * 2 + (E.spreadGap || 60);
+  return idx * spreadW;
+}
+
+function flipToSpread(idx, animated = true) {
+  if (!E || !isSpreadActive()) return;
+  const targetIdx = Math.max(0, Math.min(Math.max(0, totalSpreads() - 1), idx));
+  const from = currentSpreadIndex();
+  if (animated && Math.abs(targetIdx - from) === 1) { autoFlip(targetIdx > from ? 1 : -1); return; }
+  jumpToSpread(targetIdx);
+}
+
+function nextSpread() {
+  const cur = currentSpreadIndex();
+  if (cur < totalSpreads() - 1) flipToSpread(cur + 1, true);
+}
+
+function prevSpread() {
+  const cur = currentSpreadIndex();
+  if (cur > 0) flipToSpread(cur - 1, true);
+}
+
+function snapCurrentSpread() { jumpToSpread(currentSpreadIndex()); }
+
+function updateFlipButtons() {
+  const prevBtn = $('#ed-prev-spread');
+  const nextBtn = $('#ed-next-spread');
+  if (!prevBtn || !nextBtn) return;
+  if (!isSpreadActive()) {
+    prevBtn.hidden = true;
+    nextBtn.hidden = true;
+    return;
+  }
+  const cur = currentSpreadIndex();
+  const maxIdx = totalSpreads() - 1;
+  prevBtn.hidden = cur <= 0;
+  nextBtn.hidden = cur >= maxIdx;
+}
+
+
+// ---------- Balik halaman seperti kertas sungguhan (mode 2 halaman) ----------
+// Lembar kanan dilipat mengikuti jari dari sudut mana pun: garis lipat tegak lurus arah tarikan,
+// kertas di garis lipat menggulung seperti silinder (bagian depan menggelap, punggung kertas muncul di atasnya),
+// bayangan jatuh ke halaman di bawahnya. Dilepas → animasi halus (tanpa pantulan) ke sisi lain atau kembali.
+let flip = null;
+
+function pageSource(i) {
+  const pg = E.pages[i]; if (!pg) return null;
+  const r = E.els.get(pg.id); if (!r) return null;
+  return { pg, r };
+}
+function drawSource(ctx, src, sx, sw, dw, dh, mirror, pw) {
+  ctx.clearRect(0, 0, dw, dh);
+  if (!src) return;
+  const { r } = src;
+  const k = r.bg.width / pw;
+  ctx.save();
+  if (mirror) { ctx.translate(dw, 0); ctx.scale(-1, 1); sx = pw - sx - sw; }
+  if (!r.rendered || !r.bg.width) { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, dw, dh); }
+  else for (const c of [r.bg, r.ink]) if (c.width) ctx.drawImage(c, sx * k, 0, sw * k, c.height, 0, 0, dw, dh);
+  ctx.restore();
+}
+// potong poligon cembung dengan setengah bidang  s·((X)·n - c) >= 0
+function clipHalf(poly, nx, ny, c, s) {
+  const out = [], f = (p) => s * (p[0] * nx + p[1] * ny - c);
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length], fa = f(a), fb = f(b);
+    if (fa >= 0) out.push(a);
+    if ((fa >= 0) !== (fb >= 0)) { const t = fa / (fa - fb); out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]); }
+  }
+  return out;
+}
+const polyPath = (ctx, poly) => { ctx.beginPath(); poly.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); };
+
+function beginFlip(dir, startX, startY) {
+  if (flip || !isSpreadActive()) return null;
+  const idx = currentSpreadIndex(), to = idx + dir;
+  if (to < 0 || to >= totalSpreads()) return null;
+  const L = 2 * idx;
+  const leftEl = E.els.get(E.pages[L].id).el;
+  const lr = leftEl.getBoundingClientRect(), pr = E.pagesEl.getBoundingClientRect();
+  const pw = lr.width, ph = Math.max(lr.height, ...[L, L + 1, 2 * to, 2 * to + 1].map((i) => E.pages[i] ? pw * E.pages[i].h / E.pages[i].w : 0));
+  const roles = dir > 0
+    ? { baseL: L, baseR: 2 * to + 1, front: L + 1, back: 2 * to }
+    : { baseL: L + 1, baseR: 2 * to, front: L, back: 2 * to + 1 };
+  const mirror = dir < 0;
+  const bg = getComputedStyle(E.pagesEl.closest('.editor') || document.body).backgroundColor;
+  const ov = document.createElement('div');
+  ov.className = 'bflip';
+  Object.assign(ov.style, { left: pr.left + 'px', top: pr.top + 'px', width: pr.width + 'px', height: pr.height + 'px' });
+  const M = Math.round(Math.max(pw, ph) * 0.6); // ruang di luar buku untuk sudut kertas yang terangkat
+  const bx = lr.left - pr.left, by = lr.top - pr.top;
+  const cv = document.createElement('canvas');
+  const dpr = FLIP_SLOW ? 1 : Math.min(LOW_MEM ? 1.4 : 1.75, devicePixelRatio || 1);
+  const W = 2 * pw + 2 * M, H = ph + 2 * M;
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  Object.assign(cv.style, { position: 'absolute', left: bx - M + 'px', top: by - M + 'px', width: W + 'px', height: H + 'px', transform: mirror ? 'scaleX(-1)' : '' });
+  ov.appendChild(cv);
+  document.body.appendChild(ov);
+
+  // titik yang dipegang: sudut atas, sudut bawah, atau tepi kanan (di tinggi jari)
+  const toLocal = (X, Y) => [mirror ? 2 * pw - (X - lr.left) : X - lr.left, Y - lr.top];
+  const [, sy] = toLocal(startX, startY ?? lr.top + ph);
+  const cy = sy < ph * 0.32 ? 0 : sy > ph * 0.68 ? ph : Math.max(0, Math.min(ph, sy));
+  const C = [2 * pw, cy];
+  const st = { bg, dir, to, idx, ov, cv, ctx: cv.getContext('2d'), roles, mirror, pw, ph, M, dpr, C, P: [C[0], C[1]], toLocal, tex: {}, vx: 0, lastX: 0, lastT: performance.now(), raf: 0, grab: null };
+  makeTextures(st);
+  const need = Object.values(roles).map((i) => E.pages[i]).filter((pg) => pg && !E.els.get(pg.id).rendered);
+  if (need.length) Promise.all(need.map(renderPage)).then(() => { if (flip === st) { makeTextures(st); paintFlip(st); } });
+  paintFlip(st);
+  flip = st;
+  return st;
+}
+function makeTextures(st) {
+  const { pw, ph, dpr, roles, mirror } = st;
+  for (const role of Object.keys(roles)) {
+    const src = pageSource(roles[role]);
+    if (!src) { st.tex[role] = null; continue; }
+    const c = st.tex[role] || document.createElement('canvas');
+    c.width = Math.round(pw * dpr); c.height = Math.round(ph * dpr);
+    drawSource(c.getContext('2d'), src, 0, pw, c.width, c.height, mirror, pw);
+    st.tex[role] = c;
+  }
+}
+
+// gambar satu bingkai. Koordinat lokal: punggung buku di x = pw, halaman kanan [pw, 2pw] × [0, ph]
+let FLIP_SLOW = false;
+function paintFlip(st) {
+  const t0 = performance.now();
+  paintFlipInner(st);
+  const dt = performance.now() - t0;
+  st.avg = st.avg == null ? dt : st.avg * 0.8 + dt * 0.2;
+  if (!FLIP_SLOW && st.avg > 14) FLIP_SLOW = true; // berlaku untuk balikan berikutnya (resolusi & jumlah pita lebih ringan)
+}
+function paintFlipInner(st) {
+  const { ctx, pw, ph, M, dpr, tex, C, P } = st;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, st.cv.width, st.cv.height);
+  const base = [dpr, 0, 0, dpr, M * dpr, M * dpr];
+  ctx.setTransform(...base);
+  const right = [[pw, 0], [2 * pw, 0], [2 * pw, ph], [pw, ph]];
+
+  // halaman kiri asli tetap terlihat di bawah; kanan ditutup halaman berikutnya (sama persis dengan aslinya)
+  const dx = C[0] - P[0], dy = C[1] - P[1], Lp = Math.hypot(dx, dy);
+  if (Lp < 0.5) return; // rata: halaman asli yang tampil, tidak ada yang berubah
+  if (tex.baseR) ctx.drawImage(tex.baseR, pw, 0, pw, ph);
+  else { ctx.fillStyle = st.bg; ctx.fillRect(pw - 1, -40, pw + 60, ph + 80); }
+  const nx = dx / Lp, ny = dy / Lp; // normal lipatan: dari jari ke sudut
+  // seberapa jauh halaman sudah dibalik → jari-jari gulungan (paling besar di tengah, rata di awal & akhir)
+  const prog = Math.max(0, Math.min(1, (C[0] - P[0]) / (2 * pw)));
+  const amt = Math.min(1, Math.sin(Math.PI * prog) * 1.6); // kekuatan bayangan: nol saat rata, penuh saat menggulung
+  const r = Math.max(0.01, Math.min(Lp / Math.PI * 0.92, pw * 0.2 * Math.min(1, 4.2 * prog * (1 - prog) + 0.25 * (1 - prog))));
+  const D = (Lp + Math.PI * r) / 2;                 // jarak sudut ke garis lipat
+  const F = [C[0] - D * nx, C[1] - D * ny], Fc = F[0] * nx + F[1] * ny;
+  const dOf = (X) => X[0] * nx + X[1] * ny - Fc;
+  const dMax = Math.max(...right.map(dOf));
+  const pOf = (d) => (d <= Math.PI * r ? r * Math.sin(d / r) : -(d - Math.PI * r));
+  const kOf = (d) => (d <= Math.PI * r ? Math.cos(d / r) : -1);
+  // matriks lembar → layar untuk pita di sekitar d = dm
+  const affine = (dm) => {
+    const k = kOf(dm), a = k - 1, t = pOf(dm) - k * dm - a * Fc;
+    return [1 + a * nx * nx, a * nx * ny, a * nx * ny, 1 + a * ny * ny, t * nx, t * ny];
+  };
+  const band = (d0, d1) => clipHalf(clipHalf(right, nx, ny, Fc + d0, 1), nx, ny, Fc + d1, -1);
+  const drawFace = (back) => {
+    if (back) { if (tex.back) { ctx.save(); ctx.translate(2 * pw, 0); ctx.scale(-1, 1); ctx.drawImage(tex.back, 0, 0, pw, ph); ctx.restore(); } else { ctx.fillStyle = '#f4f2ee'; ctx.fillRect(pw, 0, pw, ph); } }
+    else if (tex.front) ctx.drawImage(tex.front, pw, 0, pw, ph);
+    else { ctx.fillStyle = '#fff'; ctx.fillRect(pw, 0, pw, ph); }
+  };
+
+  // bayangan di halaman bawah, tepat di bawah gulungan
+  ctx.save(); polyPath(ctx, right); ctx.clip();
+  const g0 = ctx.createLinearGradient(F[0] + nx * r * 0.2, F[1] + ny * r * 0.2, F[0] + nx * (r * 1.3 + 16), F[1] + ny * (r * 1.3 + 16));
+  g0.addColorStop(0, `rgba(0,0,0,${(0.30 * amt).toFixed(3)})`); g0.addColorStop(0.4, `rgba(0,0,0,${(0.10 * amt).toFixed(3)})`); g0.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g0; polyPath(ctx, band(-2, dMax + 1)); ctx.fill();
+  ctx.restore();
+
+  // bagian lembar yang masih rata
+  const flat = band(-1e6, 0.4);
+  if (flat.length > 2) {
+    ctx.save(); polyPath(ctx, flat); ctx.clip(); drawFace(false);
+    // kertas mulai naik: menggelap halus menuju garis lipat
+    const g1 = ctx.createLinearGradient(F[0] - nx * (r * 1.6 + 14), F[1] - ny * (r * 1.6 + 14), F[0], F[1]);
+    g1.addColorStop(0, 'rgba(0,0,0,0)'); g1.addColorStop(1, `rgba(0,0,0,${(0.07 * amt).toFixed(3)})`);
+    ctx.fillStyle = g1; ctx.fillRect(pw, 0, pw, ph);
+    ctx.restore();
+  }
+
+  // bayangan lembar yang terlipat jatuh ke halaman di bawahnya
+  const flapPoly = band(Math.PI * r, dMax + 1);
+  if (flapPoly.length > 2) {
+    const A = affine(Math.PI * r + 1);
+    ctx.save(); ctx.transform(...A);
+    ctx.shadowColor = `rgba(0,0,0,${(0.30 * amt).toFixed(3)})`; ctx.shadowBlur = 18 * dpr; ctx.fillStyle = '#fff';
+    polyPath(ctx, flapPoly); ctx.fill(); ctx.restore();
+  }
+
+  // gulungan: pita-pita tipis sejajar garis lipat mengikuti permukaan silinder (tanpa bayangan per pita → tidak bergaris)
+  const N = Math.max(6, Math.min(FLIP_SLOW || st.avg > 14 ? 12 : 28, Math.round(Math.PI * r / 2.5)));
+  const seg = Math.PI * r / N, half = Math.PI * r / 2;
+  const strips = (back) => {
+    for (let i = 0; i < N; i++) {
+      const d0 = i * seg, d1 = (i + 1) * seg, dm = (d0 + d1) / 2;
+      if (d0 > dMax) break;
+      if ((dm / r > Math.PI / 2) !== back) continue;
+      const poly = band(d0 - 0.4, d1 + 0.4); if (poly.length < 3) continue;
+      ctx.save(); ctx.transform(...affine(dm));
+      polyPath(ctx, poly); ctx.clip(); drawFace(back);
+      ctx.restore();
+    }
+  };
+  // satu gradasi mulus di atas seluruh gulungan, dihitung dari posisi di layar (p = jarak dari garis lipat)
+  const mapPt = (X) => { const d = dOf(X), q = pOf(Math.max(0, Math.min(Math.PI * r, d))) - d; return [X[0] + q * nx, X[1] + q * ny]; };
+  const shadeRoll = (d0, d1, stops) => {
+    if (r < 1.5) return;
+    const poly = band(d0, d1); if (poly.length < 3) return;
+    ctx.save(); polyPath(ctx, poly.map(mapPt)); ctx.clip();
+    const g = ctx.createLinearGradient(F[0], F[1], F[0] + nx * r, F[1] + ny * r);
+    for (const [t, c] of stops) g.addColorStop(t, c);
+    ctx.fillStyle = g; ctx.fillRect(-pw, -ph, pw * 4, ph * 3);
+    ctx.restore();
+  };
+  const A = (v) => (v * amt).toFixed(3);
+  strips(false);
+  // sisi depan yang menanjak: makin gelap ke puncak gulungan
+  shadeRoll(0, half, [0, 0.35, 0.6, 0.8, 0.92, 1].map((t) => [t, `rgba(0,0,0,${A(0.36 * Math.pow(Math.asin(t) / (Math.PI / 2), 1.5))})`]));
+  strips(true);
+  // punggung kertas: kilap lembut di puncak, teduh di dekat lipatan rata
+  shadeRoll(half, Math.PI * r, [[0, `rgba(0,0,0,${A(0.14)})`], [0.45, `rgba(0,0,0,${A(0.05)})`], [0.8, `rgba(255,255,255,${A(0.10)})`], [0.96, `rgba(255,255,255,${A(0.28)})`], [1, `rgba(0,0,0,${A(0.06)})`]]);
+  // bagian yang sudah terbalik rata di atas halaman
+  if (flapPoly.length > 2) {
+    ctx.save(); ctx.transform(...affine(Math.PI * r + 1));
+    polyPath(ctx, flapPoly); ctx.clip(); drawFace(true);
+    const g2 = ctx.createLinearGradient(F[0] + nx * Math.PI * r, F[1] + ny * Math.PI * r, F[0] + nx * (Math.PI * r + pw * 0.5), F[1] + ny * (Math.PI * r + pw * 0.5));
+    g2.addColorStop(0, `rgba(0,0,0,${(0.10 * amt).toFixed(3)})`); g2.addColorStop(0.25, `rgba(255,255,255,${(0.05 * amt).toFixed(3)})`); g2.addColorStop(1, `rgba(0,0,0,${(0.05 * amt).toFixed(3)})`);
+    ctx.fillStyle = g2; ctx.fillRect(pw - 2, -2, pw + 4, ph + 4);
+    ctx.restore();
+  }
+}
+function spineShade(ctx, pw, ph) {
+  const g = ctx.createLinearGradient(pw - 30, 0, pw + 30, 0);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(0.42, 'rgba(0,0,0,.10)'); g.addColorStop(0.5, 'rgba(0,0,0,.2)'); g.addColorStop(0.58, 'rgba(0,0,0,.10)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g; ctx.fillRect(pw - 30, 0, 60, ph);
+}
+// jari → titik sudut kertas; sudut tetap tersambung ke punggung buku (tidak bisa ditarik lepas)
+function constrainP(st, P) {
+  const { pw, ph, C } = st;
+  const A = [pw, C[1]];
+  let dx = P[0] - A[0], dy = P[1] - A[1], d = Math.hypot(dx, dy);
+  if (d > pw) { P = [A[0] + dx / d * pw, A[1] + dy / d * pw]; }
+  // sudut atas juga terikat ke ujung bawah punggung (dan sebaliknya) supaya kertas tidak sobek
+  const B = [pw, C[1] < ph / 2 ? ph : 0], diag = Math.hypot(pw, ph);
+  dx = P[0] - B[0]; dy = P[1] - B[1]; d = Math.hypot(dx, dy);
+  if (C[1] !== ph / 2 && d > diag) P = [B[0] + dx / d * diag, B[1] + dy / d * diag];
+  return P;
+}
+function dragFlip(st, x, y) {
+  cancelAnimationFrame(st.raf); st.raf = 0;
+  const [lx, ly] = st.toLocal(x, y ?? 0);
+  if (!st.grab) st.grab = [lx - st.C[0], (y == null ? 0 : ly - st.C[1])];
+  const P = constrainP(st, [lx - st.grab[0], y == null ? st.C[1] : ly - st.grab[1]]);
+  const now = performance.now(), dt = Math.max(8, now - st.lastT);
+  st.vx = 0.6 * ((P[0] - st.P[0]) / dt) + 0.4 * st.vx; st.lastT = now;
+  st.P = P;
+  if (!st.queued) { st.queued = true; requestAnimationFrame(() => { st.queued = false; if (flip === st) paintFlip(st); }); }
+}
+function releaseFlip(st) {
+  const commit = st.vx < -0.45 || (st.vx < 0.45 && st.P[0] < st.pw * 1.05);
+  if (commit) playPageFlip();
+  animFlip(st, commit);
+}
+// gerak lembar ke tujuan: kurva iOS (cepat di awal, mendarat sangat halus, tanpa pantulan)
+function animFlip(st, commit, lift = 0) {
+  cancelAnimationFrame(st.raf);
+  const from = st.P.slice(), to = commit ? [0, st.C[1]] : st.C.slice();
+  const dist = Math.hypot(to[0] - from[0], to[1] - from[1]);
+  const dur = Math.max(260, Math.min(620, 260 + dist * 0.55));
+  const ease = (t) => 1 - Math.pow(1 - t, 3.2);
+  const t0 = performance.now();
+  const step = (now) => {
+    const t = Math.min(1, (now - t0) / dur), e = ease(t);
+    const P = [from[0] + (to[0] - from[0]) * e, from[1] + (to[1] - from[1]) * e - lift * Math.sin(Math.PI * e)];
+    st.P = constrainP(st, P); paintFlip(st);
+    if (t >= 1) { st.P = to; paintFlip(st); st.raf = 0; endFlip(st, commit); return; }
+    st.raf = requestAnimationFrame(step);
+  };
+  st.raf = requestAnimationFrame(step);
+}
+async function endFlip(st, commit) {
+  if (commit) {
+    jumpToSpread(st.to);
+    const show = [2 * st.to, 2 * st.to + 1].map((i) => E.pages[i]).filter(Boolean);
+    await Promise.all(show.map((pg) => (E.els.get(pg.id)?.rendered ? null : renderPage(pg))));
+  }
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    st.ov.remove();
+    if (flip === st) flip = null;
+  }));
+}
+// tombol, keyboard, roda mouse: sudut bawah diangkat sedikit lalu dibalik
+function autoFlip(dir) {
+  if (flip) return;
+  const pr = E.pagesEl.getBoundingClientRect();
+  const st = beginFlip(dir, dir > 0 ? pr.right : pr.left, pr.bottom); if (!st) return;
+  playPageFlip();
+  animFlip(st, true, st.ph * 0.18);
+}
+function jumpToSpread(i) {
+  E.pagesEl.style.scrollBehavior = 'auto';
+  E.pagesEl.scrollLeft = spreadScrollLeft(i);
+  E.spreadIdx = i; E.lastSpreadIdx = i;
+  updateFlipButtons(); updateIndicator(); rerenderVisible();
+}
+
+function baseWidth() { const w = E.pagesEl.clientWidth; return Math.max(200, Math.min(w - 32, 920)); }
+function layout() {
+  if (!E) return;
+  deselectItem();
+  const spread = isSpreadActive();
+  let pw;
+  if (spread) {
+    E.pagesEl.classList.add('spread-mode');
+    E.inner.classList.add('spread-mode');
+    const availH = Math.max(200, E.pagesEl.clientHeight - 64);
+    const availW = Math.max(240, E.pagesEl.clientWidth - 56);
+    const asp = E.pages[0] ? (E.pages[0].h / E.pages[0].w) : 1.414;
+    const maxSideByH = Math.floor(availH / asp);
+    const maxSideByW = Math.floor(availW / 2);
+    pw = Math.max(120, Math.min(maxSideByH, maxSideByW, 720)) * E.zoom;
+
+    const viewW = E.pagesEl.clientWidth;
+    const sidePad = Math.max(20, Math.round((viewW - pw * 2) / 2));
+    const spreadGap = Math.max(48, Math.round(viewW - pw * 2));
+
+    E.spreadPw = pw;
+    E.spreadSidePad = sidePad;
+    E.spreadGap = spreadGap;
+
+    E.inner.style.setProperty('--pw', pw + 'px');
+    E.inner.style.setProperty('--spread-pad', sidePad + 'px');
+    E.inner.style.setProperty('--spread-gap', spreadGap + 'px');
+
+    const numSpreads = totalSpreads();
+    const totalInnerW = Math.max(viewW, sidePad * 2 + numSpreads * (pw * 2) + Math.max(0, numSpreads - 1) * spreadGap);
+    E.inner.style.width = totalInnerW + 'px';
+  } else {
+    E.pagesEl.classList.remove('spread-mode');
+    E.inner.classList.remove('spread-mode');
+    E.inner.style.removeProperty('--pw');
+    E.inner.style.removeProperty('--spread-pad');
+    E.inner.style.removeProperty('--spread-gap');
+    pw = baseWidth() * E.zoom;
+    E.inner.style.width = Math.max(E.pagesEl.clientWidth, pw + 32) + 'px';
+  }
+  for (const p of E.pages) {
+    const r = E.els.get(p.id);
+    r.el.style.width = pw + 'px';
+    r.el.style.height = (pw * p.h / p.w) + 'px';
+  }
+  const btnSpread = $('#ed-spread');
+  if (btnSpread) {
+    btnSpread.classList.toggle('on', spread);
+    btnSpread.hidden = E.pages.length < 2;
+  }
+  $('#ed-zlabel').textContent = Math.round(E.zoom * 100) + '%';
+  numberPages();
+  updateFlipButtons();
+}
+
+function onIntersect(entries) {
+  for (const en of entries) {
+    const pg = en.target._pg; const r = E?.els.get(pg.id); if (!r) continue;
+    r.visible = en.isIntersecting;
+    r.el.classList.toggle('far', !r.visible);
+    if (r.visible) queueRender(pg);
+    else if (r.rendered) { for (const c of [r.bg, r.ink, r.live]) { c.width = 0; c.height = 0; } r.rendered = false; }
+  }
+}
+// antrean gambar: satu halaman per frame supaya animasi & gulir tetap mulus (yang ada di layar didahulukan)
+const renderQ = new Set(); let rqRaf = 0;
+function queueRender(pg) { renderQ.add(pg); if (!rqRaf) rqRaf = requestAnimationFrame(drainRender); }
+function drainRender() {
+  rqRaf = 0;
+  if (!E) { renderQ.clear(); return; }
+  const vr = E.pagesEl.getBoundingClientRect();
+  let pick = null;
+  for (const pg of renderQ) {
+    const r = E.els.get(pg.id);
+    if (!r?.visible) { renderQ.delete(pg); continue; }
+    const b = r.el.getBoundingClientRect();
+    if (b.right > vr.left && b.left < vr.right && b.bottom > vr.top && b.top < vr.bottom) { pick = pg; break; }
+    pick ||= pg;
+  }
+  if (pick) { renderQ.delete(pick); renderPage(pick); }
+  if (renderQ.size) rqRaf = requestAnimationFrame(drainRender);
+}
+let rerenderTimer;
+function rerenderVisible() {
+  clearTimeout(rerenderTimer);
+  rerenderTimer = setTimeout(() => { if (!E) return; for (const p of E.pages) { const r = E.els.get(p.id); if (r.visible) renderPage(p); } }, 120);
+}
+function pxSize(pg) {
+  const r = E.els.get(pg.id);
+  const cssW = parseFloat(r.el.style.width) || r.el.clientWidth;
+  const w = Math.min(Math.round(cssW * (devicePixelRatio || 1)), 2400);
+  return [w, Math.round(w * pg.h / pg.w)];
+}
+async function renderPage(pg) {
+  const r = E.els.get(pg.id); if (!r) return;
+  // siapkan font & gambar latar dulu; kanvas baru dikosongkan & digambar dalam satu langkah (tanpa kedip kosong)
+  await pageFonts(pg);
+  if (!pg.bg && pg.src) { // halaman PDF yang belum digambar: didahulukan dari antrean latar
+    r.el.classList.add('pdf-loading');
+    await ensurePdfBg(pg).catch((e) => console.warn('pdf', e));
+    r.el.classList.remove('pdf-loading');
+  }
+  const bm = pg.bg ? await getBitmap(pg.bg) : null;
+  if (!E?.els.get(pg.id)) return;
+  const [w, h] = pxSize(pg);
+  for (const c of [r.bg, r.ink, r.live]) if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  r.rendered = true;
+  const ctx = r.bg.getContext('2d');
+  drawTemplate(ctx, w, h, pg.tpl, pg.paper, metaOf(pg));
+  if (bm) ctx.drawImage(bm, 0, 0, w, h);
+  drawInk(pg);
+}
+export async function drawBg(pg, ctx, w, h) {
+  if (!pg.bg && pg.src) await ensurePdfBg(pg).catch(() => {});
+  drawTemplate(ctx, w, h, pg.tpl, pg.paper, metaOf(pg));
+  if (pg.bg) { const bm = await getBitmap(pg.bg); if (bm) ctx.drawImage(bm, 0, 0, w, h); }
+}
+onPdfPage((id, r) => {
+  const pg = E?.pages.find((p) => p.id === id);
+  if (pg && !pg.bg) { pg.bg = r.bg; if (r.pt?.length) pg.pt = r.pt; delete pg.src; markDirty(pg); } // simpan ulang supaya gambar tidak tertimpa versi lama
+});
+function drawInk(pg) {
+  const r = E.els.get(pg.id); if (!r?.rendered) return;
+  const ctx = r.ink.getContext('2d');
+  ctx.clearRect(0, 0, r.ink.width, r.ink.height);
+  drawInkTo(ctx, pg, r.ink.width / pg.w);
+  scheduleHiRes(pg, true);
+}
+function drawInkTo(ctx, pg, s) {
+  const lay = templateLayout(pg.tpl, metaOf(pg));
+  drawChecks(ctx, lay, pg.checks, s);
+  drawCellSummaries(ctx, lay, noteSummaries(pg, () => queueRedraw(pg)), s, pg.style?.ink);
+  drawItems(ctx, pg.items, s, (it) => itemImage(it, () => queueRedraw(pg)));
+  for (const st of pg.strokes) drawStroke(ctx, st, s);
+  for (const t of pg.texts) if (t !== E.editingText) drawText(ctx, t, s);
+}
+
+// Gambar mini untuk tumpukan polaroid (dicache, dimuat di latar belakang)
+const thumbCache = new Map();
+const imgSrcs = (note) => {
+  const n = normNote(note);
+  return [...n.floats.filter((f) => f.t === 'img').map((f) => f.src).reverse(), ...[...n.html.matchAll(/<img[^>]+src="(data:image\/[^"]+)"/gi)].map((m) => m[1])];
+};
+function loadThumb(src) {
+  const key = src.length + ':' + src.slice(-64);
+  if (thumbCache.has(key)) return thumbCache.get(key);
+  const entry = { bm: null, p: null };
+  entry.p = fetch(src).then((r) => r.blob()).then((b) => createImageBitmap(b, { resizeWidth: 240, resizeQuality: 'medium' })).then((bm) => { entry.bm = bm; return bm; }).catch(() => null);
+  thumbCache.set(key, entry);
+  return entry;
+}
+const noteText = (note) => {
+  const n = normNote(note);
+  return [plainText(n.html), ...n.floats.filter((f) => f.t === 'txt' && f.v).map((f) => plainText(f.v))].filter(Boolean).join('\n');
+};
+export function noteSummaries(pg, onLoaded) {
+  if (!pg.notes) return null;
+  const out = {};
+  for (const [k, html] of Object.entries(pg.notes)) {
+    if (!html) continue;
+    const srcs = imgSrcs(html);
+    if (srcs.length) preloadPhotos(srcs);
+    const imgs = srcs.slice(0, 3).map((src) => {
+      const e = loadThumb(src);
+      if (!e.bm && onLoaded) e.p.then((bm) => bm && onLoaded());
+      return e.bm;
+    });
+    out[k] = { imgs, count: srcs.length, text: noteText(html) };
+  }
+  return out;
+}
+export async function noteSummariesReady(pg) {
+  if (!pg.notes) return null;
+  await Promise.all(Object.values(pg.notes).flatMap((h) => imgSrcs(h).slice(0, 3).map((s) => loadThumb(s).p)));
+  return noteSummaries(pg);
+}
+let redrawQueued = new Set();
+function queueRedraw(pg) {
+  if (redrawQueued.has(pg)) return; redrawQueued.add(pg);
+  requestAnimationFrame(() => { redrawQueued.delete(pg); if (E && E.els.has(pg.id)) drawInk(pg); });
+}
+
+// Ketuk kotak tanggal Monthly Plan → popup catatan berformat
+function cellNote(pg, pt) {
+  const lay = templateLayout(pg.tpl, metaOf(pg));
+  const idx = cellAt(pg.tpl, lay, pt.x, pt.y);
+  if (idx < 0) return false;
+  let title = 'Kotak kosong', sub = '';
+  if (pg.month) {
+    const [y, m] = pg.month.split('-').map(Number);
+    const first = (new Date(y, m - 1, 1).getDay() - settings.weekStart + 7) % 7;
+    const n = idx - first + 1, days = new Date(y, m, 0).getDate();
+    if (n >= 1 && n <= days) { const d = new Date(y, m - 1, n); title = `${n} ${MONTHS_LONG[m - 1]} ${y}`; sub = DAYS_LONG[d.getDay()]; }
+  }
+  const apply = (note) => {
+    const before = snap(pg);
+    pg.notes = { ...(pg.notes || {}) };
+    if (note) pg.notes[idx] = note; else delete pg.notes[idx];
+    pushUndo(before); markDirty(pg); drawInk(pg);
+  };
+  const openNote = () => cellPhotos(pg, idx, title, sub, apply);
+  // ketuk tumpukan foto (kalau catatannya punya foto) = lihat fotonya dulu
+  // hanya ikon foto yang membuka popup foto; sisa kotak adalah area kuas/teks
+  const ic = lay.areas[1 + idx]?.icon;
+  if (!ic || pt.x < ic.x - 10 || pt.x > ic.x + ic.w + 10 || pt.y < ic.y - 10 || pt.y > ic.y + ic.h + 10) return false;
+  openNote();
+  return true;
+}
+
+// Pratinjau foto layar penuh: geser kiri/kanan, ketuk latar atau tombol tutup untuk keluar
+// Foto catatan dimuat & di-decode lebih dulu (saat kotak digambar), jadi pratinjau langsung tampil mulus
+const pvCache = new Map();
+function preloadPhotos(srcs) {
+  for (const s of srcs) {
+    if (pvCache.has(s)) continue;
+    const im = new Image(); im.decoding = 'async'; im.src = s;
+    pvCache.set(s, im.decode().then(() => im).catch(() => im));
+  }
+}
+const EASE_OUT = 'cubic-bezier(.22,1,.36,1)';       // melambat lembut di akhir
+const EASE_SPRING = 'cubic-bezier(.34,1.45,.64,1)'; // sedikit memantul
+
+const monthTitle = (m) => { const [y, mo] = m.split('-').map(Number); return `${MONTHS_LONG[mo - 1]} ${y}`; };
+
+async function openPhotoViewer(srcs, title, onOpenNote) {
+  // Tumpukan polaroid: foto depan diketuk/digeser ke kiri → melengkung keluar lalu menyelip ke paling belakang,
+  // foto di belakangnya maju. Geser ke kanan = foto paling belakang ditarik ke depan.
+  const n = srcs.length;
+  const order = srcs.map((_, k) => k); // order[0] = foto paling depan
+  const TILT = [-1.5, 7, -8, 4, -5, 8.5];
+
+  // tunggu semua foto siap (maks 400 ms; biasanya sudah di-preload saat kotak digambar)
+  preloadPhotos(srcs);
+  await Promise.race([Promise.all(srcs.map((s) => pvCache.get(s))), new Promise((r) => setTimeout(r, 400))]);
+
+  const v = document.createElement('div');
+  v.className = 'pv';
+  v.innerHTML = `<div class="pv-top"><div class="pv-title">${esc(title)}<small></small></div>
+      <button class="pv-btn" data-note>${ICON.note}<span>Buka catatan</span></button>
+      <button class="pv-btn round" data-close title="Tutup">${ICON.close}</button></div>
+    <div class="pv-stage"><div class="pv-deck">${srcs.map((s, k) => `<div class="pv-card" data-k="${k}"><img src="${s}" alt="" draggable="false"></div>`).join('')}</div></div>
+    <div class="pv-hint">${n > 1 ? 'Ketuk atau geser foto untuk melihat berikutnya' : ''}</div>`;
+  const stage = v.querySelector('.pv-stage'), cards = [...v.querySelectorAll('.pv-card')];
+  const count = v.querySelector('.pv-title small');
+  let busy = 0;
+
+  const fit = () => {
+    const W = stage.clientWidth * 0.78, H = stage.clientHeight * 0.8;
+    cards.forEach((c) => {
+      const im = c.querySelector('img'), a = (im.naturalWidth || 4) / (im.naturalHeight || 3);
+      let w = Math.min(W, 560), h = w / a;
+      if (h > H) { h = H; w = h * a; }
+      im.style.width = w + 'px'; im.style.height = h + 'px';
+    });
+  };
+  const posOf = (p) => {
+    if (p === 0) return 'translate3d(0,0,0) rotate(-1.5deg) scale(1)';
+    const d = Math.min(p, 4);
+    return `translate3d(${(p % 2 ? 1 : -1) * (10 + d * 6)}px, ${d * 6}px, 0) rotate(${TILT[p % TILT.length]}deg) scale(${1 - d * 0.03})`;
+  };
+  const shade = (p) => (p === 0 ? 'brightness(1)' : `brightness(${1 - Math.min(p, 4) * 0.07})`);
+  const place = (skip = -1, dur = 560) => {
+    order.forEach((k, p) => {
+      if (k === skip) return;
+      const c = cards[k];
+      c.style.transition = dur ? `transform ${dur}ms ${EASE_OUT}, filter ${dur}ms ${EASE_OUT}` : 'none';
+      c.style.zIndex = String(n - p);
+      c.style.transform = posOf(p);
+      c.style.filter = shade(p);
+    });
+    count.textContent = n > 1 ? `${order[0] + 1} dari ${n} foto` : '1 foto';
+  };
+  const outPos = (dir) => `translate3d(${dir * Math.min(stage.clientWidth * 0.55, 420)}px, -26px, 0) rotate(${dir * 14}deg) scale(.96)`;
+
+  // foto depan melengkung keluar lalu menyelip ke belakang, dalam satu gerakan tanpa patah
+  const sendBack = (dir = -1) => {
+    if (n < 2) return;
+    const k = order.shift(); order.push(k);
+    const c = cards[k], from = getComputedStyle(c).transform, D = 760;
+    c.getAnimations().forEach((a) => a.cancel());
+    c.style.transition = 'none';
+    c.style.transform = posOf(n - 1); c.style.filter = shade(n - 1);
+    place(k);
+    busy++;
+    c.animate([
+      { transform: from === 'none' ? posOf(0) : from, filter: 'brightness(1)', easing: 'cubic-bezier(.25,.6,.35,1)' },
+      { transform: outPos(dir), filter: 'brightness(1)', offset: 0.44, easing: 'cubic-bezier(.55,0,.25,1)' },
+      { transform: posOf(n - 1), filter: shade(n - 1) },
+    ], { duration: D });
+    // tukar urutan lapisan tepat saat foto berada di luar tumpukan, jadi tidak terlihat "menembus"
+    setTimeout(() => { c.style.zIndex = '0'; }, D * 0.44);
+    setTimeout(() => { busy--; }, D * 0.5);
+  };
+  // foto paling belakang keluar ke kanan lalu mendarat di depan
+  const bringFront = (from) => {
+    if (n < 2) return;
+    const k = order.pop(); order.unshift(k);
+    const c = cards[k], D = 760;
+    c.getAnimations().forEach((a) => a.cancel());
+    c.style.transition = 'none';
+    c.style.transform = posOf(0); c.style.filter = shade(0);
+    place(k);
+    busy++;
+    c.animate([
+      { transform: posOf(n - 1), filter: shade(n - 1), easing: 'cubic-bezier(.25,.6,.35,1)' },
+      { transform: outPos(1), filter: 'brightness(1)', offset: 0.44, easing: 'cubic-bezier(.3,0,.2,1)' },
+      { transform: posOf(0), filter: 'brightness(1)' },
+    ], { duration: D });
+    setTimeout(() => { c.style.zIndex = String(n + 1); }, D * 0.44);
+    setTimeout(() => { c.style.zIndex = String(n); busy--; }, D);
+    // kartu depan sebelumnya ikut mundur, mulai dari posisi gesernya (kalau sedang digeser)
+    if (from) { const prev = cards[order[1]]; prev.animate([{ transform: from }, { transform: posOf(1) }], { duration: 560, easing: EASE_OUT }); }
+  };
+
+  let unBack = null;
+  const close = () => {
+    if (!v.isConnected || v.classList.contains('out')) return;
+    unBack?.(); document.removeEventListener('keydown', key); removeEventListener('resize', onResize);
+    v.classList.add('out');
+    cards.forEach((c) => c.animate([{ opacity: 1, translate: '0 0', scale: '1' }, { opacity: 0, translate: '0 30px', scale: '.94' }], { duration: 260, easing: 'cubic-bezier(.4,0,1,1)', fill: 'forwards' }));
+    setTimeout(() => v.remove(), 280);
+  };
+  const key = (e) => { if (e.key === 'Escape') close(); else if (e.key === 'ArrowRight' || e.key === ' ') sendBack(-1); else if (e.key === 'ArrowLeft') bringFront(); };
+  const onResize = () => { fit(); place(-1, 0); };
+  v.querySelector('[data-close]').onclick = close;
+  v.querySelector('[data-note]').onclick = () => { close(); onOpenNote(); };
+
+  // geser kartu depan mengikuti jari (pakai rAF supaya mulus)
+  let g = null, raf = 0;
+  stage.addEventListener('pointerdown', (e) => {
+    const card = e.target.closest('.pv-card');
+    g = { x: e.clientX, y: e.clientY, dx: 0, dy: 0, onFront: card && +card.dataset.k === order[0], moved: false, t: performance.now() };
+    try { stage.setPointerCapture(e.pointerId); } catch {}
+  });
+  stage.addEventListener('pointermove', (e) => {
+    if (!g) return;
+    g.dx = e.clientX - g.x; g.dy = e.clientY - g.y;
+    if (Math.hypot(g.dx, g.dy) > 6) g.moved = true;
+    if (!g.moved || !g.onFront || n < 2) return;
+    const c = cards[order[0]];
+    if (!raf) raf = requestAnimationFrame(() => {
+      raf = 0; if (!g) return;
+      c.getAnimations().forEach((a) => a.cancel());
+      c.style.transition = 'none';
+      c.style.transform = `translate3d(${g.dx}px, ${g.dy * 0.2}px, 0) rotate(${-1.5 + g.dx / 18}deg)`;
+    });
+  });
+  const up = (e) => {
+    if (!g) return;
+    const s = g; g = null; cancelAnimationFrame(raf); raf = 0;
+    if (!s.moved) { if (s.onFront) sendBack(-1); else close(); return; }
+    if (!s.onFront || n < 2) return;
+    const vx = s.dx / Math.max(1, performance.now() - s.t); // kecepatan: sentil cepat juga dihitung
+    if (s.dx < -70 || vx < -0.6) sendBack(-1);
+    else if (s.dx > 70 || vx > 0.6) bringFront(cards[order[0]].style.transform);
+    else { const c = cards[order[0]]; c.style.transition = `transform 520ms ${EASE_SPRING}`; c.style.transform = posOf(0); }
+  };
+  stage.addEventListener('pointerup', up);
+  stage.addEventListener('pointercancel', () => { g = null; place(); });
+
+  document.addEventListener('keydown', key);
+  addEventListener('resize', onResize);
+  unBack = pushBack(close); // tombol kembali HP menutup pratinjau
+  document.body.appendChild(v);
+  fit(); place(-1, 0);
+  // masuk: latar memudar, foto naik satu per satu dari belakang ke depan
+  order.slice().reverse().forEach((k, j) => cards[k].animate(
+    [{ opacity: 0, translate: '0 46px', scale: '.9' }, { opacity: 1, translate: '0 0', scale: '1' }],
+    { duration: 620, delay: 60 + j * 70, easing: EASE_OUT, fill: 'backwards' }));
+}
+
+// ---------- Pilih / geser / ubah ukuran / putar item ----------
+let sel = null; // { pg, it, box, before }
+function deselectItem() { if (!sel) return; sel.box.el.remove(); sel = null; syncToolbar(); }
+function selectItem(pg, it, e) {
+  deselectItem();
+  const r = E.els.get(pg.id);
+  const k = () => parseFloat(r.el.style.width) / pg.w;
+  // bawa ke paling depan
+  pg.items = pg.items.filter((x) => x !== it).concat(it);
+  const box = createTransformBox(r.el);
+  let before = snap(pg); // tiap geser/ubah ukuran = satu langkah undo
+  sel = { pg, it, box };
+  const toBox = () => { const kk = k(); return { x: (it.x - it.w / 2) * kk, y: (it.y - it.h / 2) * kk, w: it.w * kk, h: it.h * kk, r: it.r || 0 }; };
+  box.attach(toBox(), {
+    viewRot: () => E?.rot || 0,
+    min: 20, max: () => parseFloat(r.el.style.width) * 1.2,
+    locked: () => !!it.lk,
+    onLock: () => { pushUndo(snap(pg)); it.lk = !it.lk; markDirty(pg); before = snap(pg); toast(it.lk ? 'Dikunci' : 'Kunci dibuka'); },
+    onDuplicate: () => {
+      const clone = { ...it, x: it.x + 24, y: it.y + 24 };
+      const curBefore = snap(pg);
+      pg.items = [...(pg.items || []), clone];
+      pushUndo(curBefore); markDirty(pg); drawInk(pg);
+      selectItem(pg, clone);
+      toast('Item diduplikasi');
+    },
+    onChange: (m) => { const kk = k(); Object.assign(it, { w: m.w / kk, h: m.h / kk, x: (m.x + m.w / 2) / kk, y: (m.y + m.h / 2) / kk, r: m.r }); queueRedraw(pg); },
+    onCommit: () => { pushUndo(before); markDirty(pg); before = snap(pg); },
+    onDelete: () => { pg.items = pg.items.filter((x) => x !== it); pushUndo(before); markDirty(pg); drawInk(pg); sel = null; syncToolbar(); },
+  });
+  drawInk(pg);
+  if (e) box.el.dispatchEvent(new PointerEvent('pointerdown', e));
+}
+
+// ---------- Pilih teks di halaman: geser, ubah ukuran (huruf ikut membesar), putar ----------
+function selectText(pg, t, e) {
+  deselectItem();
+  const r = E.els.get(pg.id);
+  const k = () => parseFloat(r.el.style.width) / pg.w;
+  const box = createTransformBox(r.el);
+  let before = snap(pg);
+  sel = { pg, t, box };
+
+  let b0 = textBox(t);
+  let z0 = t.z, lh0 = t.lh, w0 = t.w, bw0 = b0.w;
+  const toBox = () => { const b = textBox(t), kk = k(); return { x: b.x * kk, y: b.y * kk, w: b.w * kk, h: b.h * kk, r: t.r || 0 }; };
+  const rebaseline = () => { b0 = textBox(t); z0 = t.z; lh0 = t.lh; w0 = t.w; bw0 = b0.w; };
+  sel.rebase = () => { before = snap(pg); rebaseline(); }; // dipanggil setelah ukuran diubah dari toolbar
+
+  box.attach(toBox(), {
+    viewRot: () => E?.rot || 0,
+    min: 16, max: () => parseFloat(r.el.style.width) * 1.5,
+    label: () => Math.round(t.z) + ' pt',
+    onDuplicate: () => {
+      const clone = { ...t, x: t.x + 24, y: t.y + 24 };
+      const curBefore = snap(pg);
+      pg.texts.push(clone);
+      pushUndo(curBefore); markDirty(pg); drawInk(pg);
+      selectText(pg, clone);
+      toast('Teks diduplikasi');
+    },
+    sideFree: true,
+    locked: () => !!t.lk,
+    onLock: () => { pushUndo(snap(pg)); t.lk = !t.lk; markDirty(pg); before = snap(pg); toast(t.lk ? 'Teks dikunci' : 'Kunci dibuka'); syncToolbar(); },
+    onChange: (m) => {
+      const kk = k();
+      delete t.a0; delete t.ab; // sudah dipindah bebas, tidak dikunci ke kotak lagi
+      t.r = m.r;
+      if (m.side) {
+        // tarik sisi kiri/kanan: ukuran huruf tetap, lebar baris berubah → teks pindah baris
+        t.w = Math.max(t.z * 1.2, m.w / kk);
+        const b = textBox(t);
+        const anchor = m.side > 0 ? m.x / kk : (m.x + m.w) / kk; // sisi seberang yang diam
+        t.x += (m.side > 0 ? anchor - b.x : anchor - (b.x + b.w));
+      } else {
+        const f = (m.w / kk) / Math.max(1, bw0);
+        t.z = Math.max(4, z0 * f);
+        if (lh0) t.lh = lh0 * f;
+        if (w0) t.w = w0 * f;
+        t.x = 0;
+        const top = m.y / kk;
+        t.y = t.base ? top + (t.lh || t.z * TEXT_LH) : top;
+        t.x = m.x / kk - textBox(t).x; // offset perataan ikut dihitung, jadi teks tidak meloncat
+      }
+      queueRedraw(pg);
+      sel?.box.update({ ...toBox(), side: m.side }); // kotak selalu pas dengan teks sebenarnya
+    },
+    onCommit: () => {
+      armed = true;
+      pushUndo(before);
+      markDirty(pg);
+      before = snap(pg);
+      rebaseline();
+      sel?.box.update(toBox());
+    },
+    onDelete: () => {
+      pg.texts = pg.texts.filter((x) => x !== t);
+      pushUndo(before);
+      markDirty(pg);
+      drawInk(pg);
+      sel = null;
+      syncToolbar();
+    },
+    // ketukan pertama hanya memilih; ketukan berikutnya (tanpa geser) membuka edit teks
+    onTap: () => {
+      if (!armed || t.lk) { armed = true; return; }
+      const b = textBox(t);
+      deselectItem();
+      textAt(pg, { x: b.x + b.w / 2, y: b.y + b.h / 2 });
+    },
+  });
+  let armed = !e;
+  syncToolbar();
+  if (e) box.el.dispatchEvent(new PointerEvent('pointerdown', e));
+}
+
+async function addItem(item) {
+  const pg = E.pages[E.cur]; if (!pg) return;
+  const r = E.els.get(pg.id).el.getBoundingClientRect(), pr = E.pagesEl.getBoundingClientRect();
+  const k = pg.w / r.width;
+  const cy = Math.min(pg.h - item.h / 2, Math.max(item.h / 2, ((pr.top + pr.height * 0.42) - r.top) * k));
+  Object.assign(item, { x: pg.w / 2 + (Math.random() - 0.5) * 120, y: cy, r: (Math.random() - 0.5) * 0.25 });
+  const before = snap(pg);
+  pg.items = [...(pg.items || []), item];
+  pushUndo(before); markDirty(pg); drawInk(pg);
+  selectItem(pg, item);
+}
+async function addPhoto(source) {
+  const url = await pickImage(source); if (!url) return;
+  const blob = await (await fetch(url)).blob();
+  const bm = await createImageBitmap(blob);
+  const id = uid(); await db.put('blobs', { id, blob });
+  const w = 360, h = w * bm.height / bm.width;
+  addItem({ t: 'img', blob: id, w, h });
+}
+function openStickerDock(show) {
+  const dock = $('#ed-stk'); if (!dock) return;
+  dock.hidden = !show;
+  document.removeEventListener('pointerdown', dockOutside, true);
+  if (!show) return;
+  stickerPicker(dock, (v) => {
+    const a = stickerAspect(v), w = isEmoji(v) ? 110 : isFluent(v) ? 150 : 220;
+    openStickerDock(false); // panel ditutup supaya stikernya kelihatan; ketuk ikon stiker untuk buka lagi
+    addItem({ t: 'stk', v, w, h: w / a });
+    playStickerPop();
+  });
+  // ketuk di luar panel = tutup (tombol stiker mengurus buka/tutupnya sendiri)
+  setTimeout(() => document.addEventListener('pointerdown', dockOutside, true));
+}
+function dockOutside(e) {
+  const dock = $('#ed-stk');
+  if (!dock || dock.hidden) return document.removeEventListener('pointerdown', dockOutside, true);
+  if (dock.contains(e.target) || e.target.closest('[data-tool="sticker"]') || e.target.closest('.sheet, #scrim, .popover')) return;
+  openStickerDock(false);
+  if (e.target.closest('#ed-pages')) { e.cherryClosed = true; return; } // di buku: tetap bisa langsung geser / balik halaman
+  swallowTap(e); e.stopImmediatePropagation(); // ketukan ini hanya menutup panel
+}
+
+// Ketuk kotak centang di Monthly Plan / Harian
+function toggleCheck(pg, pt) {
+  const i = checkAt(templateLayout(pg.tpl, metaOf(pg)), pt.x, pt.y);
+  if (i < 0) return false;
+  const before = snap(pg);
+  pg.checks = { ...(pg.checks || {}) };
+  if (pg.checks[i]) delete pg.checks[i]; else { pg.checks[i] = true; playCheckChime(); }
+  pushUndo(before); markDirty(pg); drawInk(pg);
+  navigator.vibrate?.(12);
+  return true;
+}
+
+function onScroll() { updateIndicator(); if (E.rot) applyRot(); scheduleHiResAll(); }
+function updateIndicator() {
+  if (!E) return;
+  const spread = isSpreadActive();
+  if (spread) {
+    const curSpr = currentSpreadIndex(); // dihitung dari posisi gulir, bukan dari tiap halaman
+    if (Math.floor(E.cur / 2) !== curSpr) E.cur = Math.min(E.pages.length - 1, curSpr * 2);
+    const left = curSpr * 2;
+    const right = Math.min(E.pages.length, left + 2);
+    const ind = $('#ed-ind');
+    if (ind) ind.textContent = `${left + 1}–${right}/${E.pages.length}`;
+    updateFlipButtons();
+  } else {
+    const best = pageAtCenter();
+    E.cur = best;
+    const ind = $('#ed-ind');
+    if (ind) ind.textContent = `${best + 1}/${E.pages.length}`;
+    updateFlipButtons();
+  }
+}
+
+// halaman yang paling dekat ke tengah layar (mode gulir): binary search, cukup ±10 pembacaan untuk 640 halaman
+function pageAtCenter() {
+  const n = E.pages.length; if (!n) return 0;
+  const midY = E.pagesEl.getBoundingClientRect().top + E.pagesEl.clientHeight / 2;
+  if (E.rot) { // kanvas diputar: posisi offset tidak sesuai layar, pakai cara lama
+    let best = 0, bd = Infinity;
+    E.pages.forEach((p, i) => { const r = E.els.get(p.id).el.getBoundingClientRect(); const d = Math.abs((r.top + r.bottom) / 2 - midY); if (d < bd) { bd = d; best = i; } });
+    return best;
+  }
+  const el = (i) => E.els.get(E.pages[i].id).el;
+  const e0 = el(0), delta = e0.getBoundingClientRect().top - e0.offsetTop * E.zoomK0();
+  const center = (i) => { const e = el(i); return delta + (e.offsetTop + e.offsetHeight / 2) * E.zoomK0(); };
+  let lo = 0, hi = n - 1;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (center(mid) < midY) lo = mid + 1; else hi = mid; }
+  return lo > 0 && Math.abs(center(lo - 1) - midY) < Math.abs(center(lo) - midY) ? lo - 1 : lo;
+}
+
+// ---------- Ke halaman tertentu (ketuk indikator "23–24/640") ----------
+function goToPage(i) {
+  if (!E) return;
+  i = Math.max(0, Math.min(E.pages.length - 1, i));
+  if (isSpreadActive()) jumpToSpread(Math.floor(i / 2));
+  else {
+    const el = E.els.get(E.pages[i].id).el;
+    E.pagesEl.style.scrollBehavior = 'auto';
+    el.scrollIntoView({ block: 'start', inline: 'center' });
+  }
+  E.cur = i; updateIndicator();
+}
+function pagePicker() {
+  if (!E) return;
+  const n = E.pages.length, cur = E.cur + 1;
+  const s = openSheet(`
+    <div class="gp">
+      <h3>Ke halaman</h3>
+      <div class="gp-main">
+        <div class="gp-prev" id="gp-prev"><span>…</span></div>
+        <div class="gp-side">
+          <div class="gp-num"><input class="inp" id="gp-n" type="text" inputmode="numeric" enterkeyhint="go" value="${cur}" aria-label="Nomor halaman"><span>/ ${n}</span></div>
+          <input type="range" class="bsize-range-lg" id="gp-r" min="1" max="${n}" step="1" value="${cur}" aria-label="Geser untuk memilih halaman">
+          <div class="gp-quick">
+            <button class="chip-opt" data-j="first">Awal</button>
+            <button class="chip-opt" data-j="-10">−10</button>
+            <button class="chip-opt" data-j="+10">+10</button>
+            <button class="chip-opt" data-j="last">Akhir</button>
+          </div>
+        </div>
+      </div>
+      <div class="actions"><button class="btn ghost" id="gp-c">Batal</button><button class="btn yellow" id="gp-ok">Buka</button></div>
+    </div>`);
+  const inp = $('#gp-n', s), rng = $('#gp-r', s), prev = $('#gp-prev', s);
+  let val = cur, pvTimer = 0, pvTok = 0;
+  const preview = () => {
+    clearTimeout(pvTimer);
+    pvTimer = setTimeout(async () => {
+      const tok = ++pvTok, pg = E?.pages[val - 1]; if (!pg) return;
+      prev.classList.add('loading');
+      try {
+        const c = await renderPageImage(pg, 260);
+        if (tok !== pvTok || !prev.isConnected) return;
+        prev.replaceChildren(c); prev.classList.remove('loading');
+      } catch { prev.classList.remove('loading'); }
+    }, 140);
+  };
+  const set = (v, from) => {
+    val = Math.max(1, Math.min(n, Math.round(v) || 1));
+    if (from !== 'inp') inp.value = val;
+    if (from !== 'rng') rng.value = val;
+    rng.style.setProperty('--p', ((val - 1) / Math.max(1, n - 1)) * 100 + '%');
+    preview();
+  };
+  inp.onfocus = () => requestAnimationFrame(() => inp.select());
+  inp.oninput = () => { inp.value = inp.value.replace(/\D/g, ''); if (inp.value) set(+inp.value, 'inp'); };
+  rng.oninput = () => set(+rng.value, 'rng');
+  $$('[data-j]', s).forEach((b) => b.onclick = () => { const j = b.dataset.j; set(j === 'first' ? 1 : j === 'last' ? n : val + +j); });
+  const go = () => { closeSheet(); goToPage(val - 1); };
+  inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } };
+  $('#gp-ok', s).onclick = go;
+  $('#gp-c', s).onclick = () => closeSheet();
+  set(cur);
+}
+
+// ---------- Simpan ----------
+let saveTimer;
+function markDirty(pg) { E.dirty.add(pg); clearTimeout(saveTimer); saveTimer = setTimeout(flush, 700); }
+async function flush() {
+  clearTimeout(saveTimer);
+  if (!E || !E.dirty.size) return;
+  const list = [...E.dirty]; E.dirty.clear();
+  await db.putMany('pages', list);
+  E.nb.updated = Date.now();
+  E.nb.ink = E.pages.some((p) => p.strokes.length || p.texts.length);
+  await saveNotebook(E.nb);
+}
+
+// ---------- Toolbar ----------
+function setTool(t) {
+  if (t === 'eraser' && E.tool !== 'eraser' && pens().eraser.m === 'obj') toast('Penghapus per objek aktif. Ketuk penghapus lagi untuk ganti.');
+  if (scrib) scribbleFlush();
+  if (t === 'scribble' && E.tool !== 'scribble') {
+    const prev = E.tool;
+    ensureScribbleReady().then((ok) => { if (!ok && E?.tool === 'scribble') setTool(prev === 'scribble' ? 'pen' : prev); });
+  }
+  // tombol stiker ditekan lagi saat panel terbuka = tutup panel
+  const dockOpen = !$('#ed-stk')?.hidden;
+  const toggleOff = t === 'sticker' && E.tool === 'sticker' && dockOpen;
+  commitTextInput();
+  deselectItem();
+  if (E.tool !== t) { E.prevTool = E.tool; E.subOff = true; }
+  E.tool = t; syncToolbar();
+  openStickerDock(t === 'sticker' && !toggleOff);
+}
+const SUB_TOOLS = ['pen', 'hl', 'eraser', 'shape'];
+// stabilo: jenis tinta (seperti produk aslinya) + bentuk ujung + mode lurus
+const HL_INKS = [
+  { k: 'neon', label: 'Neon', sub: 'cerah, klasik', icon: '<svg viewBox="0 0 24 24"><path d="M4 15l9-9 5 5-9 9H4z"/><path d="M4 20h16" stroke-width="3" opacity=".5"/></svg>' },
+  { k: 'mild', label: 'Mild', sub: 'lembut, estetik', icon: '<svg viewBox="0 0 24 24"><path d="M4 15l9-9 5 5-9 9H4z" opacity=".75"/><path d="M4 20h16" stroke-width="3" opacity=".28"/></svg>' },
+  { k: 'pastel', label: 'Pastel', sub: 'soft', icon: '<svg viewBox="0 0 24 24"><circle cx="8" cy="12" r="4" opacity=".45"/><circle cx="16" cy="12" r="4" opacity=".7"/></svg>' },
+  { k: 'metal', label: 'Metalik', sub: 'berkilau', icon: '<svg viewBox="0 0 24 24"><path d="M12 3l2.2 5.4L20 9l-4.4 3.8L17 19l-5-3-5 3 1.4-6.2L4 9l5.8-.6z"/></svg>' },
+];
+const HL_TIPS = [
+  { k: 'chisel', label: 'Chisel', icon: '<svg viewBox="0 0 24 24"><path d="M9 3h6v8l-3 5-3-5z"/><path d="M5 21h14" stroke-width="3.4" stroke-linecap="butt"/></svg>' },
+  { k: 'bullet', label: 'Bullet', icon: '<svg viewBox="0 0 24 24"><path d="M9 3h6v9a3 3 0 0 1-6 0z"/><path d="M8 21h8" stroke-width="2.2"/></svg>' },
+];
+const HL_PAL = {
+  neon: ['#fff200', '#39ff14', '#ff6ec7', '#ff9f1c', '#00e5ff', '#bf5fff'],
+  mild: ['#f3dd6d', '#a8dcb9', '#f4abba', '#c3aee0', '#9fcdee', '#f6bd8d'],
+  pastel: ['#fff3a3', '#c8f2c2', '#ffd1dc', '#dccbf5', '#c7e6ff', '#ffe0c2'],
+  metal: ['#d4af37', '#b8bcc6', '#c27a46', '#e79ac0', '#5fc9bd', '#8fa6ff'],
+};
+const hlInk = (b) => (HL_PAL[b] ? b : 'neon');
+const BRUSH_SHORT = { pen: 'Pena', ballpoint: 'Ballpoint', pencil: 'Pensil', calligraphy: 'Kaligrafi', brush: 'Kuas' };
+function syncSub() {
+  const bar = $('#ed-sub'); if (!bar || !E) return;
+  const t = E.tool, P = pens();
+  $$('[data-tool]').forEach((b) => { b.classList.toggle('has-opt', SUB_TOOLS.includes(b.dataset.tool)); b.classList.toggle('opt-open', b.dataset.tool === t && SUB_TOOLS.includes(t) && !E.subOff); });
+  let groups = null;
+  if (t === 'pen') groups = [{ opts: BRUSH_PROFILES.map((b) => ({ k: b.id, label: BRUSH_SHORT[b.id] || b.label, icon: ICON[b.icon] || ICON.pen })), on: P.pen.b || 'pen', pick: (k) => { P.pen.b = k; } }];
+  if (t === 'hl') groups = [
+    { opts: HL_INKS, on: hlInk(P.hl.b), pick: (k) => { P.hl.b = k; if (!HL_PAL[k].includes(P.hl.c)) P.hl.c = HL_PAL[k][0]; } },
+    { opts: HL_TIPS, on: P.hl.tip || 'chisel', pick: (k) => { P.hl.tip = k; } },
+    { toggle: true, opts: [{ k: 'straight', label: 'Lurus', icon: '<svg viewBox="0 0 24 24"><path d="M4 17L20 7"/><circle cx="4" cy="17" r="1.8"/><circle cx="20" cy="7" r="1.8"/></svg>' }], on: P.hl.straight ? 'straight' : '', pick: () => { P.hl.straight = !P.hl.straight; if (!P.hl.straight) P.hl.hv = false; } },
+  ];
+  if (t === 'eraser') groups = [{ opts: [{ k: 'area', label: 'Manual', icon: ICON.eraser }, { k: 'obj', label: 'Per objek', icon: ICON.trash }], on: P.eraser.m || 'area', pick: (k) => { P.eraser.m = k; } }];
+  if (t === 'shape') groups = [{ opts: Object.entries(SHAPES).map(([k, label]) => ({ k, label, icon: shapeIcon(k) })), on: P.shape.k || 'line', pick: (k) => { P.shape.k = k; } }];
+  const show = !!groups && !E.subOff;
+  if (show && bar.dataset.for !== t) {
+    bar.innerHTML = groups.map((g, gi) => `<div class="seg ${g.toggle ? 'tog' : ''}" data-g="${gi}">` + g.opts.map((o) => `<button class="subopt" data-k="${o.k}" ${o.sub ? `title="${esc(o.sub)}"` : ''}>${o.icon}<span>${esc(o.label)}</span></button>`).join('') + '</div>').join('<i class="seg-sep"></i>');
+    bar._fresh = true;
+    bar.dataset.for = t;
+    $$('.seg', bar).forEach((sg) => { const g = groups[+sg.dataset.g]; $$('.subopt', sg).forEach((b) => b.onclick = () => { if (sg._slime?.busy) return; /* tunggu animasi selesai */ g.pick(b.dataset.k); saveSettings(); syncToolbar(); }); });
+  }
+  if (show) {
+    const fresh = bar._fresh; bar._fresh = false;
+    $$('.seg', bar).forEach((sg) => {
+      const g = groups[+sg.dataset.g];
+      const prev = $('.subopt.on', sg);
+      $$('.subopt', sg).forEach((b) => b.classList.toggle('on', b.dataset.k === g.on));
+      if (g.toggle) return; // tombol nyala/mati tunggal: tanpa penanda
+      // penanda slime: melar ke pilihan baru, ekornya menyusul setelah kepala tiba
+      const cur = $('.subopt.on', sg), sl = createSlime(sg, { blur: 5 });
+      requestAnimationFrame(() => (fresh || !prev || prev === cur ? sl.place(cur) : sl.move(prev, cur)));
+    });
+  }
+  const top = $('.etop', $('#editor'));
+  if (top) bar.style.top = top.offsetTop + top.offsetHeight + 'px';
+  bar.classList.toggle('open', show);
+}
+function syncToolbar() {
+  queueMicrotask(syncSub);
+  const P = pens();
+  // ikon hanya ditulis ulang saat pilihannya berubah (hemat parsing SVG & reflow)
+  const shapeBtn = $('#ed-shape');
+  if (shapeBtn && shapeBtn.dataset.k !== P.shape.k) { shapeBtn.innerHTML = shapeIcon(P.shape.k); shapeBtn.dataset.k = P.shape.k; }
+  const curB = P.pen.b || 'pen';
+  const penBtn = $('#ed-pen');
+  if (penBtn && penBtn.dataset.b !== curB) {
+    penBtn.innerHTML = ICON[curB] || ICON.pen;
+    penBtn.dataset.b = curB;
+    const prof = BRUSH_PROFILES.find((x) => x.id === curB);
+    penBtn.title = `Pena: ${prof?.label || 'Pena'} (ketuk lagi untuk pilih jenis kuas)`;
+  }
+  $$('[data-tool]').forEach((b) => b.classList.toggle('on', b.dataset.tool === E.tool));
+  $('#ed-stylus').classList.toggle('on', settings.stylusOnly);
+  const isTextSel = !!(sel && sel.t && !sel.t.lk);
+  const t = isTextSel ? 'text' : (E.tool === 'scribble' ? 'text' : E.tool);
+  const colors = t === 'hl' ? HL_PAL[hlInk(P.hl.b)] : (t === 'pen' || t === 'shape' || t === 'text') ? PEN_COLORS : [];
+  const cfg = P[t];
+  const activeColor = sel?.t ? sel.t.c : cfg?.c;
+  $('#ed-colors').innerHTML = colors.map((c) => `<button class="pcolor ${activeColor === c ? 'on' : ''}" data-c="${c}" style="background:${c}"></button>`).join('') +
+    (colors.length ? `<label class="pcolor" title="Warna lain" style="background:conic-gradient(red,yellow,lime,cyan,blue,magenta,red);position:relative;overflow:hidden"><input type="color" id="ed-cc" value="${activeColor?.length === 7 ? activeColor : '#000000'}" style="opacity:0;position:absolute;inset:0;width:100%;height:100%"></label>` : '');
+  $$('#ed-colors [data-c]').forEach((b) => b.onclick = () => {
+    const c = b.dataset.c;
+    cfg.c = c;
+    if (sel?.t && !sel.t.lk) {
+      const curBefore = snap(sel.pg);
+      sel.t.c = c;
+      pushUndo(curBefore);
+      markDirty(sel.pg);
+      drawInk(sel.pg);
+    }
+    saveSettings();
+    syncToolbar();
+  });
+  const cc = $('#ed-cc');
+  if (cc) cc.onchange = (e) => {
+    const c = e.target.value;
+    cfg.c = c;
+    if (sel?.t && !sel.t.lk) {
+      const curBefore = snap(sel.pg);
+      sel.t.c = c;
+      pushUndo(curBefore);
+      markDirty(sel.pg);
+      drawInk(sel.pg);
+    }
+    saveSettings();
+    syncToolbar();
+  };
+  // alat tanpa ukuran (Pilih, Geser, Stiker) tidak punya slider; jangan sampai editor gagal dibuka
+  // sedang mengetik angka ukuran: jangan bangun ulang toolbar (kolom angkanya bisa hilang)
+  const typingSize = !!document.activeElement?.closest?.('#ed-sizes .tsize');
+  if (typingSize) {
+    // biarkan apa adanya
+  } else if (t !== 'text' && (!cfg || !SIZES[t])) {
+    $('#ed-sizes').innerHTML = '';
+  } else if (t !== 'text') {
+    sizeSlider(t, cfg);
+  } else if (E.tool === 'scribble' && !isTextSel) {
+    // Scribble yang masih tulisan tangan: − tebal coretan + (angka bisa diketik)
+    $('#ed-sizes').innerHTML = scribbleSizeStepper();
+  } else {
+    // teks (termasuk hasil Scribble yang sudah jadi teks): − ukuran + (angka bisa diketik)
+    $('#ed-sizes').innerHTML = textSizeStepper();
+  }
+  if (t === 'text' && !typingSize) {
+    const activeFont = sel?.t ? (sel.t.f || cfg.f) : cfg.f;
+    const curFmt = sel?.t || E.textInput?.t || cfg;
+    $('#ed-sizes').insertAdjacentHTML('beforeend', `<button class="fontbtn" id="ed-font" title="Pilih font (${activeFont || 'Bawaan'})" style='font-family:${cssFamily(activeFont)}'>${activeFont ? esc(activeFont.length > 8 ? activeFont.slice(0, 7) + '…' : activeFont) : 'Aa'}</button>` + textFmtHTML(curFmt));
+    bindTextFmt(cfg);
+    bindTextSizeStepper();
+    $('#ed-font').onclick = () => {
+      const s = openSheet('<h3>Pilih Font</h3><div id="fp"></div><div class="actions"><button class="btn yellow" id="fp-ok">Selesai</button></div>');
+      const sampleText = sel?.t?.v ? sel.t.v.slice(0, 16) : 'Cherry';
+      fontPicker($('#fp', s), activeFont || null, async (fam) => {
+        cfg.f = fam;
+        if (sel?.t && !sel.t.lk) {
+          const curBefore = snap(sel.pg);
+          if (fam) sel.t.f = fam; else delete sel.t.f;
+          await ensureFont(fam);
+          await ensureFont(fam, 700);
+          drawInk(sel.pg);
+          markDirty(sel.pg);
+          pushUndo(curBefore);
+          const r = E.els.get(sel.pg.id);
+          const kk = parseFloat(r.el.style.width) / sel.pg.w;
+          const bx = textBox(sel.t);
+          sel.box.update({ x: bx.x * kk, y: bx.y * kk, w: bx.w * kk, h: bx.h * kk, r: sel.t.r || 0 });
+        }
+        saveSettings();
+        syncToolbar();
+      }, sampleText);
+      $('#fp-ok', s).onclick = () => closeSheet();
+    };
+  }
+  $('#ed-undo').disabled = !E.undo.length; $('#ed-redo').disabled = !E.redo.length;
+  E.pagesEl.style.cursor = t === 'hand' ? 'grab' : E.tool === 'text' ? 'text' : t === 'select' ? 'default' : 'crosshair';
+}
+function shapeIcon(k) {
+  const d = { line: '<path d="M5 19L19 5"/>', rect: '<rect x="4.5" y="6" width="15" height="12" rx="1"/>', ellipse: '<ellipse cx="12" cy="12" rx="8" ry="6"/>', arrow: '<path d="M5 19L19 5M11 5h8v8"/>', free: '<path d="M6 8c3-4 9-4 12-1s1 9-4 10-11-2-8-9z" fill="currentColor" fill-opacity=".25"/>' }[k];
+  return `<svg viewBox="0 0 24 24">${d}</svg>`;
+}
+function shapeMenu(anchor) {
+  popover(anchor, Object.entries(SHAPES).map(([k, label]) => ({ label, fn: () => { pens().shape.k = k; saveSettings(); syncToolbar(); } })));
+}
+
+// ---------- Undo / Redo ----------
+const snap = (pg) => ({ pg, strokes: pg.strokes.slice(), texts: pg.texts.slice(), checks: { ...(pg.checks || {}) }, notes: { ...(pg.notes || {}) }, items: (pg.items || []).map((i) => ({ ...i })) });
+function pushUndo(s) { E.undo.push(s); if (E.undo.length > 120) E.undo.shift(); E.redo = []; syncUndo(); }
+function syncUndo() { $('#ed-undo').disabled = !E.undo.length; $('#ed-redo').disabled = !E.redo.length; }
+function restore(s) { deselectItem(); s.pg.strokes = s.strokes; s.pg.texts = s.texts; s.pg.checks = s.checks; s.pg.notes = s.notes; s.pg.items = s.items.map((i) => ({ ...i })); drawInk(s.pg); markDirty(s.pg); }
+function undo() { commitTextInput(); const s = E.undo.pop(); if (!s) return; E.redo.push(snap(s.pg)); restore(s); syncUndo(); }
+function redo() { const s = E.redo.pop(); if (!s) return; E.undo.push(snap(s.pg)); restore(s); syncUndo(); }
+document.addEventListener('keydown', (e) => {
+  if (!E || e.target.matches?.('input,textarea')) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); redo(); }
+  if (isSpreadActive()) {
+    if (e.key === 'ArrowRight' || e.key === 'PageDown') { e.preventDefault(); nextSpread(); }
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prevSpread(); }
+  }
+});
+
+// ---------- Input pointer ----------
+function bindPointers(el) {
+  const ptrs = new Map();
+  let mode = null, cur = null, pinch = null, pan = null, inertia = 0;
+  const stopInertia = () => cancelAnimationFrame(inertia);
+  const makePan = (e, tap = null) => ({
+    x: e.clientX,
+    y: e.clientY,
+    startX: e.clientX,
+    startY: e.clientY,
+    startSpread: currentSpreadIndex(),
+    t: performance.now(),
+    vx: 0,
+    vy: 0,
+    tap
+  });
+
+  el.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.text-input, .tbox, .pdel')) return; // kotak seleksi mengurus sentuhannya sendiri
+
+    // Cek apakah ketukan mengenai teks yang ada di halaman:
+    const targetPage = e.target.closest('.page');
+    if (targetPage) {
+      const pg = targetPage._pg, pt = toPage(e, pg);
+      const hitText = [...pg.texts].reverse().find((x) => textHit(x, pt.x, pt.y, 8));
+      if (hitText) {
+        if (!sel || sel.t !== hitText) {
+          e.preventDefault();
+          commitTextInput();
+          ptrs.delete(e.pointerId);
+          selectText(pg, hitText, e);
+          return;
+        }
+      }
+    }
+
+    // ketukan pertama di luar teks yang sedang diketik / item yang terpilih hanya menutupnya, tidak menggambar atau membuat yang baru
+    // (dua jari tetap boleh untuk geser/zoom)
+    if (e.pointerType !== 'touch' || ![...ptrs.values()].some((p) => p.type === 'touch')) {
+      if (E.textInput) { e.preventDefault(); commitTextInput(); swallowTap(e); return; }
+      if (sel && E.tool !== 'select' && E.tool !== 'sticker' && E.tool !== 'lasso') { e.preventDefault(); deselectItem(); swallowTap(e); return; }
+    }
+    if (e.pointerType === 'pen') E.penSeen = true;
+    if (e.pointerType === 'touch' && mode === 'draw' && cur?.type === 'pen') return; // tolak telapak tangan
+    ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
+    try { el.setPointerCapture(e.pointerId); } catch {}
+    stopInertia();
+    if (e.cherryClosed && !mode) { mode = 'pan'; pan = makePan(e); return; } // baru saja menutup menu: hanya geser, tidak menggambar
+    const touches = [...ptrs.entries()].filter(([, p]) => p.type === 'touch');
+    if (e.pointerType === 'touch' && touches.length >= 2) {
+      if (mode === 'draw' || mode === 'erase' || mode === 'shape') cancelCurrent(cur);
+      cur = null;
+      const [a, b] = touches.map(([, p]) => p);
+      pinch = { d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, z0: E.zoom, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2,
+        a0: Math.atan2(b.y - a.y, b.x - a.x), r0: E.rot, canRot: settings.stylusOnly || E.penSeen, zOn: false, rOn: false };
+      mode = 'pinch'; return;
+    }
+    if (mode) return;
+    if (E.tool === 'select') {
+      // Pilih: ketuk stiker/foto/teks = pilih (geser, ubah ukuran, putar, hapus); ketuk kotak tanggal = catatan; seret = geser halaman
+      const pe = e.target.closest('.page');
+      if (pe) {
+        const pg = pe._pg, pt = toPage(e, pg);
+        const t = [...pg.texts].reverse().find((x) => textHit(x, pt.x, pt.y, 6));
+        if (t) { e.preventDefault(); ptrs.delete(e.pointerId); selectText(pg, t, e); return; }
+        const it = itemAt(pg, pt);
+        if (it) { e.preventDefault(); ptrs.delete(e.pointerId); selectItem(pg, it, e); return; }
+        // coretan / bentuk yang sudah digambar: ketuk = pilih, langsung bisa digeser
+        const st = [...pg.strokes].reverse().find((x) => strokeHit(x, pt.x, pt.y, 7 / zoomK()));
+        if (st) { e.preventDefault(); ptrs.delete(e.pointerId); deselectItem(); groupSelect(pg, [st], [], [], e); return; }
+      }
+      deselectItem();
+      mode = 'pan'; pan = makePan(e, pe ? { pg: pe._pg, pt: toPage(e, pe._pg), x0: e.clientX, y0: e.clientY, t0: performance.now() } : null); return;
+    }
+    if (E.tool === 'sticker') {
+      const pe = e.target.closest('.page');
+      if (pe) { const it = itemAt(pe._pg, toPage(e, pe._pg)); if (it) { e.preventDefault(); ptrs.delete(e.pointerId); selectItem(pe._pg, it, e); return; } }
+      deselectItem(); openStickerDock(false);
+      mode = 'pan'; pan = makePan(e); return;
+    }
+    const fingerPans = e.pointerType === 'touch' && (settings.stylusOnly || E.penSeen);
+    if (E.tool === 'hand' || fingerPans || e.button === 1) { mode = 'pan'; pan = makePan(e); return; }
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    const pageEl = e.target.closest('.page');
+    if (!pageEl) { mode = 'pan'; pan = makePan(e); return; }
+    const pg = pageEl._pg;
+    const pt = toPage(e, pg);
+    const P = pens();
+    if ((E.tool === 'select' || E.tool === 'text') && toggleCheck(pg, pt)) { e.preventDefault(); return; }
+    if (E.tool === 'text') {
+      e.preventDefault();
+      // yang paling depan menang: teks, lalu stiker/foto, baru kotak tanggal
+      const hit = [...pg.texts].reverse().find((t) => textHit(t, pt.x, pt.y, 6));
+      if (!hit && !E.textInput) { const it = itemAt(pg, pt); if (it) { ptrs.delete(e.pointerId); selectItem(pg, it, e); return; } }
+      // ketuk pertama = pilih (bisa digeser/resize/putar); ketuk teks yang sudah terpilih = edit isinya
+      if (hit && !(sel && sel.t === hit) && !E.textInput) { ptrs.delete(e.pointerId); selectText(pg, hit, e); return; }
+      deselectItem();
+      textAt(pg, pt); return;
+    }
+    if (sel) deselectItem();
+    cur = { pg, type: e.pointerType, before: snap(pg), id: e.pointerId, t0: performance.now(), x0: pt.x, y0: pt.y };
+    if (E.tool === 'scribble') {
+      mode = 'draw'; cur.scrib = true;
+      scribbleHold(pg);
+      cur.stroke = { t: 'pen', c: P.text.c || '#1f1f22', w: brushW('scribble', P.scribble) / zoomK(), p: [pt.x, pt.y, pt.p] };
+      cur.sx = pt.x; cur.sy = pt.y; cur.raw = pt; cur.times = [0];
+      drawLastSegment(liveCtx(pg), cur.stroke, liveScale(pg));
+    } else if (E.tool === 'pen' || E.tool === 'hl') {
+      mode = 'draw';
+      playPencilTouch();
+      cur.stroke = { t: E.tool, b: P[E.tool]?.b || 'pen', c: P[E.tool].c, w: brushW(E.tool, P[E.tool]), p: [pt.x, pt.y, pt.p] };
+      if (E.tool === 'pen') cur.hold = { x: e.clientX, y: e.clientY }; // untuk deteksi "tahan di akhir"
+      if (E.tool === 'hl') { cur.stroke.b = hlInk(P.hl.b); cur.stroke.tip = P.hl.tip || 'chisel'; if (P.hl.straight || P.hl.hv) cur.stroke.straight = true; cur.hv = !!P.hl.hv; }
+      cur.sx = pt.x; cur.sy = pt.y; cur.raw = pt; // titik "tertinggal" untuk penghalus coretan
+      if (E.tool === 'pen') drawLastSegment(liveCtx(pg), cur.stroke, liveScale(pg));
+      else redrawLive(pg, cur.stroke);
+    } else if (E.tool === 'lasso') {
+      mode = 'lasso'; cur.poly = [pt.x, pt.y];
+    } else if (E.tool === 'eraser') {
+      mode = 'erase'; cur.changed = false; eraseAt(cur, pt);
+    } else if (E.tool === 'shape') {
+      mode = 'shape'; cur.x0 = pt.x; cur.y0 = pt.y; cur.stroke = null;
+      if (P.shape.k === 'free') cur.stroke = { t: 'pen', fill: true, c: P.shape.c, w: brushW('shape', P.shape), p: [pt.x, pt.y, 0.5] };
+    }
+  });
+
+  el.addEventListener('pointermove', (e) => {
+    const p = ptrs.get(e.pointerId); if (!p) return;
+    const px = p.x, py = p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (mode === 'pinch') {
+      const ts = [...ptrs.values()].filter((q) => q.type === 'touch');
+      if (ts.length < 2) return;
+      const [a, b] = ts;
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      // mode stylus: dua jari juga memutar kanvas (seperti aplikasi gambar), tegak lagi kalau dekat 0°
+      // pinch lebih "kaku": zoom/putar baru aktif setelah jari benar-benar merenggang/memutar, lalu dihaluskan
+      const ang = Math.atan2(b.y - a.y, b.x - a.x);
+      if (!pinch.zOn && Math.abs(Math.log(d / pinch.d0)) > 0.07) { pinch.zOn = true; pinch.d0 = d; pinch.z0 = E.zoom; }
+      if (pinch.canRot && !pinch.rOn && Math.abs(Math.atan2(Math.sin(ang - pinch.a0), Math.cos(ang - pinch.a0))) > 0.28) { pinch.rOn = true; pinch.a0 = ang; pinch.r0 = E.rot; }
+      if (pinch.rOn) {
+        let r = pinch.r0 + ang - pinch.a0;
+        r = Math.atan2(Math.sin(r), Math.cos(r));
+        for (const snap of [0, Math.PI / 2, -Math.PI / 2, Math.PI, -Math.PI]) if (Math.abs(r - snap) < 0.09) r = snap;
+        if (r === -Math.PI) r = Math.PI;
+        E.rot = r;
+      }
+      if (pinch.zOn) {
+        let z = pinch.z0 * d / pinch.d0;
+        if (Math.abs(z - 1) < 0.05) z = 1; // nempel di 100%
+        z = E.zoom + (z - E.zoom) * 0.5;
+        if (Math.abs(z - E.zoom) / E.zoom > 0.002) setZoom(z, unrotPoint(mx, my), false);
+      }
+      applyRot();
+      scrollView(mx - pinch.mx, my - pinch.my);
+      pinch.mx = mx; pinch.my = my;
+      return;
+    }
+    if (mode === 'pan') {
+      const dx = e.clientX - px, dy = e.clientY - py;
+      if (isSpreadActive() && E.zoom <= 1.05) {
+        const tdx = e.clientX - pan.startX, tdy = e.clientY - pan.startY;
+        if (!pan.flip && !pan.noFlip && Math.hypot(tdx, tdy) > 10) {
+          if (Math.abs(tdx) > Math.abs(tdy) * 0.6) pan.flip = beginFlip(tdx < 0 ? 1 : -1, pan.startX, pan.startY);
+          if (!pan.flip) pan.noFlip = true;
+        }
+        if (pan.flip) dragFlip(pan.flip, e.clientX, e.clientY);
+      } else {
+        scrollView(dx, dy);
+      }
+      const now = performance.now(), dt = Math.max(1, now - pan.t);
+      pan.vx = 0.8 * (dx / dt) + 0.2 * pan.vx; pan.vy = 0.8 * (dy / dt) + 0.2 * pan.vy; pan.t = now;
+      return;
+    }
+    if (!cur || e.pointerId !== cur.id) return;
+    const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    if (mode === 'draw' && cur.stroke.t === 'hl' && (cur.stroke.straight || cur.stroke.b === 'line' || cur.stroke.b === 'under')) {
+      const raw = toPage(e, cur.pg), x0 = cur.stroke.p[0], y0 = cur.stroke.p[1];
+      let x = raw.x, y = raw.y;
+      if (cur.hv) { if (Math.abs(x - x0) >= Math.abs(y - y0)) y = y0; else x = x0; } // kunci datar / tegak
+      else if (Math.abs(y - y0) < Math.abs(x - x0) * 0.12) y = y0; // hampir datar → benar-benar datar
+      cur.stroke.p = [x0, y0, 0.5, x, y, 0.5]; cur.raw = { x, y, p: 0.5 };
+      redrawLive(cur.pg, cur.stroke);
+    } else if (mode === 'draw') {
+      if (cur.snapped) return; // sudah jadi bentuk sempurna: tunggu pena diangkat
+      const ctx = liveCtx(cur.pg), s = liveScale(cur.pg);
+      const a = SMOOTH_ALPHA[settings.smooth ?? 1];
+      for (const ce of (evs.length ? evs : [e])) {
+        const raw = toPage(ce, cur.pg); cur.raw = raw;
+        // penghalus: titik coretan mengejar ujung pena sedikit di belakang, getaran tangan teredam
+        cur.sx += (raw.x - cur.sx) * a; cur.sy += (raw.y - cur.sy) * a;
+        const pt = { x: cur.sx, y: cur.sy, p: raw.p };
+        const q = cur.stroke.p; const n = q.length;
+        if (Math.hypot(pt.x - q[n - 3], pt.y - q[n - 2]) < 0.7) continue;
+        q.push(pt.x, pt.y, pt.p);
+        if (cur.stroke.t === 'pen') drawLastSegment(ctx, cur.stroke, s);
+      }
+      if (cur.stroke.t === 'hl') redrawLive(cur.pg, cur.stroke);
+      // pena bergerak lebih dari beberapa piksel → hitung ulang waktu tahan dari sini
+      if (cur.hold && Math.hypot(e.clientX - cur.hold.x, e.clientY - cur.hold.y) > SNAP_STILL) {
+        cur.hold.x = e.clientX; cur.hold.y = e.clientY;
+        clearTimeout(cur.holdT); const c = cur; cur.holdT = setTimeout(() => trySnap(c), SNAP_HOLD);
+      }
+    } else if (mode === 'lasso') {
+      const pt = toPage(e, cur.pg), q = cur.poly;
+      if (Math.hypot(pt.x - q[q.length - 2], pt.y - q[q.length - 1]) > 2) q.push(pt.x, pt.y);
+      clearLive(cur.pg);
+      const ctx = liveCtx(cur.pg), sc = liveScale(cur.pg);
+      ctx.save(); ctx.beginPath();
+      for (let i = 0; i < q.length; i += 2) ctx.lineTo(q[i] * sc, q[i + 1] * sc);
+      ctx.closePath(); // garis putus-putus saja, area di dalam tidak diarsir
+      ctx.setLineDash([6, 5]); ctx.lineWidth = 1.6; ctx.strokeStyle = '#0a99f0'; ctx.stroke(); ctx.restore();
+    } else if (mode === 'erase') {
+      for (const ce of (evs.length ? evs : [e])) eraseAt(cur, toPage(ce, cur.pg));
+    } else if (mode === 'shape' && cur.stroke?.fill) {
+      // bentuk bebas: gambar kelilingnya, ujung otomatis tersambung dan diisi warna
+      const q = cur.stroke.p;
+      for (const ce of (evs.length ? evs : [e])) { const pt = toPage(ce, cur.pg); if (Math.hypot(pt.x - q[q.length - 3], pt.y - q[q.length - 2]) > 1.2) q.push(pt.x, pt.y, 0.5); }
+      redrawLive(cur.pg, cur.stroke);
+    } else if (mode === 'shape') {
+      const pt = toPage(e, cur.pg);
+      const P = pens().shape;
+      cur.stroke = { t: 'pen', sharp: P.k !== 'ellipse', c: P.c, w: brushW('shape', P), p: shapePoints(P.k, cur.x0, cur.y0, pt.x, pt.y) };
+      redrawLive(cur.pg, cur.stroke);
+    }
+  });
+
+  function trySnap(c) {
+    if (c !== cur || mode !== 'draw' || c.snapped || c.scrib || c.stroke.t !== 'pen') return;
+    const res = analyzeShape(c.stroke.p); if (!res) return;
+    c.snapped = true;
+    let pr = 0, n = 0; for (let i = 2; i < c.stroke.p.length; i += 3) { pr += c.stroke.p[i]; n++; }
+    pr = Math.min(0.85, Math.max(0.3, n ? pr / n : 0.5));
+    const flat = (pts) => { const a = []; for (const q of pts) a.push(q.x, q.y, pr); return a; };
+    const fromSt = { ...c.stroke, p: flat(res.src) };
+    c.stroke.p = flat(res.dst); // bentuk akhir langsung disiapkan (pena boleh diangkat kapan saja)
+    if (res.sharp) c.stroke.sharp = true;
+    navigator.vibrate?.(12);
+    // morph: tiap titik bergeser halus dari coretan tangan ke bentuk sempurna
+    const t0 = performance.now(), D = 220, ease = (t) => 1 - (1 - t) ** 3;
+    const frame = (now) => {
+      if (cur !== c) return;
+      const k = ease(Math.min(1, (now - t0) / D)), a = fromSt.p, b = c.stroke.p, m = new Array(b.length);
+      for (let i = 0; i < b.length; i++) m[i] = a[i] + (b[i] - a[i]) * k;
+      redrawLive(c.pg, { ...c.stroke, p: m });
+      if (k < 1) c.morphRaf = requestAnimationFrame(frame);
+    };
+    c.morphRaf = requestAnimationFrame(frame);
+  }
+
+  const end = (e) => {
+    if (!ptrs.has(e.pointerId)) return;
+    ptrs.delete(e.pointerId);
+    if (mode === 'pinch') { if (![...ptrs.values()].some((q) => q.type === 'touch')) { const needRerender = pinch?.zOn || pinch?.rOn; mode = null; if (needRerender) rerenderVisible(); } return; }
+    if (mode === 'pan') {
+      mode = null;
+      const tp = pan.tap;
+      if (E.tool === 'select' && tp && Math.hypot(e.clientX - tp.x0, e.clientY - tp.y0) < 10 && performance.now() - tp.t0 < 450) {
+        toggleCheck(tp.pg, tp.pt);
+        return;
+      }
+      if (isSpreadActive() && E.zoom <= 1.05) {
+        if (pan.flip) releaseFlip(pan.flip);
+        return;
+      }
+      let vx = pan.vx * 16, vy = pan.vy * 16;
+      if (performance.now() - pan.t > 80) vx = vy = 0;
+      const step = () => { if (Math.abs(vx) < 0.4 && Math.abs(vy) < 0.4) return; scrollView(vx, vy); vx *= 0.94; vy *= 0.94; inertia = requestAnimationFrame(step); };
+      inertia = requestAnimationFrame(step);
+      return;
+    }
+    if (!cur || e.pointerId !== cur.id) return;
+    const pg = cur.pg;
+    clearTimeout(cur.holdT); cancelAnimationFrame(cur.morphRaf);
+    if (e.type === 'pointercancel') { cancelCurrent(cur); }
+    else if (mode === 'draw' && cur.scrib) { finishSmooth(cur); scribbleAdd(pg, cur.stroke); }
+    else if (mode === 'draw') {
+      if (!cur.snapped) finishSmooth(cur);
+      pg.strokes.push(cur.stroke);
+      clearLive(pg); drawStroke(E.els.get(pg.id).ink.getContext('2d'), cur.stroke, scaleOf(pg)); drawHiStroke(pg, cur.stroke);
+      pushUndo(cur.before); markDirty(pg);
+      if (e.pointerType === 'touch' && performance.now() - cur.t0 < 320) {
+        const p = cur.stroke.p;
+        let maxD = 0;
+        for (let i = 0; i < p.length; i += 3) maxD = Math.max(maxD, Math.hypot(p[i] - cur.x0, p[i + 1] - cur.y0));
+        if (maxD < 18) {
+          E.tapDots = (E.tapDots || []).slice(-1);
+          E.tapDots.push({ undoLen: E.undo.length, t: performance.now() });
+        }
+      }
+    } else if (mode === 'lasso') {
+      clearLive(pg);
+      lassoSelect(pg, cur.poly);
+    } else if (mode === 'erase') {
+      clearLive(pg);
+      if (cur.changed) { pushUndo(cur.before); markDirty(pg); }
+    } else if (mode === 'shape') {
+      clearLive(pg);
+      if (cur.stroke?.fill && cur.stroke.p.length < 12) cur.stroke = null;
+      if (cur.stroke) { pg.strokes.push(cur.stroke); drawInk(pg); pushUndo(cur.before); markDirty(pg); }
+    }
+    mode = null; cur = null;
+  };
+  el.addEventListener('pointerup', end);
+  el.addEventListener('pointercancel', end);
+  // pasang setelah listener `end` agar titik tap selesai diproses dulu sebelum onDbl1 membersihkan & menjalankan gestur
+  attachTapGestures(el, {
+    isBlocked: (e) => !!e.target.closest('.tbox, .rn-float, .pdel') || !!E?.textInput,
+    onTap2: () => E?.runEdGesture?.(getGestures().tap2),
+    onTap3: () => E?.runEdGesture?.(getGestures().tap3),
+    onDbl1: () => {
+      const act = getGestures().dbl1;
+      if (!act || act === 'none') return;
+      const now = performance.now();
+      while (E.tapDots?.length && now - E.tapDots[E.tapDots.length - 1].t < 500 && E.undo.length === E.tapDots[E.tapDots.length - 1].undoLen) {
+        E.tapDots.pop();
+        const s = E.undo.pop();
+        if (s) { restore(s); syncUndo(); }
+      }
+      E?.runEdGesture?.(act);
+    },
+  });
+  el.addEventListener('lostpointercapture', () => { if (mode === 'pan' && pan?.flip && flip === pan.flip && !pan.flip.raf) releaseFlip(pan.flip); });
+  let wheelThrottle = false;
+  el.addEventListener('wheel', (e) => {
+    if (e.ctrlKey) { e.preventDefault(); setZoom(E.zoom * (e.deltaY < 0 ? 1.1 : 0.9), { x: e.clientX, y: e.clientY }); return; }
+    stopInertia();
+    if (isSpreadActive() && E.zoom <= 1.05) {
+      if (Math.abs(e.deltaY) > 20 || Math.abs(e.deltaX) > 20) {
+        e.preventDefault();
+        if (wheelThrottle) return;
+        wheelThrottle = true;
+        setTimeout(() => wheelThrottle = false, 320);
+        if (e.deltaY > 0 || e.deltaX > 0) nextSpread();
+        else prevSpread();
+        return;
+      }
+    }
+    el.scrollTop += e.deltaY; el.scrollLeft += e.deltaX;
+    e.preventDefault();
+  }, { passive: false });
+
+  function cancelCurrent(c) { if (!c) return; clearLive(c.pg); if (mode === 'erase' && c.changed) restore(c.before); mode = null; }
+}
+
+// ---------- Format teks (alat T) ----------
+const TEXT_FMT_KEYS = ['b', 'it', 'u', 'st', 'al', 'hl'];
+const ALIGN_ICON = {
+  left: '<svg viewBox="0 0 24 24"><path d="M4 6h16M4 10h10M4 14h16M4 18h10"/></svg>',
+  center: '<svg viewBox="0 0 24 24"><path d="M4 6h16M7 10h10M4 14h16M7 18h10"/></svg>',
+  right: '<svg viewBox="0 0 24 24"><path d="M4 6h16M10 10h10M4 14h16M10 18h10"/></svg>',
+};
+const HL_CYCLE = ['', '#ffe066', '#ffadc8', '#b2f2bb', '#a5d8ff'];
+function textFmtHTML(cfg) {
+  const on = (k) => (cfg[k] ? 'on' : '');
+  const al = cfg.al || 'left';
+  return `<span class="tf-sep"></span>
+    <button class="tfbtn ${on('b')}" data-tf="b" title="Tebal"><b>B</b></button>
+    <button class="tfbtn ${on('it')}" data-tf="it" title="Miring"><i style="font-family:Georgia,serif">I</i></button>
+    <button class="tfbtn ${on('u')}" data-tf="u" title="Garis bawah"><u>U</u></button>
+    <button class="tfbtn ${on('st')}" data-tf="st" title="Coret"><s>S</s></button>
+    <button class="tfbtn" data-tf="al" title="Rata kiri / tengah / kanan">${ALIGN_ICON[al]}</button>
+    <button class="tfbtn ${on('hl')}" data-tf="hl" title="Stabilo"><span class="tf-hl" style="background:${cfg.hl || 'transparent'}">ab</span></button>`;
+}
+// alat format berlaku untuk teks yang sedang diketik / dipilih, dan untuk teks baru berikutnya
+function bindTextFmt(cfg) {
+  // tombol tidak mengambil fokus, jadi teks yang sedang diketik tetap terbuka
+  $$('#ed-sizes [data-tf], #ed-font').forEach((b) => { b.onpointerdown = (e) => e.preventDefault(); b.onmousedown = (e) => e.preventDefault(); });
+  $$('#ed-sizes [data-tf]').forEach((b) => b.onclick = () => {
+    const k = b.dataset.tf;
+    const target = E.textInput?.t || (sel?.t?.lk ? null : sel?.t);
+    if (k === 'al') {
+      const order = ['left', 'center', 'right'];
+      const current = target?.al || cfg.al || 'left';
+      const next = order[(order.indexOf(current) + 1) % 3];
+      cfg.al = next;
+      if (target) { if (next === 'left') delete target.al; else target.al = next; }
+    } else if (k === 'hl') {
+      const current = target?.hl || cfg.hl || '';
+      const next = HL_CYCLE[(HL_CYCLE.indexOf(current) + 1) % HL_CYCLE.length];
+      cfg.hl = next;
+      if (target) { if (next) target.hl = next; else delete target.hl; }
+    } else {
+      const current = target ? !!target[k] : !!cfg[k];
+      const next = !current;
+      cfg[k] = next;
+      if (target) { if (next) target[k] = true; else delete target[k]; }
+    }
+    saveSettings();
+    if (target) {
+      const pg = E.textInput?.pg || sel?.pg;
+      if (pg) {
+        const curBefore = snap(pg);
+        if (E.textInput) styleTextarea(E.textInput.ta, target);
+        pushUndo(curBefore); markDirty(pg); drawInk(pg);
+        if (sel?.t === target) {
+          const r = E.els.get(pg.id);
+          const kk = parseFloat(r.el.style.width) / pg.w;
+          const bx = textBox(target);
+          sel.box.update({ x: bx.x * kk, y: bx.y * kk, w: bx.w * kk, h: bx.h * kk, r: target.r || 0 });
+        }
+      }
+    }
+    syncToolbar();
+  });
+}
+function styleTextarea(ta, t) {
+  Object.assign(ta.style, {
+    fontWeight: t.b ? '700' : '', fontStyle: t.it ? 'italic' : '',
+    textDecoration: [t.u ? 'underline' : '', t.st ? 'line-through' : ''].filter(Boolean).join(' '),
+    textAlign: t.al || 'left', background: t.hl ? t.hl + '6b' : '',
+  });
+}
+
+// ---------- Popup kotak tanggal: khusus foto ----------
+// Teks ditulis langsung di kertas dengan alat T. Di sini hanya menambah, melihat, dan menghapus foto hari itu.
+function cellPhotos(pg, idx, title, sub, apply) {
+  const note = normNote(pg.notes?.[idx]);
+  let floats = note.floats.slice();
+  const save = () => { const keep = note.html || floats.length; apply(keep ? { html: note.html, floats } : null); };
+  const s = openSheet(`
+    <div class="rn-head"><div><h3 style="margin:0">${esc(title)}</h3>${sub ? `<div class="rn-sub">${esc(sub)}</div>` : ''}</div>
+      <button class="ib sm" id="cp-x" title="Tutup">${ICON.close}</button></div>
+    <div class="cp-grid" id="cp-grid"></div>
+    <div class="actions"><button class="btn ghost" id="cp-cam">${ICON.image}<span>Kamera</span></button><button class="btn primary" id="cp-gal">${ICON.image}<span>Galeri</span></button></div>`);
+  const grid = $('#cp-grid', s);
+  const draw = () => {
+    const imgs = floats.filter((f) => f.t === 'img');
+    grid.innerHTML = imgs.length
+      ? imgs.map((f, i) => `<div class="cp-item" style="--i:${i}"><img src="${f.src}" alt="" data-v="${i}"><button class="cp-del" data-d="${i}" title="Hapus foto">${ICON.close}</button></div>`).join('')
+      : '<div class="cp-empty">Belum ada foto di tanggal ini.<br>Tambahkan dari kamera atau galeri.</div>';
+    $$('[data-v]', grid).forEach((im) => im.onclick = () => openPhotoViewer(imgs.map((f) => f.src), title, () => {}));
+    $$('[data-d]', grid).forEach((b) => b.onclick = async () => {
+      if (!(await askDelete())) return;
+      const f = imgs[+b.dataset.d]; floats = floats.filter((x) => x !== f); save(); draw();
+    });
+  };
+  // konfirmasi kecil tanpa menutup lembar
+  const askDelete = () => askUnsaved(false, 'Foto ini akan dihapus dari tanggal ini.', { title: 'Hapus foto?', discard: 'Hapus', keep: 'Batal' }).then((r) => r === 'discard');
+  const add = async (source) => {
+    const url = await pickImage(source); if (!url) return;
+    const im = new Image(); im.src = url; await im.decode().catch(() => {});
+    floats.push({ t: 'img', src: url, x: 0.08 + Math.random() * 0.1, y: 0.06, w: 0.42, a: (im.naturalWidth || 4) / (im.naturalHeight || 3), r: 0 });
+    save(); draw(); toast('Foto ditambahkan');
+  };
+  $('#cp-cam', s).onclick = () => add('camera');
+  $('#cp-gal', s).onclick = () => add('gallery');
+  $('#cp-x', s).onclick = () => closeSheet();
+  draw();
+}
+
+// ---------- Kanvas tajam saat zoom besar ----------
+// Kanvas halaman maksimal 2400 px; di atas zoom 220% hanya bagian halaman yang terlihat digambar ulang
+// dengan resolusi penuh layar, jadi garis kertas & coretan tetap tajam sampai 1500%.
+const HI_ZOOM = 2.2;
+const hiTimers = new Map();
+// HP dengan RAM kecil: lapisan tajam lebih kecil (cadangan geser lebih sempit) supaya tidak macet
+const DEV_MEM = navigator.deviceMemory || 4;
+const LOW_MEM = DEV_MEM <= 4;
+const HI_CAP = DEV_MEM <= 2 ? 3.5e6 : DEV_MEM <= 4 ? 6e6 : 9e6;
+const hiForce = new Set();
+function scheduleHiRes(pg, force = false) {
+  if (!E) return;
+  if (force) hiForce.add(pg.id);
+  clearTimeout(hiTimers.get(pg.id));
+  hiTimers.set(pg.id, setTimeout(() => { const f = hiForce.delete(pg.id); renderHiRes(pg, f); }, 70));
+}
+function scheduleHiResAll() { if (E) for (const p of E.pages) { const r = E.els.get(p.id); if (r?.visible || r?.hi) scheduleHiRes(p); } }
+function dropHiRes(r) { r.hi?.remove(); r.hiLive?.remove(); r.hi = r.hiLive = r.hiInfo = null; }
+async function renderHiRes(pg, force = false) {
+  const r = E?.els.get(pg.id); if (!r) return;
+  const needPx = parseFloat(r.el.style.width) * Math.min(3, devicePixelRatio || 1);
+  if (needPx <= r.ink.width * 1.02 || !r.visible || !r.rendered || E.rot) return dropHiRes(r);
+  const bm = pg.bg ? await getBitmap(pg.bg) : null; // siapkan dulu, sebelum kanvas dikosongkan
+  if (!E || !r.el.isConnected) return;
+  const pr = E.pagesEl.getBoundingClientRect(), er = r.el.getBoundingClientRect();
+  const vx = Math.max(0, pr.left - er.left), vy = Math.max(0, pr.top - er.top);
+  const vw = Math.min(er.width, pr.right - er.left) - vx, vh = Math.min(er.height, pr.bottom - er.top) - vy;
+  if (vw <= 2 || vh <= 2) return dropHiRes(r);
+  const dpr = Math.min(LOW_MEM ? 2 : 2.5, devicePixelRatio || 1);
+  // lapisan tajam masih menutupi layar di ukuran zoom yang sama → tidak perlu digambar ulang (tidak ada "loncat")
+  const cv = r.hiInfo?.cover;
+  if (!force && r.hi && cv && Math.abs(cv.pw - er.width) < 0.5 && vx >= cv.x0 - 1 && vy >= cv.y0 - 1 && vx + vw <= cv.x1 + 1 && vy + vh <= cv.y1 + 1) return;
+  // gambar lebih luas dari layar (cadangan setengah layar tiap arah), dibatasi ±16 juta piksel supaya hemat memori
+  let m = 0.5, x0, y0, x1, y1;
+  for (;;) {
+    x0 = Math.max(0, vx - vw * m); y0 = Math.max(0, vy - vh * m);
+    x1 = Math.min(er.width, vx + vw * (1 + m)); y1 = Math.min(er.height, vy + vh * (1 + m));
+    if ((x1 - x0) * (y1 - y0) * dpr * dpr <= HI_CAP || m <= 0) break;
+    m = Math.max(0, m - 0.1);
+  }
+  if (!r.hi) {
+    r.hi = document.createElement('canvas'); r.hi.className = 'c-hi';
+    r.hiLive = document.createElement('canvas'); r.hiLive.className = 'c-hi';
+    r.el.insertBefore(r.hi, r.live); r.live.after(r.hiLive);
+  }
+  const W = er.width * dpr, H = er.height * dpr, s = W / pg.w;
+  const cw = x1 - x0, ch = y1 - y0;
+  for (const c of [r.hi, r.hiLive]) {
+    c.width = Math.round(cw * dpr); c.height = Math.round(ch * dpr);
+    Object.assign(c.style, { left: x0 + 'px', top: y0 + 'px', width: cw + 'px', height: ch + 'px' });
+  }
+  r.hiInfo = { vx: x0, vy: y0, dpr, s, cover: { x0, y0, x1, y1, pw: er.width } };
+  const ctx = r.hi.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, -x0 * dpr, -y0 * dpr);
+  drawTemplate(ctx, W, H, pg.tpl, pg.paper, metaOf(pg));
+  if (bm) ctx.drawImage(bm, 0, 0, W, H);
+  drawInkTo(ctx, pg, s);
+}
+function drawHiStroke(pg, st) {
+  const r = E.els.get(pg.id); if (!r?.hi || !r.hiInfo) return;
+  const ctx = r.hi.getContext('2d'); ctx.setTransform(1, 0, 0, 1, -r.hiInfo.vx * r.hiInfo.dpr, -r.hiInfo.vy * r.hiInfo.dpr);
+  drawStroke(ctx, st, r.hiInfo.s);
+}
+
+// ---------- Ukuran kuas (slider & popup) ----------
+// Skala logaritmik: geser pelan di kiri untuk ukuran sangat kecil, ke kanan untuk ukuran besar
+const BRUSH_RANGE = { pen: [0.3, 40], hl: [4, 80], eraser: [3, 120], shape: [0.3, 40], scribble: [1, 14], text: [1, 160] };
+const brushW = (t, cfg) => cfg?.w ?? SIZES[t]?.[cfg?.z ?? 1] ?? 4.5;
+const toSlider = (t, w) => { const [a, b] = BRUSH_RANGE[t] || [0.5, 40]; return Math.round(100 * Math.log(Math.max(a, w) / a) / Math.log(b / a)); };
+const fromSlider = (t, v) => { const [a, b] = BRUSH_RANGE[t] || [0.5, 40]; return +(a * Math.pow(b / a, Math.max(0, Math.min(100, v)) / 100)).toFixed(1); };
+
+function sizeSlider(t, cfg, color) {
+  const w = brushW(t, cfg);
+  const box = $('#ed-sizes');
+  if (!box) return;
+  const col = t === 'eraser' ? 'var(--text)' : (color || cfg.c || '#222');
+  const dotPx = Math.max(3, Math.min(20, w * 0.8));
+
+  box.innerHTML = `
+    <div class="bsize">
+      <button class="size-pill" id="ed-size-btn" title="Atur ukuran kuas">
+        <span class="size-pill-dot"><i style="width:${dotPx}px;height:${dotPx}px;background:${col};opacity:${t === 'hl' ? 0.5 : 1}"></i></span>
+        <span class="size-pill-num">${w < 1 ? w.toFixed(1) : Math.round(w)} px</span>
+        <span class="size-pill-caret">▾</span>
+      </button>
+      <div class="bsize-inline">
+        <input type="range" min="0" max="100" step="1" value="${toSlider(t, w)}" id="ed-bsize" aria-label="Ukuran kuas">
+      </div>
+    </div>`;
+
+  const range = $('#ed-bsize', box);
+  if (range) {
+    range.style.setProperty('--p', range.value + '%');
+    range.oninput = () => {
+      cfg.w = fromSlider(t, +range.value);
+      range.style.setProperty('--p', range.value + '%');
+      const dot = $('.size-pill-dot i', box);
+      const num = $('.size-pill-num', box);
+      const px = Math.max(3, Math.min(20, cfg.w * 0.8));
+      if (dot) { dot.style.width = px + 'px'; dot.style.height = px + 'px'; }
+      if (num) num.textContent = (cfg.w < 1 ? cfg.w.toFixed(1) : Math.round(cfg.w)) + ' px';
+    };
+    range.onchange = () => saveSettings();
+  }
+
+  $('#ed-size-btn', box).onclick = (e) => (t === 'hl' ? openHlSheet() : openBrushSizeSheet(e.currentTarget, t, cfg, color));
+}
+
+function openBrushSizeSheet(anchor, t, cfg, color) {
+  const currentW = brushW(t, cfg);
+  const [minW, maxW] = BRUSH_RANGE[t] || [1, 50];
+  const col = t === 'eraser' ? '#555' : (color || cfg.c || '#222');
+  const presets = t === 'hl'
+    ? [8, 16, 26, 40, 60]
+    : t === 'eraser'
+      ? [8, 16, 32, 64, 96]
+      : t === 'scribble'
+        ? [1.5, 2.5, 3.2, 5, 8]
+        : [1.5, 3, 5, 10, 20];
+
+  const content = `
+    <div class="bsize-sheet">
+      <div class="bsize-head">
+        <span class="bsize-title">${t === 'scribble' ? 'Tebal Tulisan Scribble' : 'Ukuran ' + (t === 'hl' ? 'Stabilo' : t === 'eraser' ? 'Penghapus' : 'Kuas')}</span>
+        <span class="bsize-curr-val" id="bss-val">${currentW < 1 ? currentW.toFixed(1) : Math.round(currentW)} px</span>
+      </div>
+      <div class="bsize-preview-box">
+        <div class="bsize-preview-circle" id="bss-circle" style="width:${Math.max(4, Math.min(84, currentW * 1.5))}px;height:${Math.max(4, Math.min(84, currentW * 1.5))}px;background:${col};opacity:${t === 'hl' ? 0.45 : 1}"></div>
+      </div>
+      <div class="bsize-slider-row">
+        <span class="bsize-minmax">${minW}</span>
+        <input type="range" min="0" max="100" step="1" value="${toSlider(t, currentW)}" id="bss-slider" class="bsize-range-lg">
+        <span class="bsize-minmax">${maxW}</span>
+      </div>
+      <div class="bsize-presets">
+        ${presets.map(p => `<button class="chip-opt ${Math.abs(currentW - p) < 0.5 ? 'on' : ''}" data-pw="${p}">${p} px</button>`).join('')}
+      </div>
+      <div class="actions" style="margin-top:4px"><button class="btn yellow" id="bss-ok" style="width:100%">Selesai</button></div>
+    </div>`;
+
+  const s = openSheet(content);
+  const slider = $('#bss-slider', s);
+  const circle = $('#bss-circle', s);
+  const valText = $('#bss-val', s);
+
+  const update = (w) => {
+    cfg.w = w;
+    if (slider) {
+      slider.value = toSlider(t, w);
+      slider.style.setProperty('--p', slider.value + '%');
+    }
+    if (valText) valText.textContent = (w < 1 ? w.toFixed(1) : Math.round(w)) + ' px';
+    if (circle) {
+      const px = Math.max(4, Math.min(84, w * 1.5));
+      circle.style.width = px + 'px';
+      circle.style.height = px + 'px';
+    }
+    $$('.bsize-presets [data-pw]', s).forEach(b => b.classList.toggle('on', Math.abs(+b.dataset.pw - w) < 0.5));
+    saveSettings();
+    syncToolbar();
+  };
+
+  if (slider) {
+    slider.style.setProperty('--p', slider.value + '%');
+    slider.oninput = () => update(fromSlider(t, +slider.value));
+  }
+
+  $$('.bsize-presets [data-pw]', s).forEach(b => {
+    b.onclick = () => update(+b.dataset.pw);
+  });
+
+  $('#bss-ok', s).onclick = () => closeSheet();
+}
+
+// ---------- Panel Stabilo: ketebalan, ujung kotak/bulat, garis lurus, warna ----------
+const HL_MARKER = {
+  chisel: '<svg viewBox="0 0 40 76"><path class="mk-tip" d="M15 3l10 5v10H15z"/><rect class="mk-band" x="12" y="18" width="16" height="7" rx="1.5"/><rect class="mk-body" x="10" y="25" width="20" height="48" rx="4"/><rect class="mk-band" x="10" y="40" width="20" height="6"/></svg>',
+  bullet: '<svg viewBox="0 0 40 76"><path class="mk-tip" d="M16 18v-8a4 4 0 0 1 8 0v8z"/><rect class="mk-band" x="13" y="18" width="14" height="7" rx="1.5"/><rect class="mk-body" x="11" y="25" width="18" height="48" rx="4"/><rect class="mk-band" x="11" y="40" width="18" height="6"/></svg>',
+};
+const HL_TIP_NAME = { chisel: 'Kotak', bullet: 'Bulat' };
+function openHlSheet() {
+  const H = pens().hl;
+  const [minW, maxW] = BRUSH_RANGE.hl;
+  const presets = [8, 16, 26, 40, 60];
+  const s = openSheet(`
+    <div class="bsize-sheet hl-sheet">
+      <div class="bsize-head"><span class="bsize-title">Stabilo</span><span class="bsize-curr-val" id="hls-val"></span></div>
+      <div class="hl-stage">
+        <canvas id="hls-prev" class="hl-prev"></canvas>
+        <div class="hl-tips">${HL_TIPS.map((tp) => `<button class="hl-tip" data-tip="${tp.k}">${HL_MARKER[tp.k]}<span>${HL_TIP_NAME[tp.k]}</span></button>`).join('')}</div>
+      </div>
+      <div class="hl-label">Ketebalan</div>
+      <div class="bsize-slider-row">
+        <span class="bsize-minmax">${minW}</span>
+        <input type="range" min="0" max="100" step="1" id="hls-slider" class="bsize-range-lg" aria-label="Ketebalan stabilo">
+        <span class="bsize-minmax">${maxW}</span>
+      </div>
+      <div class="bsize-presets">${presets.map((p) => `<button class="chip-opt" data-pw="${p}">${p} px</button>`).join('')}</div>
+      <label class="hl-switch"><span>Garis lurus</span><input type="checkbox" id="hls-straight"><i></i></label>
+      <label class="hl-switch"><span>Hanya horizontal / vertikal<small>Garis lurus terkunci datar atau tegak</small></span><input type="checkbox" id="hls-hv"><i></i></label>
+      <div class="hl-label">Jenis tinta</div>
+      <div class="hl-inks">${HL_INKS.map((ik) => `<button class="chip-opt" data-ink="${ik.k}" title="${esc(ik.sub)}">${esc(ik.label)}</button>`).join('')}</div>
+      <div class="hl-label">Warna</div>
+      <div class="hl-colors" id="hls-colors"></div>
+      <div class="actions" style="margin-top:4px"><button class="btn yellow" id="hls-ok" style="width:100%">Selesai</button></div>
+    </div>`);
+  const slider = $('#hls-slider', s), cv = $('#hls-prev', s);
+
+  const drawPreview = () => {
+    const dpr = window.devicePixelRatio || 1, W = cv.clientWidth || 280, Hh = cv.clientHeight || 96;
+    cv.width = W * dpr; cv.height = Hh * dpr;
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    const sc = 0.9, w = brushW('hl', H), x0 = 24, x1 = W - 24, mid = Hh / 2, p = [];
+    if (H.straight || H.hv) p.push(x0, mid, 0.5, x1, mid, 0.5);
+    else for (let i = 0; i <= 40; i++) { const x = x0 + (x1 - x0) * i / 40; p.push(x, mid + Math.sin(i / 40 * Math.PI * 2) * Math.min(18, Hh / 2 - w * sc / 2 - 4), 0.5); }
+    // titik dalam px layar → satuan stroke (dibagi skala)
+    const st = { t: 'hl', b: hlInk(H.b), tip: H.tip || 'chisel', c: H.c, w, p: p.map((v, i) => (i % 3 === 2 ? v : v / sc)) };
+    drawStroke(ctx, st, sc * dpr);
+  };
+  const sync = () => {
+    const w = brushW('hl', H), ink = hlInk(H.b), tip = H.tip || 'chisel';
+    $('#hls-val', s).textContent = Math.round(w) + ' px';
+    slider.value = toSlider('hl', w); slider.style.setProperty('--p', slider.value + '%');
+    $$('[data-pw]', s).forEach((b) => b.classList.toggle('on', Math.abs(+b.dataset.pw - w) < 0.5));
+    $$('[data-tip]', s).forEach((b) => { b.classList.toggle('on', b.dataset.tip === tip); b.style.setProperty('--mk', H.c); });
+    $$('[data-ink]', s).forEach((b) => b.classList.toggle('on', b.dataset.ink === ink));
+    $('#hls-straight', s).checked = !!(H.straight || H.hv);
+    $('#hls-hv', s).checked = !!H.hv;
+    const pal = HL_PAL[ink];
+    $('#hls-colors', s).innerHTML = pal.map((c) => `<button class="pcolor ${H.c === c ? 'on' : ''}" data-c="${c}" style="background:${c}"></button>`).join('') +
+      `<label class="pcolor ${pal.includes(H.c) ? '' : 'on'}" title="Warna lain" style="background:conic-gradient(red,yellow,lime,cyan,blue,magenta,red);position:relative;overflow:hidden"><input type="color" value="${H.c?.length === 7 ? H.c : '#ffe14d'}" style="opacity:0;position:absolute;inset:0;width:100%;height:100%"></label>`;
+    $$('#hls-colors [data-c]', s).forEach((b) => b.onclick = () => { H.c = b.dataset.c; changed(); });
+    $('#hls-colors input', s).oninput = (e) => { H.c = e.target.value; changed(true); };
+    drawPreview();
+  };
+  // simpan + perbarui toolbar (warna, ikon) setiap ada perubahan
+  const changed = (light) => {
+    if (!light) sync();
+    else { drawPreview(); $$('[data-tip]', s).forEach((b) => b.style.setProperty('--mk', H.c)); } // pemilih warna tetap terbuka
+    saveSettings(); syncToolbar();
+  };
+
+  slider.oninput = () => { H.w = fromSlider('hl', +slider.value); slider.style.setProperty('--p', slider.value + '%'); $('#hls-val', s).textContent = Math.round(H.w) + ' px'; $$('[data-pw]', s).forEach((b) => b.classList.toggle('on', Math.abs(+b.dataset.pw - H.w) < 0.5)); drawPreview(); };
+  slider.onchange = () => { saveSettings(); syncToolbar(); };
+  $$('[data-pw]', s).forEach((b) => b.onclick = () => { H.w = +b.dataset.pw; changed(); });
+  $$('[data-tip]', s).forEach((b) => b.onclick = () => { H.tip = b.dataset.tip; changed(); });
+  $$('[data-ink]', s).forEach((b) => b.onclick = () => { H.b = b.dataset.ink; if (!HL_PAL[H.b].includes(H.c)) H.c = HL_PAL[H.b][0]; changed(); });
+  // toggle on/off: bulatan melar ke arah tujuan
+  $$('.hl-switch input', s).forEach((inp) => {
+    const k = inp.nextElementSibling;
+    inp.addEventListener('click', (e) => { if (k.dataset.anim) e.preventDefault(); }); // tunggu animasi selesai
+    inp.addEventListener('change', () => {
+      k.classList.remove('pop-on', 'pop-off'); void k.offsetWidth;
+      k.classList.add(inp.checked ? 'pop-on' : 'pop-off'); k.dataset.anim = '1';
+    });
+    k.addEventListener('animationend', () => { delete k.dataset.anim; });
+  });
+  $('#hls-straight', s).onchange = (e) => { H.straight = e.target.checked; if (!H.straight) H.hv = false; changed(); };
+  $('#hls-hv', s).onchange = (e) => { H.hv = e.target.checked; if (H.hv) H.straight = true; changed(); };
+  $('#hls-ok', s).onclick = () => closeSheet();
+  requestAnimationFrame(sync);
+  sync();
+}
+
+// ---------- Ukuran teks & Scribble: − angka + (angka bisa diketik langsung) ----------
+const textSize = (cfg) => cfg?.fz ?? SIZES.text[cfg?.z ?? 1] ?? 32;
+const clampTextSize = (z) => Math.max(BRUSH_RANGE.text[0], Math.min(BRUSH_RANGE.text[1], Math.round(z)));
+// langkah makin besar untuk huruf besar: 1 → 2 → 4
+const textStep = (z, dir) => { const st = z < 24 ? 1 : z < 60 ? 2 : 4; return Math.max(1, dir > 0 ? Math.floor(z / st) * st + st : Math.ceil(z / st) * st - st); };
+const textTarget = () => E?.textInput?.t || (sel?.t && !sel.t.lk ? sel.t : null);
+const curTextSize = () => textTarget()?.z ?? textSize(pens().text);
+// ubah ukuran huruf + lebar kotak + jarak baris bersamaan (kotak ikut membesar), pojok kiri atas tetap di tempat
+function resizeText(t, z) {
+  const f = z / t.z, b0 = textBox(t);
+  t.z = z;
+  if (t.lh) t.lh *= f;
+  if (t.w) t.w *= f;
+  delete t.a0; delete t.ab; // tidak lagi dikunci ke kotak tanggal, supaya bisa melebar
+  const b1 = textBox(t);
+  t.x += b0.x - b1.x; t.y += b0.y - b1.y;
+}
+let tsUndo = null; // rentetan klik −/+ = satu langkah undo
+function applyTextSize(z) {
+  z = clampTextSize(z);
+  pens().text.fz = z;
+  if (E.textInput) {
+    const { ta, pg, t } = E.textInput;
+    resizeText(t, z);
+    const k = parseFloat(E.els.get(pg.id).el.style.width) / pg.w;
+    const lh = (t.lh || t.z * TEXT_LH) * k, fz = t.z * k;
+    const top = t.base ? (t.y - BASE_LIFT) * k - ((lh - fz) / 2 + fz * 0.8) : t.y * k;
+    Object.assign(ta.style, { left: t.x * k + 'px', top: top + 'px', fontSize: fz + 'px', lineHeight: lh + 'px' });
+    ta.oninput?.();
+  } else if (sel?.t && !sel.t.lk) {
+    const { pg, t } = sel;
+    if (tsUndo?.t !== t) {
+      const before = snap(pg);
+      before.texts = before.texts.map((x) => (x === t ? { ...x } : x)); // salinan, supaya undo benar-benar kembali
+      pushUndo(before); tsUndo = { t };
+    }
+    clearTimeout(tsUndo.timer); tsUndo.timer = setTimeout(() => { tsUndo = null; }, 1200);
+    resizeText(t, z);
+    markDirty(pg); drawInk(pg);
+    const kk = parseFloat(E.els.get(pg.id).el.style.width) / pg.w, bx = textBox(t);
+    sel.box.update({ x: bx.x * kk, y: bx.y * kk, w: bx.w * kk, h: bx.h * kk, r: t.r || 0 });
+    sel.rebase?.();
+  }
+  return z;
+}
+// tebal tulisan tangan Scribble (sebelum jadi teks)
+const scribW = () => brushW('scribble', pens().scribble);
+const applyScribW = (w) => { const [a, b] = BRUSH_RANGE.scribble; return (pens().scribble.w = Math.max(a, Math.min(b, Math.round(w * 10) / 10))); };
+const fmtNum = (v) => String(Math.round(v * 10) / 10);
+
+function numStepper(kind, val, label) {
+  return `<div class="tsize" id="ed-tsize" data-kind="${kind}">
+    <button class="tsize-btn" data-ts="-1" aria-label="Perkecil ${label}">−</button>
+    <input class="tsize-num" type="text" inputmode="decimal" enterkeyhint="done" autocomplete="off" value="${fmtNum(val)}" aria-label="Ukuran ${label}" title="Ketik ukuran ${label}">
+    <button class="tsize-btn" data-ts="1" aria-label="Perbesar ${label}">+</button>
+  </div>`;
+}
+const textSizeStepper = () => numStepper('text', curTextSize(), 'teks');
+const scribbleSizeStepper = () => numStepper('scribble', scribW(), 'tulisan');
+
+function bindTextSizeStepper() {
+  const box = $('#ed-tsize'); if (!box) return;
+  const isText = box.dataset.kind === 'text';
+  const get = isText ? curTextSize : scribW;
+  const set = isText ? applyTextSize : applyScribW;
+  const step = isText ? textStep : (w, dir) => (dir > 0 ? Math.floor(w * 2 + 1e-6) / 2 + 0.5 : Math.ceil(w * 2 - 1e-6) / 2 - 0.5);
+  const inp = $('.tsize-num', box);
+  const show = (v) => { inp.value = fmtNum(v); };
+  const bump = (dir) => show(set(step(get(), dir)));
+  $$('[data-ts]', box).forEach((b) => {
+    let hold, rep;
+    const stop = () => { if (hold || rep) saveSettings(); clearTimeout(hold); clearInterval(rep); hold = rep = null; };
+    // tahan = terus naik/turun; preventDefault supaya teks yang sedang diketik tidak kehilangan fokus
+    b.onpointerdown = (e) => { e.preventDefault(); if (document.activeElement === inp) commit(); bump(+b.dataset.ts); hold = setTimeout(() => { rep = setInterval(() => bump(+b.dataset.ts), 70); }, 380); };
+    b.onpointerup = b.onpointerleave = b.onpointercancel = stop;
+    b.onclick = (e) => { if (e.detail === 0) { bump(+b.dataset.ts); saveSettings(); } }; // keyboard
+  });
+  // ketik angka sendiri: Enter / keluar dari kolom = terapkan
+  const commit = () => {
+    const v = parseFloat(String(inp.value).replace(',', '.'));
+    show(Number.isFinite(v) ? set(v) : get());
+    saveSettings();
+  };
+  inp.onfocus = () => requestAnimationFrame(() => inp.select());
+  inp.oninput = () => { inp.value = inp.value.replace(/[^\d.,]/g, ''); };
+  inp.onchange = commit;
+  inp.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); inp.blur(); E?.textInput?.ta.focus({ preventScroll: true }); }
+    else if (e.key === 'Escape') { show(get()); inp.blur(); E?.textInput?.ta.focus({ preventScroll: true }); }
+    else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { e.preventDefault(); bump(e.key === 'ArrowUp' ? 1 : -1); }
+  };
+  inp.onblur = () => setTimeout(() => { if (E && !document.activeElement?.closest?.('#ed-sizes .tsize')) syncToolbar(); }, 0);
+}
+
+// ---------- Salin teks ----------
+async function copyText(txt) {
+  try { await navigator.clipboard.writeText(txt); }
+  catch {
+    const ta = document.createElement('textarea'); ta.value = txt; ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  toast('Teks disalin');
+}
+
+// ---------- Scribble: tulisan tangan → teks ----------
+// Coretan ditampung dulu; setelah pena diam 0,9 detik, dikenali (ML Kit di HP) lalu diganti teks dengan format alat T.
+const SCRIBBLE_ICON = '<svg viewBox="0 0 24 24"><path d="M14.5 4.5l3 3L8 17l-4 1 1-4z"/><path class="acc" d="M13 20h7M16.5 14v6"/></svg>';
+let scrib = null; // { pg, strokes: [{ stroke, times }], timer }
+function scribbleHold(pg) {
+  if (scrib && scrib.pg !== pg) scribbleFlush();
+  clearTimeout(scrib?.timer);
+}
+function scribbleAdd(pg, stroke) {
+  scrib ||= { pg, strokes: [] };
+  scrib.strokes.push(stroke);
+  scribbleDraw();
+  clearTimeout(scrib.timer);
+  scrib.timer = setTimeout(scribbleFlush, 900);
+}
+function scribbleDraw() {
+  if (!scrib) return;
+  clearLive(scrib.pg);
+  const ctx = liveCtx(scrib.pg), s = liveScale(scrib.pg);
+  for (const st of scrib.strokes) drawStroke(ctx, st, s);
+}
+let scribModelReady = {};
+async function scribbleFlush() {
+  const job = scrib; scrib = null;
+  if (!job?.strokes.length) return;
+  clearTimeout(job.timer);
+  const { pg } = job;
+  const P = scribPlugin();
+  // bounding box tulisan
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const st of job.strokes) for (let i = 0; i < st.p.length; i += 3) { x0 = Math.min(x0, st.p[i]); y0 = Math.min(y0, st.p[i + 1]); x1 = Math.max(x1, st.p[i]); y1 = Math.max(y1, st.p[i + 1]); }
+  const keepAsInk = (msg) => {
+    if (msg) toast(msg, 3200);
+    const before = snap(pg); pg.strokes.push(...job.strokes); clearLive(pg); drawInk(pg); pushUndo(before); markDirty(pg);
+  };
+  if (!P) return keepAsInk('Scribble jalan di aplikasi Android. Di sini tulisan disimpan sebagai coretan.');
+  try {
+    const lang = scribLang();
+    if (!scribModelReady[lang]) {
+      const st = await P.status({ lang });
+      if (!st.downloaded) {
+        toast('Mengunduh pengenal tulisan tangan (sekali saja)…', 6000);
+        await P.download({ lang });
+      }
+      scribModelReady[lang] = true;
+    }
+    // ML Kit butuh waktu per titik: dibuat urut (10 ms per titik) dari urutan goresan
+    let tm = 0;
+    const strokes = job.strokes.map((st) => { const a = []; for (let i = 0; i < st.p.length; i += 3) { a.push(+(st.p[i] - x0).toFixed(1), +(st.p[i + 1] - y0).toFixed(1), tm); tm += 10; } tm += 120; return a; });
+    const pre = [...pg.texts].filter((t) => Math.abs(t.y - y0) < 60 && t.x < x0).map((t) => t.v).join(' ').slice(-20);
+    const res = await P.recognize({ lang, strokes, width: Math.max(200, x1 - x0), height: Math.max(40, y1 - y0), preContext: pre });
+    const text = (res.text || '').trim();
+    if (!text) return keepAsInk('Tulisan tidak terbaca. Disimpan sebagai coretan.');
+    // ganti coretan dengan teks seukuran tulisan yang proporsional, memakai format alat T
+    const cfg = pens().text;
+    const strokeH = Math.max(14, y1 - y0);
+    const strokeW = Math.max(20, x1 - x0);
+    const lines = text.split('\n');
+    const numLines = Math.max(1, lines.length);
+    const lineH = strokeH / numLines;
+    const estZ = Math.max(12, Math.min(180, Math.round(lineH * 0.85)));
+
+    const m = measurer(estZ, { f: cfg.f, b: cfg.b, it: cfg.it });
+    const maxTextW = Math.max(...lines.map((l) => m.measureText(l).width), 20);
+    const fitW = Math.max(strokeW, Math.ceil(maxTextW) + 20);
+
+    const t = { x: x0, y: y0, z: estZ, c: cfg.c || job.strokes[0].c || '#1f1f22', v: text, w: fitW };
+    if (cfg.f) t.f = cfg.f;
+    for (const k of TEXT_FMT_KEYS) if (cfg[k]) t[k] = cfg[k];
+    const before = snap(pg);
+    pg.texts.push(t);
+    clearLive(pg); drawInk(pg); pushUndo(before); markDirty(pg);
+    // Langsung pilih teks yang baru dikonversi agar kotak seleksi transform langsung aktif
+    selectText(pg, t);
+  } catch (e) {
+    console.warn('scribble', e);
+    keepAsInk(String(e?.message || e).toLowerCase().includes('download') || !navigator.onLine
+      ? 'Perlu internet sekali untuk mengunduh pengenal tulisan. Tulisan disimpan sebagai coretan.'
+      : 'Scribble gagal. Tulisan disimpan sebagai coretan.');
+  }
+}
+
+// ---------- Penghalus coretan ----------
+// 0 = mati, 1 = halus, 2 = sangat halus (makin kecil alpha, makin halus tapi makin "tertinggal")
+const SMOOTH_ALPHA = [1, 0.45, 0.26];
+// ---------- Gambar lalu tahan: coretan berubah jadi bentuk sempurna ----------
+// Tahan pena diam ±0,55 dtk di akhir coretan → dianalisis: garis, segitiga, kotak, lingkaran/elips.
+// Bentuk tertutup: ujung ke ujung disambung otomatis. Coretan lalu "morph" halus ke bentuk sempurnanya.
+const SNAP_HOLD = 550, SNAP_STILL = 3; // ms, piksel layar
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function resample(pts, n) {
+  const L = [0];
+  for (let i = 1; i < pts.length; i++) L.push(L[i - 1] + dist(pts[i], pts[i - 1]));
+  const total = L[L.length - 1] || 1, out = [];
+  let j = 0;
+  for (let k = 0; k < n; k++) {
+    const d = total * k / (n - 1);
+    while (j < pts.length - 2 && L[j + 1] < d) j++;
+    const t = Math.min(1, Math.max(0, (d - L[j]) / ((L[j + 1] - L[j]) || 1)));
+    out.push({ x: pts[j].x + (pts[j + 1].x - pts[j].x) * t, y: pts[j].y + (pts[j + 1].y - pts[j].y) * t });
+  }
+  return out;
+}
+function segDist(p, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy || 1;
+  const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2));
+  return Math.hypot(p.x - a.x - dx * t, p.y - a.y - dy * t);
+}
+function rdp(pts, eps) {
+  if (pts.length < 3) return pts.slice();
+  let md = 0, mi = 0;
+  for (let i = 1; i < pts.length - 1; i++) { const d = segDist(pts[i], pts[0], pts[pts.length - 1]); if (d > md) { md = d; mi = i; } }
+  if (md <= eps) return [pts[0], pts[pts.length - 1]];
+  const a = rdp(pts.slice(0, mi + 1), eps), b = rdp(pts.slice(mi), eps);
+  return a.slice(0, -1).concat(b);
+}
+const snapAngle = (a, tol) => { const q = Math.PI / 2, r = Math.round(a / q) * q; return Math.abs(a - r) < tol ? r : a; };
+// mulai bentuk dari titik yang paling dekat dengan awal coretan, searah coretan (supaya morph-nya alami)
+function orderLike(poly, P, ccw) {
+  let k = 0, bd = Infinity;
+  poly.forEach((v, i) => { const d = dist(v, P[0]); if (d < bd) { bd = d; k = i; } });
+  let out = poly.slice(k).concat(poly.slice(0, k));
+  let area = 0; for (let i = 0; i < out.length; i++) { const a = out[i], b = out[(i + 1) % out.length]; area += a.x * b.y - b.x * a.y; }
+  if ((area > 0) !== ccw) out = [out[0], ...out.slice(1).reverse()];
+  return out;
+}
+function analyzeShape(p) {
+  const raw = [];
+  for (let i = 0; i < p.length; i += 3) raw.push({ x: p[i], y: p[i + 1] });
+  if (raw.length < 6) return null;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const q of raw) { x0 = Math.min(x0, q.x); y0 = Math.min(y0, q.y); x1 = Math.max(x1, q.x); y1 = Math.max(y1, q.y); }
+  const D = Math.hypot(x1 - x0, y1 - y0);
+  if (D < 14) return null;
+  const N = 96, P = resample(raw, N);
+  let L = 0; for (let i = 1; i < N; i++) L += dist(P[i], P[i - 1]);
+  const chord = dist(P[0], P[N - 1]);
+  // garis lurus
+  if (L < chord * 1.2) {
+    let dev = 0; for (const q of P) dev = Math.max(dev, segDist(q, P[0], P[N - 1]));
+    if (dev < Math.max(3, chord * 0.07)) {
+      const a = P[0]; let b = P[N - 1];
+      const ang = Math.atan2(b.y - a.y, b.x - a.x), sa = snapAngle(ang, 0.07); // hampir datar/tegak → lurus
+      if (sa !== ang) b = { x: a.x + Math.cos(sa) * chord, y: a.y + Math.sin(sa) * chord };
+      return { kind: 'line', src: P, dst: resample([a, b], N), sharp: true };
+    }
+  }
+  // bentuk tertutup (ujung-ujungnya cukup dekat → disambung)
+  if (!(chord < D * 0.35 && L > D * 1.7)) return null;
+  let area = 0; for (let i = 0; i < N; i++) { const a = P[i], b = P[(i + 1) % N]; area += a.x * b.y - b.x * a.y; }
+  const ccw = area > 0;
+  // segitiga / kotak: cari sudut dengan penyederhanaan garis, buang titik yang hampir lurus
+  let V = rdp([...P, P[0]], D * 0.085).slice(0, -1);
+  const angAt = (i) => { const a = V[(i - 1 + V.length) % V.length], b = V[i], c = V[(i + 1) % V.length]; const u = Math.atan2(a.y - b.y, a.x - b.x), v = Math.atan2(c.y - b.y, c.x - b.x); let d = Math.abs(u - v); if (d > Math.PI) d = 2 * Math.PI - d; return d; };
+  for (let guard = 0; guard < 20 && V.length > 3; guard++) {
+    let wi = -1, wa = 0;
+    V.forEach((_, i) => { const a = angAt(i); if (a > wa) { wa = a; wi = i; } });
+    if (wa > 2.62) V.splice(wi, 1); else break; // > 150°: bukan sudut
+  }
+  if (V.length === 3 || V.length === 4) {
+    let err = 0; for (const q of P) { let m = Infinity; for (let i = 0; i < V.length; i++) m = Math.min(m, segDist(q, V[i], V[(i + 1) % V.length])); err = Math.max(err, m); }
+    if (err < D * 0.1) {
+      let poly = V;
+      if (V.length === 4 && V.every((_, i) => Math.abs(angAt(i) - Math.PI / 2) < 0.35)) {
+        // kotak: persegi panjang mengikuti arah sisi terpanjang (lurus kalau hampir datar)
+        let li = 0, ll = 0; for (let i = 0; i < 4; i++) { const l = dist(V[i], V[(i + 1) % 4]); if (l > ll) { ll = l; li = i; } }
+        const th = snapAngle(Math.atan2(V[(li + 1) % 4].y - V[li].y, V[(li + 1) % 4].x - V[li].x), 0.12);
+        const c = Math.cos(th), sn = Math.sin(th);
+        let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+        for (const q of V) { const u = q.x * c + q.y * sn, v = -q.x * sn + q.y * c; u0 = Math.min(u0, u); u1 = Math.max(u1, u); v0 = Math.min(v0, v); v1 = Math.max(v1, v); }
+        const pt = (u, v) => ({ x: u * c - v * sn, y: u * sn + v * c });
+        poly = [pt(u0, v0), pt(u1, v0), pt(u1, v1), pt(u0, v1)];
+      }
+      poly = orderLike(poly, P, ccw);
+      return { kind: poly.length === 3 ? 'triangle' : 'rect', src: P, dst: resample([...poly, poly[0]], N), sharp: true };
+    }
+  }
+  // lingkaran / elips (PCA)
+  let cx = 0, cy = 0; for (const q of P) { cx += q.x; cy += q.y; } cx /= N; cy /= N;
+  let sxx = 0, syy = 0, sxy = 0; for (const q of P) { const dx = q.x - cx, dy = q.y - cy; sxx += dx * dx; syy += dy * dy; sxy += dx * dy; }
+  let th = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  const c = Math.cos(th), sn = Math.sin(th);
+  let mu = 0, mv = 0; for (const q of P) { const dx = q.x - cx, dy = q.y - cy, u = dx * c + dy * sn, v = -dx * sn + dy * c; mu += u * u; mv += v * v; }
+  let a = Math.sqrt(2 * mu / N), b = Math.sqrt(2 * mv / N);
+  let err = 0; for (const q of P) { const dx = q.x - cx, dy = q.y - cy, u = dx * c + dy * sn, v = -dx * sn + dy * c; err += Math.abs(Math.hypot(u / a, v / b) - 1); }
+  err /= N;
+  if (err > 0.15) return null;
+  const circle = Math.min(a, b) / Math.max(a, b) > 0.8;
+  if (circle) { a = b = (a + b) / 2; th = 0; } else th = snapAngle(th, 0.14);
+  const ct = Math.cos(th), st = Math.sin(th);
+  // titik awal = sudut titik pertama coretan, arah putaran mengikuti coretan
+  const dx0 = P[0].x - cx, dy0 = P[0].y - cy;
+  const t0 = Math.atan2((-dx0 * st + dy0 * ct) / b, (dx0 * ct + dy0 * st) / a);
+  const dir = ccw ? 1 : -1, dst = [];
+  for (let k = 0; k < N; k++) {
+    const t = t0 + dir * 2 * Math.PI * k / (N - 1), u = Math.cos(t) * a, v = Math.sin(t) * b;
+    dst.push({ x: cx + u * ct - v * st, y: cy + u * st + v * ct });
+  }
+  return { kind: circle ? 'circle' : 'ellipse', src: P, dst, sharp: false };
+}
+
+function finishSmooth(c) {
+  if (c.stroke.t === 'hl' && (c.stroke.straight || c.stroke.b === 'line' || c.stroke.b === 'under')) return;
+  const lvl = settings.smooth ?? 1, q = c.stroke.p;
+  if (!lvl || q.length < 9) return;
+  // sambungkan ujung coretan ke posisi akhir pena yang sebenarnya
+  const r = c.raw, n = q.length;
+  const gx = r.x - q[n - 3], gy = r.y - q[n - 2], gap = Math.hypot(gx, gy);
+  for (let i = 1, k = Math.min(6, Math.ceil(gap / 3)); i <= k; i++) q.push(q[n - 3] + gx * i / k, q[n - 2] + gy * i / k, r.p);
+  // rata-rata bergerak (ujung tetap), 1–2 kali tergantung level
+  for (let pass = 0; pass < lvl; pass++) {
+    const src = q.slice();
+    for (let i = 3; i < src.length - 3; i += 3) {
+      q[i] = (src[i - 3] + 2 * src[i] + src[i + 3]) / 4;
+      q[i + 1] = (src[i - 2] + 2 * src[i + 1] + src[i + 4]) / 4;
+    }
+  }
+}
+
+function isTap(c) {
+  const p = c.stroke.p;
+  let d = 0;
+  for (let i = 3; i < p.length; i += 3) d = Math.max(d, Math.hypot(p[i] - c.x0, p[i + 1] - c.y0));
+  // jari boleh bergeser ±10 piksel layar dan tetap dihitung ketukan (dulu 6 satuan halaman ≈ 2 piksel di HP)
+  const k = parseFloat(E.els.get(c.pg.id).el.style.width) / c.pg.w || 1;
+  return d < Math.max(6, 10 / k) && performance.now() - c.t0 < 450;
+}
+const scaleOf = (pg) => E.els.get(pg.id).ink.width / pg.w;
+// ukuran pena & penghapus tetap sama di layar: makin di-zoom, coretan makin halus di kertas
+const zoomK = () => Math.max(1, E?.zoom || 1);
+const liveCtx = (pg) => {
+  const r = E.els.get(pg.id);
+  if (r.hiLive && r.hiInfo) { const c = r.hiLive.getContext('2d'); c.setTransform(1, 0, 0, 1, -r.hiInfo.vx * r.hiInfo.dpr, -r.hiInfo.vy * r.hiInfo.dpr); return c; }
+  return r.live.getContext('2d');
+};
+const liveScale = (pg) => { const r = E.els.get(pg.id); return r.hiLive && r.hiInfo ? r.hiInfo.s : scaleOf(pg); };
+function clearLive(pg) { const r = E.els.get(pg.id); for (const c of [r.live, r.hiLive]) if (c) { const x = c.getContext('2d'); x.setTransform(1, 0, 0, 1, 0, 0); x.clearRect(0, 0, c.width, c.height); } }
+function redrawLive(pg, stroke) { clearLive(pg); drawStroke(liveCtx(pg), stroke, liveScale(pg)); }
+function toPage(e, pg) {
+  const r = pageRect(pg), q = unrotPoint(e.clientX, e.clientY);
+  const k = pg.w / r.width;
+  return { x: (q.x - r.left) * k, y: (q.y - r.top) * k, p: e.pointerType === 'pen' ? (e.pressure || 0.5) : 0.5 };
+}
+
+// ---------- Putar kanvas ----------
+// Yang diputar hanya tampilan. Coretan tetap disimpan di koordinat halaman yang tegak,
+// jadi setelah kanvas dikembalikan tegak, tulisannya ikut lurus dengan sendirinya.
+const viewCenter = () => { const el = E.pagesEl, r = el.getBoundingClientRect(); return { x: r.left + el.clientWidth / 2, y: r.top + el.clientHeight / 2 }; };
+function unrotPoint(x, y) {
+  if (!E.rot) return { x, y };
+  const c = viewCenter(), cs = Math.cos(-E.rot), sn = Math.sin(-E.rot), dx = x - c.x, dy = y - c.y;
+  return { x: c.x + dx * cs - dy * sn, y: c.y + dx * sn + dy * cs };
+}
+// posisi halaman seandainya kanvas tidak diputar
+function pageRect(pg) {
+  const el = E.els.get(pg.id).el;
+  if (!E.rot) return el.getBoundingClientRect();
+  const pe = E.pagesEl, pr = pe.getBoundingClientRect();
+  let x = 0, y = 0;
+  for (let n = el; n && n !== pe; n = n.offsetParent) { x += n.offsetLeft; y += n.offsetTop; }
+  const left = pr.left + pe.clientLeft + x - pe.scrollLeft, top = pr.top + pe.clientTop + y - pe.scrollTop;
+  return { left, top, width: el.offsetWidth, height: el.offsetHeight };
+}
+// geser tampilan mengikuti jari, memperhitungkan putaran
+function scrollView(dx, dy) {
+  const el = E.pagesEl, cs = Math.cos(-E.rot), sn = Math.sin(-E.rot);
+  el.scrollLeft -= dx * cs - dy * sn; el.scrollTop -= dx * sn + dy * cs;
+}
+function applyRot() {
+  const el = E.pagesEl, inner = E.inner, chip = $('#ed-rot');
+  if (!E.rot) { inner.style.transform = ''; inner.style.transformOrigin = ''; if (chip) chip.hidden = true; return; }
+  const ox = el.scrollLeft + el.clientWidth / 2 - inner.offsetLeft, oy = el.scrollTop + el.clientHeight / 2 - inner.offsetTop;
+  inner.style.transformOrigin = `${ox}px ${oy}px`;
+  inner.style.transform = `rotate(${E.rot}rad)`;
+  if (chip) { chip.hidden = false; chip.innerHTML = `${ICON.undo}<span>${Math.round(E.rot * 180 / Math.PI)}°</span>`; }
+}
+// kembali tegak dengan animasi halus
+function resetRotation() {
+  const r0 = E.rot; if (!r0) return;
+  const t0 = performance.now(), D = 420;
+  const step = (now) => {
+    if (!E) return;
+    const t = Math.min(1, (now - t0) / D), e = 1 - Math.pow(1 - t, 3);
+    E.rot = t < 1 ? r0 * (1 - e) : 0; applyRot();
+    if (t < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+function eraseAt(c, pt) {
+  const pg = c.pg;
+  const r = brushW('eraser', pens().eraser) / 2 / zoomK();
+  const before = pg.strokes.length + pg.texts.length;
+  // coretan: hanya bagian di bawah penghapus yang hilang; teks: langsung hilang satu
+  let cut = false;
+  const whole = pens().eraser.m === 'obj';
+  pg.strokes = pg.strokes.flatMap((st) => { if (!strokeHit(st, pt.x, pt.y, r)) return [st]; cut = true; return whole ? [] : eraseStrokePart(st, pt.x, pt.y, r); });
+  pg.texts = pg.texts.filter((t) => !textHit(t, pt.x, pt.y, r / 2));
+  let gone = false;
+  if (pg.items?.length) { const hit = itemAt(pg, pt); if (hit) { pg.items = pg.items.filter((x) => x !== hit); gone = true; } }
+  if (gone || cut || pg.strokes.length + pg.texts.length !== before) { c.changed = true; drawInk(pg); }
+  // tampilkan lingkaran penghapus
+  clearLive(pg);
+  const ctx = liveCtx(pg), s = liveScale(pg);
+  ctx.save(); ctx.strokeStyle = 'rgba(120,120,130,.8)'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]);
+  ctx.beginPath(); ctx.arc(pt.x * s, pt.y * s, r * s, 0, 7); ctx.stroke(); ctx.restore();
+}
+
+function shapePoints(k, x0, y0, x1, y1) {
+  const P = (...xy) => xy.flatMap((v, i) => i % 2 ? [v, 0.5] : [v]);
+  if (k === 'rect') return P(x0, y0, x1, y0, x1, y1, x0, y1, x0, y0);
+  if (k === 'ellipse') {
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, rx = Math.abs(x1 - x0) / 2, ry = Math.abs(y1 - y0) / 2; const out = [];
+    for (let i = 0; i <= 64; i++) { const a = i / 64 * Math.PI * 2; out.push(cx + rx * Math.cos(a), cy + ry * Math.sin(a), 0.5); }
+    return out;
+  }
+  if (k === 'arrow') {
+    const a = Math.atan2(y1 - y0, x1 - x0), L = Math.min(40, Math.hypot(x1 - x0, y1 - y0) * 0.35);
+    return P(x0, y0, x1, y1, x1 - L * Math.cos(a - 0.45), y1 - L * Math.sin(a - 0.45), x1, y1, x1 - L * Math.cos(a + 0.45), y1 - L * Math.sin(a + 0.45));
+  }
+  return P(x0, y0, x1, y1);
+}
+
+// ---------- Teks ----------
+function textAt(pg, pt) {
+  commitTextInput();
+  const hit = [...pg.texts].reverse().find((t) => textHit(t, pt.x, pt.y, 6));
+  const P = pens().text;
+  let t = hit;
+  if (!t) {
+    const z = textSize(P);
+    const sn = pg.bg ? null : snapToLines(pg.tpl, pt.x, pt.y, z, metaOf(pg));
+    t = sn ? { x: sn.x, y: sn.y, lh: sn.lh, base: true, z: sn.z || z, c: P.c, v: '' } : { x: pt.x, y: pt.y - z * 0.6, z, c: P.c, v: '' };
+    if (P.f) t.f = P.f;
+    for (const k of TEXT_FMT_KEYS) if (P[k]) t[k] = P[k];
+    if (sn?.ab) { t.a0 = sn.a0; t.ab = sn.ab; } // batas kotak (Monthly Plan / Harian)
+    // lebar sampai pinggir kotak/kertas, lalu pindah baris
+    t.w = sn?.w || Math.max(80, pg.w - t.x - 40);
+  }
+  const before = snap(pg);
+  E.editingText = t;
+  drawInk(pg);
+  const r = E.els.get(pg.id);
+  const k = parseFloat(r.el.style.width) / pg.w;
+  const lh = (t.lh || t.z * TEXT_LH) * k, fz = t.z * k;
+  // posisikan textarea agar garis dasarnya pas dengan garis kertas
+  const top = t.base ? (t.y - BASE_LIFT) * k - ((lh - fz) / 2 + fz * 0.8) : t.y * k;
+  const ta = document.createElement('textarea');
+  ta.className = 'text-input' + (t.base ? ' on-lines' : '');
+  ta.value = t.v;
+  ta.setAttribute('wrap', 'soft');
+  Object.assign(ta.style, { left: t.x * k + 'px', top: top + 'px', fontSize: fz + 'px', lineHeight: lh + 'px', color: t.c, fontFamily: cssFamily(t.f) });
+  if (t.r) { ta.style.transform = `rotate(${t.r}rad)`; ta.style.transformOrigin = 'center'; }
+  styleTextarea(ta, t);
+  const fit = () => {
+    ta.style.height = 'auto'; ta.style.height = Math.max(lh, ta.scrollHeight) + 'px';
+    if (t.w) ta.style.width = t.w * k + 'px';
+    else { ta.style.width = 'auto'; ta.style.width = Math.max(40, ta.scrollWidth + 12) + 'px'; }
+  };
+  ta.oninput = fit;
+  r.el.appendChild(ta);
+  E.textInput = { ta, pg, t, isNew: !hit, before };
+  fit(); ta.focus({ preventScroll: true });
+  setTimeout(() => { if (document.activeElement !== ta && E?.textInput?.ta === ta) ta.focus({ preventScroll: true }); }, 30);
+  // pindah ke kolom angka ukuran teks: jangan selesaikan ketikan dulu
+  ta.addEventListener('blur', () => setTimeout(() => { if (!document.activeElement?.closest?.('#ed-tsize')) commitTextInput(); }, 0));
+  ta.addEventListener('keydown', (e) => { if (e.key === 'Escape') ta.blur(); });
+}
+function commitTextInput() {
+  if (!E?.textInput) return;
+  const { ta, pg, t, isNew, before } = E.textInput;
+  E.textInput = null; E.editingText = null;
+  const v = ta.value.replace(/\s+$/, '');
+  ta.remove();
+  const changed = v !== t.v;
+  if (!v) { pg.texts = pg.texts.filter((x) => x !== t); }
+  else {
+    t.v = v; if (isNew) pg.texts.push(t);
+    // kalau tidak muat sampai bawah kotak, geser naik per baris (tidak melewati baris pertama)
+    if (t.ab) {
+      const n = wrapLines(t).length;
+      while (t.y > t.a0 && t.y + (n - 1) * t.lh > t.ab - 8) t.y -= t.lh;
+    }
+  }
+  if (changed || (!v && !isNew)) { pushUndo(before); markDirty(pg); }
+  drawInk(pg);
+}
+
+// ---------- Zoom ----------
+function setZoom(z, focus, rerender = true) {
+  z = Math.max(0.5, Math.min(15, z));
+  if (Math.abs(z - E.zoom) < 0.001) return;
+  const el = E.pagesEl, rect = el.getBoundingClientRect();
+  const fx = (focus?.x ?? rect.left + rect.width / 2) - rect.left, fy = (focus?.y ?? rect.top + rect.height / 2) - rect.top;
+  const ratio = z / E.zoom;
+  const sl = el.scrollLeft, stp = el.scrollTop;
+  // lapisan tajam ikut diskalakan seketika supaya tetap pas (tidak berkedip/bergeser), lalu digambar ulang setelah zoom berhenti
+  for (const p of E.pages) {
+    const r = E.els.get(p.id);
+    for (const c of [r?.hi, r?.hiLive]) if (c) for (const k of ['left', 'top', 'width', 'height']) c.style[k] = parseFloat(c.style[k]) * ratio + 'px';
+    if (r?.hiInfo?.cover) r.hiInfo.cover.pw = -1; // ukuran zoom berubah → gambar ulang tajam setelah berhenti
+  }
+  E.zoom = z; layout();
+  el.scrollLeft = (sl + fx) * ratio - fx;
+  el.scrollTop = (stp + fy) * ratio - fy;
+  if (E.rot) applyRot();
+  if (rerender) rerenderVisible();
+  scheduleHiResAll();
+}
+
+// ---------- Kelola halaman ----------
+async function addPage(opts = {}) {
+  const at = E.cur + 1;
+  const ref = E.pages[E.cur];
+  let tpl = opts.tpl || (ref?.bg ? (E.nb.tpl || 'plain') : ref?.tpl) || 'plain';
+  let month = undefined;
+  if (tpl === 'monthly') {
+    const [y, m] = (ref?.month || ymd(new Date()).slice(0, 7)).split('-').map(Number);
+    const d = new Date(y, m, 1); month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  }
+  const pg = opts.page || newPage(E.nb.id, { tpl, paper: ref?.paper || E.nb.paper, date: tpl === 'daily' ? ref?.date : undefined, month });
+  pg.nb = E.nb.id;
+  E.pages.splice(at, 0, pg);
+  E.nb.pageIds = E.pages.map((p) => p.id);
+  mountPage(pg, at);
+  layout();
+  playPageFlip();
+  await db.put('pages', pg);
+  E.nb.updated = Date.now(); await saveNotebook(E.nb);
+  if (isSpreadActive()) {
+    flipToSpread(Math.floor(at / 2), true);
+  } else {
+    E.els.get(pg.id).el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  toast(`Halaman ${at + 1} ditambahkan`);
+}
+
+async function deletePage() {
+  const pg = E.pages[E.cur];
+  if (E.pages.length === 1) { toast('Buku harus punya minimal 1 halaman'); return; }
+  if (!(await confirmDialog(`Hapus halaman ${E.cur + 1}? Tindakan ini tidak bisa dibatalkan.`, { ok: 'Hapus', danger: true }))) return;
+  const r = E.els.get(pg.id); E.io.unobserve(r.el); r.el.remove(); E.els.delete(pg.id);
+  E.pages.splice(E.cur, 1);
+  E.nb.pageIds = E.pages.map((p) => p.id);
+  E.undo = E.undo.filter((s) => s.pg !== pg); E.redo = E.redo.filter((s) => s.pg !== pg); syncUndo();
+  E.dirty.delete(pg);
+  await db.del('pages', pg.id);
+  if (pg.bg) await db.del('blobs', pg.bg);
+  E.nb.updated = Date.now(); await saveNotebook(E.nb);
+  playTrashCrumple();
+  layout(); updateIndicator();
+}
+
+export function paperPickerHTML(tpl, paper) {
+  const sw = { white: '#ffffff', mint: '#eef7f1', cream: '#fbf5e6', gray: '#e3e5e9', dark: '#2b2d31' };
+  const curCat = (PAPER_CATS.find((c) => c.items.includes(tpl)) || PAPER_CATS[0]).id;
+  return `<div class="pp" data-cur="${curCat}">
+    <div class="pp-colors"><span>Warna</span>${Object.keys(PAPERS).map((k) => `<button class="pp-col ${k === paper ? 'on' : ''}" data-paper="${k}" title="${PAPERS[k].label}" style="--c:${sw[k] || PAPERS[k].bg}"></button>`).join('')}</div>
+    <div class="pp-covers">${PAPER_CATS.map((c) => `<button class="pp-cover ${c.id === curCat ? 'on' : ''}" data-cat="${c.id}"><span class="pp-stack">${c.items.slice(0, 3).map((k, i) => `<i class="pp-sheet" data-k="${k}" style="--i:${i}"></i>`).join('')}</span><b>${c.label}</b><small>${c.items.length} kertas</small></button>`).join('')}</div>
+    <div class="pp-body"></div>
+  </div>`;
+}
+export function bindPaperPicker(root, state) {
+  const meta = { month: ymd(new Date()).slice(0, 7), date: ymd(new Date()), weekStart: settings.weekStart };
+  const pp = $('.pp', root), body = $('.pp-body', root);
+  const thumb = (el, k, w) => { el.innerHTML = ''; el.appendChild(templateThumb(k, state.paper, w, meta)); };
+  const covers = () => $$('.pp-sheet', root).forEach((el) => thumb(el, el.dataset.k, 60));
+  const showCat = (id, animate = true) => {
+    pp.dataset.cur = id;
+    $$('.pp-cover', root).forEach((x) => x.classList.toggle('on', x.dataset.cat === id));
+    const cat = PAPER_CATS.find((c) => c.id === id);
+    body.innerHTML = `<div class="pp-grid ${animate ? 'in' : ''}">${cat.items.map((k, i) => `<button class="pp-item ${k === state.tpl ? 'on' : ''}" data-tpl="${k}" style="--i:${i}"><i class="pp-th"></i><span>${TEMPLATES[k]}</span></button>`).join('')}</div>`;
+    $$('.pp-item', body).forEach((btn) => {
+      thumb($('.pp-th', btn), btn.dataset.tpl, 92);
+      btn.onclick = () => { state.tpl = btn.dataset.tpl; $$('.pp-item', body).forEach((x) => x.classList.toggle('on', x === btn)); };
+    });
+    $(`.pp-cover[data-cat="${id}"]`, root)?.scrollIntoView({ block: 'nearest', inline: 'center', behavior: animate ? 'smooth' : 'auto' });
+  };
+  $$('.pp-cover', root).forEach((c) => c.onclick = () => { if (pp.dataset.cur !== c.dataset.cat) showCat(c.dataset.cat); });
+  $$('[data-paper]', root).forEach((btn) => btn.onclick = () => { state.paper = btn.dataset.paper; $$('[data-paper]', root).forEach((x) => x.classList.toggle('on', x === btn)); covers(); showCat(pp.dataset.cur, false); });
+  covers(); showCat(pp.dataset.cur, false);
+}
+
+function changePaper(all) {
+  const pg = E.pages[E.cur];
+  const state = { tpl: pg.tpl, paper: pg.paper };
+  const s = openSheet(`<div class="pp-head"><button class="pp-x" id="cp-c">Batal</button><h3>${all ? 'Kertas semua halaman' : `Kertas halaman ${E.cur + 1}`}</h3><button class="btn yellow" id="cp-ok">Terapkan</button></div>${paperPickerHTML(state.tpl, state.paper)}`, { wide: true });
+  bindPaperPicker(s, state);
+  $('#cp-c', s).onclick = () => closeSheet();
+  $('#cp-ok', s).onclick = () => {
+    const targets = all ? E.pages : [pg];
+    for (const p of targets) {
+      p.tpl = state.tpl; p.paper = state.paper;
+      if (state.tpl === 'monthly' && !p.month) p.month = ymd(new Date()).slice(0, 7);
+      if (state.tpl === 'daily' && !p.date && E.nb.date) p.date = E.nb.date;
+      markDirty(p); const r = E.els.get(p.id); if (r.visible) renderPage(p);
+    }
+    if (all) { E.nb.tpl = state.tpl; E.nb.paper = state.paper; }
+    closeSheet();
+  };
+}
+
+// ---------- Gaya Monthly Plan: font, bentuk tanggal, warna bebas, acak ----------
+const COLOR_FIELDS = { accent: 'Warna utama', accent2: 'Warna akhir pekan', cell: 'Isi kotak', line: 'Garis kotak', ink: 'Warna angka' };
+const PRESETS = ['#ff6b8b', '#f97316', '#f5b700', '#22a861', '#14b8a6', '#0a99f0', '#6366f1', '#8b5cf6', '#ec4899', '#2a2a33', '#ffffff', '#fff6f8', '#f0f9ff', '#f0fdf4', '#fefce8'];
+function monthStyleSheet(pg) {
+  let st = { ...DEFAULT_MONTH_STYLE, ...(pg.style || {}) };
+  const s = openSheet(`
+    <div class="rn-head"><h3 style="margin:0">Gaya Monthly Plan</h3><button class="btn yellow icon-btn" id="ms-rand">${ICON.dice}Acak</button></div>
+    <div class="ms-preview"><canvas id="ms-cv"></canvas></div>
+    <div class="field"><label>Bentuk tanggal</label><div class="chips" id="ms-shape"></div></div>
+    <div class="field"><label>Warna (ketuk kotak warna untuk pilih warna apa saja)</label><div id="ms-colors"></div></div>
+    <div class="field"><label>Font</label><div id="ms-font"></div></div>
+    <label class="ms-all"><input type="checkbox" id="ms-all" checked> Terapkan ke semua halaman Monthly Plan di buku ini</label>
+    <div class="actions"><button class="btn ghost" id="ms-c">Batal</button><button class="btn yellow" id="ms-ok">Simpan</button></div>`, { wide: true });
+  const cv = $('#ms-cv', s);
+  const preview = async () => {
+    await ensureFont(st.font, 700);
+    const w = 360, h = Math.round(w * pg.h / pg.w);
+    cv.width = w * 2; cv.height = h * 2; cv.style.width = w + 'px';
+    drawTemplate(cv.getContext('2d'), cv.width, cv.height, 'monthly', pg.paper, { ...metaOf(pg), style: st });
+  };
+  const drawControls = () => {
+    $('#ms-shape', s).innerHTML = Object.entries(DATE_SHAPES).map(([k, v]) => `<button class="chip-opt ${st.shape === k ? 'on' : ''}" data-shape="${k}">${v}</button>`).join('');
+    $$('[data-shape]', s).forEach((b) => b.onclick = () => { st.shape = b.dataset.shape; drawControls(); preview(); });
+    $('#ms-colors', s).innerHTML = Object.entries(COLOR_FIELDS).map(([k, label]) => `
+      <div class="ms-row"><span>${label}</span>
+        <div class="swatches">${PRESETS.map((c) => `<button class="sw sm ${st[k] === c ? 'on' : ''}" data-k="${k}" data-c="${c}" style="background:${c}"></button>`).join('')}
+          <label class="sw sm ms-any" title="Warna apa saja" style="background:${st[k]}"><input type="color" data-any="${k}" value="${st[k]}"></label></div></div>`).join('');
+    $$('[data-c]', s).forEach((b) => b.onclick = () => { st[b.dataset.k] = b.dataset.c; drawControls(); preview(); });
+    $$('[data-any]', s).forEach((inp) => inp.oninput = () => { st[inp.dataset.any] = inp.value; inp.parentElement.style.background = inp.value; preview(); });
+  };
+  drawControls(); preview();
+  fontPicker($('#ms-font', s), st.font, (f) => { st.font = f; preview(); }, 'November 12');
+  $('#ms-rand', s).onclick = () => {
+    st = randomStyle(); drawControls(); preview();
+    fontPicker($('#ms-font', s), st.font, (f) => { st.font = f; preview(); }, 'November 12');
+    cv.animate([{ transform: 'rotate(-2deg) scale(.96)' }, { transform: 'none' }], { duration: 300, easing: 'cubic-bezier(.34,1.56,.64,1)' });
+  };
+  $('#ms-c', s).onclick = () => closeSheet();
+  $('#ms-ok', s).onclick = () => {
+    const targets = $('#ms-all', s).checked ? E.pages.filter((p) => p.tpl === 'monthly') : [pg];
+    for (const p of targets) { p.style = { ...st }; markDirty(p); const r = E.els.get(p.id); if (r?.visible) renderPage(p); }
+    closeSheet(); toast('Gaya disimpan');
+  };
+}
+
+async function setMonth() {
+  const pg = E.pages[E.cur];
+  const s = openSheet(`<h3>Bulan untuk Monthly Plan</h3><div class="field"><input class="inp" type="month" id="sm-m" value="${pg.month || ymd(new Date()).slice(0, 7)}"></div>
+    <div class="actions"><button class="btn ghost" id="sm-c">Batal</button><button class="btn yellow" id="sm-ok">Terapkan</button></div>`);
+  $('#sm-c', s).onclick = () => closeSheet();
+  $('#sm-ok', s).onclick = () => { const v = $('#sm-m', s).value; if (v) { pg.month = v; markDirty(pg); renderPage(pg); } closeSheet(); };
+}
+
+// ---------- Toolbar yang urutannya bisa diatur (⋮ tetap terkunci di ujung) ----------
+const TB_DEFAULT = ['select', 'lasso', 'pen', 'hl', 'eraser', 'shape', 'text', 'scribble', 'sticker', 'img', 'hand', 'sep1', 'ctx', 'sep2', 'undo', 'redo', 'sep3', 'stylus', 'add'];
+const TB_LABEL = {
+  select: 'Pilih', lasso: 'Laso', pen: 'Pena', hl: 'Stabilo', eraser: 'Penghapus', shape: 'Bentuk', text: 'Teks', scribble: 'Scribble',
+  sticker: 'Stiker & foto', img: 'Sisipkan gambar', hand: 'Geser', ctx: 'Warna & ukuran', undo: 'Urungkan', redo: 'Ulangi',
+  stylus: 'Mode stylus', add: 'Tambah halaman', sep1: 'Garis pemisah', sep2: 'Garis pemisah', sep3: 'Garis pemisah',
+};
+const SEP_ICON = '<svg viewBox="0 0 24 24"><path d="M12 4v16"/></svg>';
+const GRIP_ICON = '<svg viewBox="0 0 24 24" style="fill:currentColor;stroke:none"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>';
+function tbOrder() {
+  const saved = Array.isArray(settings.toolbarOrder) ? settings.toolbarOrder.filter((k) => TB_DEFAULT.includes(k)) : [];
+  return [...new Set([...saved, ...TB_DEFAULT])]; // alat baru yang belum ada di urutan tersimpan masuk di belakang
+}
+function toolbarHTML() {
+  const H = {
+    select: `<button class="tool" data-tool="select" title="Pilih (ketuk untuk pilih stiker, teks, atau kotak tanggal)">${ICON.cursor}</button>`,
+    lasso: `<button class="tool" data-tool="lasso" title="Laso: lingkari coretan, teks, atau stiker lalu geser, ubah ukuran, putar">${LASSO_ICON}</button>`,
+    pen: `<button class="tool" data-tool="pen" id="ed-pen" title="Pena (ketuk lagi untuk pilih jenis kuas)">${ICON.pen}</button>`,
+    hl: `<button class="tool" data-tool="hl" title="Stabilo">${ICON.marker}</button>`,
+    eraser: `<button class="tool" data-tool="eraser" title="Penghapus">${ICON.eraser}</button>`,
+    shape: `<button class="tool" data-tool="shape" title="Bentuk (ketuk lagi untuk pilih bentuk)" id="ed-shape"></button>`,
+    text: `<button class="tool" data-tool="text" title="Teks">${ICON.text}</button>`,
+    scribble: `<button class="tool" data-tool="scribble" title="Scribble: tulis tangan jadi teks">${SCRIBBLE_ICON}</button>`,
+    sticker: `<button class="tool" data-tool="sticker" title="Stiker & foto">${STICKER_ICON}</button>`,
+    img: `<button class="tool" id="ed-img" title="Sisipkan gambar ke halaman">${ICON.image}</button>`,
+    hand: `<button class="tool" data-tool="hand" title="Geser">${ICON.hand}</button>`,
+    ctx: `<div class="ectx" style="display:flex;align-items:center;gap:4px;flex:none"><div id="ed-colors" style="display:flex;align-items:center"></div><div class="sizes" id="ed-sizes"></div></div>`,
+    undo: `<button class="tool" id="ed-undo" title="Urungkan">${ICON.undo}</button>`,
+    redo: `<button class="tool" id="ed-redo" title="Ulangi">${ICON.redo}</button>`,
+    stylus: `<button class="tool" id="ed-stylus" title="Mode stylus: jari hanya untuk geser">${ICON.stylus}</button>`,
+    add: `<button class="tool" id="ed-add" title="Tambah halaman">${ICON.addPage}</button>`,
+    sep1: '<div class="sep"></div>', sep2: '<div class="sep"></div>', sep3: '<div class="sep"></div>',
+  };
+  // data-tb dipasang di elemen terluar, dipakai untuk menyusun ulang tanpa membangun ulang (event tetap utuh)
+  return tbOrder().map((k) => H[k].replace(/^<(\w+)/, `<$1 data-tb="${k}"`)).join('');
+}
+function applyToolbarOrder(order) {
+  const box = $('#editor .etools'); if (!box) return;
+  for (const k of order) { const el = $(`[data-tb="${k}"]`, box); if (el) box.appendChild(el); }
+}
+function tbIcon(k) {
+  if (k.startsWith('sep')) return SEP_ICON;
+  if (k === 'ctx') return ICON.palette;
+  const el = $(`#editor .etools [data-tb="${k}"]`);
+  return el?.innerHTML || '';
+}
+function toolbarSortSheet() {
+  const s = openSheet(`
+    <div class="tbs">
+      <h3>Atur urutan toolbar</h3>
+      <p class="tbs-hint">Tahan dan geser ikon titik-titik di kanan untuk memindah. Urutan dari atas = kiri ke kanan.</p>
+      <div class="tbs-list" id="tbs-list">${tbOrder().map((k) => `
+        <div class="tbs-row ${k.startsWith('sep') ? 'is-sep' : ''}" data-k="${k}">
+          <span class="tbs-ic">${tbIcon(k)}</span><span class="tbs-name">${esc(TB_LABEL[k])}</span>
+          <button class="tbs-grip" aria-label="Geser ${esc(TB_LABEL[k])}">${GRIP_ICON}</button>
+        </div>`).join('')}
+        <div class="tbs-row locked"><span class="tbs-ic">${ICON.more}</span><span class="tbs-name">Lainnya (⋮)</span><span class="tbs-lock" title="Selalu di ujung kanan">${ICON.lock}</span></div>
+      </div>
+      <div class="actions"><button class="btn ghost" id="tbs-reset">Urutan awal</button><button class="btn yellow" id="tbs-ok">Selesai</button></div>
+    </div>`);
+  const list = $('#tbs-list', s);
+  const order = () => $$('.tbs-row[data-k]', list).map((r) => r.dataset.k);
+  const save = () => { settings.toolbarOrder = order(); saveSettings(); applyToolbarOrder(settings.toolbarOrder); };
+  const bind = () => $$('.tbs-grip', list).forEach((g) => {
+    g.onpointerdown = (e) => {
+      e.preventDefault();
+      const row = g.closest('.tbs-row'), id = e.pointerId;
+      row.classList.add('dragging');
+      const sc = list.closest('.sheet') || s;
+      // dengar di window: memindah baris di DOM melepas pointer capture, jadi jangan bergantung padanya
+      const move = (ev) => {
+        if (ev.pointerId !== id) return;
+        ev.preventDefault();
+        // dekat tepi atas/bawah panel: gulir otomatis supaya bisa dipindah jauh
+        const r = sc.getBoundingClientRect();
+        if (ev.clientY < r.top + 48) sc.scrollTop -= 10; else if (ev.clientY > r.bottom - 48) sc.scrollTop += 10;
+        // tukar dengan tetangga selama jari sudah melewati setengah tingginya (bisa beberapa baris sekaligus)
+        for (let n = 0; n < 40; n++) {
+          const prev = row.previousElementSibling, next = row.nextElementSibling;
+          if (prev?.dataset.k && ev.clientY < prev.getBoundingClientRect().top + prev.offsetHeight / 2) list.insertBefore(row, prev);
+          else if (next?.dataset.k && ev.clientY > next.getBoundingClientRect().top + next.offsetHeight / 2) list.insertBefore(next, row);
+          else break;
+        }
+      };
+      const up = (ev) => {
+        if (ev.pointerId !== id) return;
+        window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up);
+        row.classList.remove('dragging'); save();
+      };
+      window.addEventListener('pointermove', move, { passive: false });
+      window.addEventListener('pointerup', up); window.addEventListener('pointercancel', up);
+    };
+    // keyboard: panah atas/bawah
+    g.onkeydown = (e) => {
+      const row = g.closest('.tbs-row');
+      if (e.key === 'ArrowUp' && row.previousElementSibling) { list.insertBefore(row, row.previousElementSibling); g.focus(); save(); e.preventDefault(); }
+      if (e.key === 'ArrowDown' && row.nextElementSibling?.dataset.k) { list.insertBefore(row.nextElementSibling, row); g.focus(); save(); e.preventDefault(); }
+    };
+  });
+  bind();
+  $('#tbs-reset', s).onclick = () => {
+    for (const k of TB_DEFAULT) list.insertBefore($(`.tbs-row[data-k="${k}"]`, list), $('.tbs-row.locked', list));
+    save(); toast('Urutan toolbar dikembalikan');
+  };
+  $('#tbs-ok', s).onclick = () => closeSheet();
+}
+
+function moreMenu(anchor) {
+  const pg = E.pages[E.cur];
+  popover(anchor, [
+    { label: 'Atur urutan toolbar', icon: 'pages', fn: toolbarSortSheet },
+    { label: 'Gestur & pintasan', icon: 'hand', fn: openGestureSettings },
+    '-',
+    { label: 'Tambah halaman', icon: 'addPage', fn: () => addPage() },
+    { label: 'Tambah halaman Monthly Plan', icon: 'today', fn: () => addPage({ tpl: 'monthly' }) },
+    { label: 'Cari kata di PDF', icon: 'search', fn: openFind },
+    { label: 'Ambil foto dari kamera', icon: 'image', fn: () => addPhoto('camera') },
+    { label: 'Sisipkan gambar jadi halaman', icon: 'image', fn: insertImages },
+    '-',
+    ...(E.pages.length >= 2 ? [
+      {
+        label: isSpreadActive() ? 'Tampilkan 1 halaman saja' : 'Tampilkan 2 halaman berdampingan (buku)',
+        icon: 'pages',
+        fn: () => {
+          const keep = E.cur; // tetap di halaman yang sama setelah ganti mode
+          E.spreadMode = isSpreadActive() ? 'single' : 'spread';
+          layout();
+          goToPage(keep);
+          toast(E.spreadMode === 'spread' ? 'Mode 2 Halaman (Buku)' : 'Mode 1 Halaman');
+          playPageFlip();
+        }
+      },
+      '-',
+    ] : []),
+    { label: 'Ganti kertas halaman ini', icon: 'note', fn: () => changePaper(false) },
+    { label: 'Ganti kertas semua halaman', icon: 'pages', fn: () => changePaper(true) },
+    ...(pg?.tpl === 'monthly' ? [
+      { label: 'Gaya Monthly Plan (font & warna)', icon: 'palette', fn: () => monthStyleSheet(pg) },
+      { label: 'Acak gaya', icon: 'dice', fn: () => { pg.style = randomStyle(); markDirty(pg); renderPage(pg); } },
+      { label: 'Atur bulan (Monthly Plan)', icon: 'today', fn: setMonth },
+    ] : []),
+    '-',
+    { label: 'Ekspor ke PDF', icon: 'pdf', fn: async () => { await flush(); exportNotebookPdf(E.nb, E.pages); } },
+    { label: 'Salin semua teks halaman ini', icon: 'copy', fn: () => { const pg = E.pages[E.cur]; const txt = [...pg.texts].sort((a, b) => (a.y - b.y) || (a.x - b.x)).map((t) => t.v).join('\n'); if (!txt.trim()) return toast('Belum ada teks di halaman ini'); copyText(txt); } },
+    { label: 'Bagikan halaman ini sebagai gambar', icon: 'image', fn: async () => { const pg = E.pages[E.cur]; await flush(); toast('Menyiapkan gambar…'); const t = pg.tpl === 'monthly' && pg.month ? 'Monthly Plan ' + monthTitle(pg.month) : (E.nb.title || 'Cherry') + ' hal ' + (E.cur + 1); await sharePageImage(pg, t); } },
+    { label: 'Hapus halaman ini', icon: 'trash', danger: true, fn: deletePage },
+  ]);
+}
+
+async function insertImages() {
+  const files = await pickFile('image/*', true);
+  if (!files?.length) return;
+  for (const f of files) { const pg = await imageFileToPage(f, E.nb.id); await addPage({ page: pg }); }
+}
+
+// ---------- Penghapus per area: potong coretan, sisakan bagian di luar lingkaran ----------
+function eraseStrokePart(st, x, y, r) {
+  const p = st.p, n = p.length / 3, rr = r + st.w / 2, rr2 = rr * rr;
+  if (n < 2 || st.fill) return [];
+  // rapatkan titik supaya potongan rapi (garis lurus dari Bentuk cuma 2 titik)
+  const step = Math.max(0.6, rr / 3), d = [];
+  for (let i = 0; i < n; i++) {
+    if (i) {
+      const ax = p[i * 3 - 3], ay = p[i * 3 - 2], bx = p[i * 3], by = p[i * 3 + 1], L = Math.hypot(bx - ax, by - ay);
+      const k = Math.floor(L / step);
+      for (let j = 1; j < k; j++) { const u = j / k; d.push(ax + (bx - ax) * u, ay + (by - ay) * u, p[i * 3 - 1] + (p[i * 3 + 2] - p[i * 3 - 1]) * u); }
+    }
+    d.push(p[i * 3], p[i * 3 + 1], p[i * 3 + 2]);
+  }
+  const out = []; let seg = [];
+  const push = () => { if (seg.length >= 6) out.push({ ...st, p: seg }); seg = []; };
+  for (let i = 0; i < d.length; i += 3) {
+    if ((d[i] - x) ** 2 + (d[i + 1] - y) ** 2 <= rr2) push(); else seg.push(d[i], d[i + 1], d[i + 2]);
+  }
+  push();
+  return out;
+}
+
+// ---------- Laso: pilih banyak sekaligus, lalu geser / ubah ukuran / putar / hapus ----------
+function inPoly(q, x, y) {
+  let c = false;
+  for (let i = 0, j = q.length - 2; i < q.length; j = i, i += 2) {
+    const xi = q[i], yi = q[i + 1], xj = q[j], yj = q[j + 1];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c;
+  }
+  return c;
+}
+function splitByPoly(st, q) {
+  const p = st.p, n = p.length / 3, inside = [], outside = [];
+  if (!n) return { inside, outside };
+  if (st.fill) { for (let i = 0; i < n; i++) if (inPoly(q, p[i * 3], p[i * 3 + 1])) return { inside: [st], outside: [] }; return { inside: [], outside: [st] }; }
+  const step = Math.max(0.8, st.w / 2), d = [];
+  for (let i = 0; i < n; i++) {
+    if (i) { const ax = p[i * 3 - 3], ay = p[i * 3 - 2], bx = p[i * 3], by = p[i * 3 + 1], k = Math.floor(Math.hypot(bx - ax, by - ay) / step);
+      for (let j = 1; j < k; j++) { const u = j / k; d.push(ax + (bx - ax) * u, ay + (by - ay) * u, p[i * 3 - 1]); } }
+    d.push(p[i * 3], p[i * 3 + 1], p[i * 3 + 2]);
+  }
+  let seg = [], inS = null;
+  const flush = () => { if (seg.length >= (n === 1 ? 3 : 6)) (inS ? inside : outside).push({ ...st, p: seg }); seg = []; };
+  for (let i = 0; i < d.length; i += 3) {
+    const f = inPoly(q, d[i], d[i + 1]);
+    if (inS !== null && f !== inS) { const lx = seg[seg.length - 3], ly = seg[seg.length - 2], lp = seg[seg.length - 1]; flush(); seg.push(lx, ly, lp); }
+    inS = f; seg.push(d[i], d[i + 1], d[i + 2]);
+  }
+  flush();
+  if (!inside.length) return { inside: [], outside: [st] };
+  if (!outside.length) return { inside: [st], outside: [] };
+  return { inside, outside };
+}
+function lassoSelect(pg, q) {
+  if (q.length < 8) return;
+  // laso bebas: coretan yang kena sebagian dipotong, bagian di dalam lingkaran ikut terpilih
+  const strokes = [];
+  const kept = [];
+  for (const st of pg.strokes) {
+    const parts = splitByPoly(st, q);
+    if (!parts.inside.length) { kept.push(st); continue; }
+    kept.push(...parts.outside); strokes.push(...parts.inside);
+  }
+  const corners = (b, r, cx, cy) => [[b.x, b.y], [b.x + b.w, b.y], [b.x, b.y + b.h], [b.x + b.w, b.y + b.h], [cx, cy]].map(([x, y]) => { const c = Math.cos(r), sn = Math.sin(r), dx = x - cx, dy = y - cy; return [cx + dx * c - dy * sn, cy + dx * sn + dy * c]; });
+  const touches = (pts) => pts.some(([x, y]) => inPoly(q, x, y));
+  const texts = pg.texts.filter((t) => { const b = textBox(t); return touches(corners(b, t.r || 0, b.x + b.w / 2, b.y + b.h / 2)); });
+  const items = (pg.items || []).filter((it) => touches(corners({ x: it.x - it.w / 2, y: it.y - it.h / 2, w: it.w, h: it.h }, it.r || 0, it.x, it.y)));
+  if (strokes.length || texts.length || items.length) { const before0 = snap(pg); pg.strokes = [...kept, ...strokes]; if (strokes.length) { pushUndo(before0); } }
+  if (!strokes.length && !texts.length && !items.length) { toast('Tidak ada yang terpilih'); return; }
+  groupSelect(pg, strokes, texts, items);
+}
+// pilih sekelompok coretan / teks / stiker → kotak geser, ubah ukuran, putar, hapus
+function groupSelect(pg, strokes, texts, items, e) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const grow = (a, b, c, d) => { x0 = Math.min(x0, a); y0 = Math.min(y0, b); x1 = Math.max(x1, c); y1 = Math.max(y1, d); };
+  for (const st of strokes) { const p = st.p, h = st.w / 2; for (let i = 0; i < p.length; i += 3) grow(p[i] - h, p[i + 1] - h, p[i] + h, p[i + 1] + h); }
+  for (const t of texts) { const b = textBox(t); grow(b.x, b.y, b.x + b.w, b.y + b.h); }
+  for (const it of items) { const R = Math.hypot(it.w, it.h) / 2; grow(it.x - R, it.y - R, it.x + R, it.y + R); }
+  const cx0 = (x0 + x1) / 2, cy0 = (y0 + y1) / 2, w0 = Math.max(1, x1 - x0);
+  // salinan asli: setiap perubahan dihitung dari sini, objek baru menggantikan yang lama (undo tetap utuh)
+  const S = strokes.map((st) => ({ o: st, cur: st })), T = texts.map((t) => ({ o: { ...t }, b: textBox(t), cur: t })), I = items.map((it) => ({ o: { ...it }, cur: it }));
+  const r = E.els.get(pg.id), k = () => parseFloat(r.el.style.width) / pg.w;
+  const box = createTransformBox(r.el);
+  let before = snap(pg);
+  sel = { pg, box, lasso: true };
+  const swap = (arr, a, b) => { const i = arr.indexOf(a); if (i >= 0) arr[i] = b; };
+  const kk0 = k();
+  box.attach({ x: x0 * kk0, y: y0 * kk0, w: (x1 - x0) * kk0, h: (y1 - y0) * kk0, r: 0 }, {
+    viewRot: () => E?.rot || 0,
+    min: 12, max: () => parseFloat(r.el.style.width) * 3,
+    onChange: (m) => {
+      const kk = k(), f = (m.w / kk) / w0, cs = Math.cos(m.r), sn = Math.sin(m.r);
+      const cx1 = (m.x + m.w / 2) / kk, cy1 = (m.y + m.h / 2) / kk;
+      const tf = (x, y) => { const dx = (x - cx0) * f, dy = (y - cy0) * f; return [cx1 + dx * cs - dy * sn, cy1 + dx * sn + dy * cs]; };
+      for (const e of S) {
+        const p = e.o.p, np = new Array(p.length);
+        for (let i = 0; i < p.length; i += 3) { const [a, b] = tf(p[i], p[i + 1]); np[i] = a; np[i + 1] = b; np[i + 2] = p[i + 2]; }
+        const nst = { ...e.o, p: np, w: e.o.w * f };
+        swap(pg.strokes, e.cur, nst); e.cur = nst;
+      }
+      for (const e of T) {
+        const o = e.o, nt = { ...o, z: o.z * f, r: (o.r || 0) + m.r };
+        if (o.lh) nt.lh = o.lh * f; if (o.w) nt.w = o.w * f; delete nt.a0; delete nt.ab;
+        const [ncx, ncy] = tf(e.b.x + e.b.w / 2, e.b.y + e.b.h / 2);
+        const b = textBox(nt); nt.x += ncx - (b.x + b.w / 2); nt.y += ncy - (b.y + b.h / 2);
+        swap(pg.texts, e.cur, nt); e.cur = nt;
+      }
+      for (const e of I) {
+        const [nx, ny] = tf(e.o.x, e.o.y);
+        const ni = { ...e.o, x: nx, y: ny, w: e.o.w * f, h: e.o.h * f, r: (e.o.r || 0) + m.r };
+        swap(pg.items, e.cur, ni); e.cur = ni;
+      }
+      queueRedraw(pg);
+    },
+    onCommit: () => { pushUndo(before); markDirty(pg); before = snap(pg); },
+    onDelete: () => {
+      const gone = new Set([...S, ...T, ...I].map((e) => e.cur));
+      pg.strokes = pg.strokes.filter((x) => !gone.has(x)); pg.texts = pg.texts.filter((x) => !gone.has(x)); pg.items = (pg.items || []).filter((x) => !gone.has(x));
+      pushUndo(before); markDirty(pg); drawInk(pg); sel = null; syncToolbar();
+    },
+  });
+  syncToolbar();
+  if (e) box.el.dispatchEvent(new PointerEvent("pointerdown", e));
+}
+
+// ---------- Cari kata di PDF (teks yang tersimpan saat PDF diimpor) ----------
+let FIND = null;
+function closeFind() { if (!FIND) return; FIND.bar.remove(); document.querySelectorAll('.find-hl').forEach((x) => x.remove()); FIND = null; }
+function openFind() {
+  if (FIND) { FIND.input.focus(); return; }
+  if (!E.pages.some((p) => p.pt?.length)) { toast(E.nb.pdfPending ? 'Teks PDF masih disiapkan di latar belakang. Coba lagi sebentar.' : 'Buku ini belum punya teks PDF. Impor ulang PDF-nya supaya bisa dicari.'); return; }
+  const bar = document.createElement('div');
+  bar.className = 'find-bar';
+  bar.innerHTML = '<input type="search" placeholder="Cari kata di PDF" enterkeyhint="search"><span class="find-n">0/0</span><button class="fb-prev" title="Sebelumnya">‹</button><button class="fb-next" title="Berikutnya">›</button><button class="fb-copy" title="Salin semua teks PDF">' + ICON.copy + '</button><button class="fb-x" title="Tutup">' + ICON.close + '</button>';
+  $('#editor').appendChild(bar);
+  const input = bar.querySelector('input'), nEl = bar.querySelector('.find-n');
+  FIND = { bar, input, hits: [], i: -1 };
+  const show = () => {
+    document.querySelectorAll('.find-hl').forEach((x) => x.remove());
+    FIND.hits.forEach((h, j) => {
+      const el = E.els.get(h.pg.id)?.el; if (!el) return;
+      const d = document.createElement('i');
+      d.className = 'find-hl' + (j === FIND.i ? ' on' : '');
+      Object.assign(d.style, { left: h.x / h.pg.w * 100 + '%', top: h.y / h.pg.h * 100 + '%', width: h.w / h.pg.w * 100 + '%', height: h.h / h.pg.h * 100 + '%' });
+      el.appendChild(d); h.el = d;
+    });
+    nEl.textContent = FIND.hits.length ? (FIND.i + 1) + '/' + FIND.hits.length : '0/0';
+    FIND.hits[FIND.i]?.el?.scrollIntoView({ block: 'center', inline: 'center', behavior: 'smooth' });
+  };
+  const run = () => {
+    const q = input.value.trim().toLowerCase(); FIND.hits = []; FIND.i = -1;
+    if (q.length >= 1) for (const pg of E.pages) for (const it of pg.pt || []) {
+      const low = it.s.toLowerCase(); let k = low.indexOf(q);
+      while (k >= 0) {
+        const L = it.s.length || 1;
+        FIND.hits.push({ pg, x: it.x + it.w * k / L, y: it.y, w: Math.max(4, it.w * q.length / L), h: it.h });
+        k = low.indexOf(q, k + q.length);
+      }
+    }
+    if (FIND.hits.length) FIND.i = 0;
+    show();
+  };
+  const go = (d) => { if (!FIND.hits.length) return; FIND.i = (FIND.i + d + FIND.hits.length) % FIND.hits.length; show(); };
+  let t; input.oninput = () => { clearTimeout(t); t = setTimeout(run, 180); };
+  input.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); go(e.shiftKey ? -1 : 1); } if (e.key === 'Escape') closeFind(); };
+  bar.querySelector('.fb-prev').onclick = () => go(-1);
+  bar.querySelector('.fb-next').onclick = () => go(1);
+  bar.querySelector('.fb-x').onclick = closeFind;
+  bar.querySelector('.fb-copy').onclick = () => copyText(E.pages.map((p) => pdfPageText(p)).filter(Boolean).join('\n\n'));
+  bar.addEventListener('pointerdown', (e) => e.stopPropagation());
+  input.focus();
+}
+function pdfPageText(pg) {
+  const its = pg.pt || []; let out = '', last = null;
+  for (const it of its) {
+    if (last) out += Math.abs(it.y - last.y) > last.h * 0.6 ? '\n' : (it.x - (last.x + last.w) > it.h * 0.15 && !/\s$/.test(out) ? ' ' : '');
+    out += it.s; last = it;
+  }
+  return out.trim();
+}
