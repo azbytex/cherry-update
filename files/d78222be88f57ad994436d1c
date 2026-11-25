@@ -1,0 +1,423 @@
+// Panel chatbot AI Groq di Editor: bisa mode mengambang (geser & ubah ukuran) atau split sidebar kanan.
+import { $, esc, ICON, toast, pickFile, blobToDataURL } from './ui.js';
+import { settings, saveSettings } from './db.js';
+import { tr } from './i18n.js';
+import { getGroqKey, setGroqKey, getGroqModel, pickVisionModel, fetchGroqModels, streamGroqChat, openGroqSettings } from './groq.js';
+import { formatChatMd, latexToPlain } from './mathfmt.js';
+
+const FLOAT_ICON = '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2.5"/><rect x="9" y="9" width="10" height="10" rx="1.8" fill="var(--card)"/><path d="M9 12h10"/></svg>';
+const SPLIT_ICON = '<svg viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M14.5 4.5v15"/></svg>';
+const CAM_ICON = '<svg viewBox="0 0 24 24"><path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h2l1.2-2h4.6l1.2 2h2A2.5 2.5 0 0 1 20 8.5v9A2.5 2.5 0 0 1 17.5 20h-11A2.5 2.5 0 0 1 4 17.5z"/><circle cx="12" cy="13" r="3.2"/></svg>';
+const CLIP_ICON = '<svg viewBox="0 0 24 24"><path d="M21.4 11.2l-9.2 9.2a5 5 0 0 1-7.1-7.1l9.2-9.2a3.3 3.3 0 0 1 4.7 4.7l-9.2 9.2a1.7 1.7 0 0 1-2.4-2.4l8.5-8.5"/></svg>';
+const CIRCLE_ASK_ICON = '<svg viewBox="0 0 24 24"><circle cx="11" cy="12" r="7.5" stroke-dasharray="3 2.5"/><path d="M18.5 3.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></svg>';
+export const AI_ICON = '<svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></svg>';
+
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+async function resizeImageFile(file, maxDim = 1280) {
+  try {
+    const bm = await createImageBitmap(file);
+    try {
+      const scale = Math.min(1, maxDim / Math.max(bm.width, bm.height));
+      const w = Math.max(1, Math.round(bm.width * scale));
+      const h = Math.max(1, Math.round(bm.height * scale));
+      const c = document.createElement('canvas'); c.width = w; c.height = h;
+      try {
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(bm, 0, 0, w, h);
+        let url = c.toDataURL('image/jpeg', 0.85);
+        if (url.length > 3_200_000) url = c.toDataURL('image/jpeg', 0.65);
+        return url;
+      } finally { c.width = c.height = 0; }
+    } finally { bm.close?.(); }
+  } catch {
+    return blobToDataURL(file);
+  }
+}
+
+function renderMd(raw) { return formatChatMd(raw); }
+
+export function createChatController({ editorEl, splitHost, getPageContext, getPageImage, onRequestCircle, onResolveDrop, onInsertText, onBeforeSplit, onLayoutChange, onToggle }) {
+  let open = false;
+  let useCtx = true;
+  let useImg = !!getPageImage;
+  let busy = false;
+  let abortCtrl = null;
+  let msgs = []; // { role: 'user'|'assistant', content: string, imgs?: string[], hasImg?: boolean }
+  let pendingImgs = []; // [{ url, label?, ctxText?, fromCircle? }]
+  let hideTemp = false;
+
+  const widget = document.createElement('div');
+  widget.className = 'chat-box in-split';
+  widget.tabIndex = -1;
+  widget.innerHTML = `
+    <div class="calc-head chat-head">
+      <span class="calc-title">${AI_ICON}<b>Asisten AI</b></span>
+      <div class="calc-acts">
+        <button type="button" class="calc-ib" id="chat-clear" title="Bersihkan obrolan">${ICON.trash}</button>
+        <button type="button" class="calc-ib" id="chat-close" title="Tutup">${ICON.close}</button>
+      </div>
+    </div>
+    <div class="chat-body" id="chat-body"></div>
+    <div class="chat-foot" id="chat-foot">
+      <div class="chat-ctx-row">
+        <button type="button" class="chip-opt chat-ctx on" id="chat-ctx">Pakai halaman ini</button>
+        <button type="button" class="chip-opt chat-ctx on" id="chat-img">${CAM_ICON}<span>Capture halaman</span></button>
+      </div>
+      <div class="chat-atts" id="chat-atts" hidden></div>
+      <div class="chat-inp-row">
+        <button type="button" class="chat-ib" id="chat-attach" title="Lampirkan gambar">${CLIP_ICON}</button>
+        <button type="button" class="chat-ib" id="chat-circle" title="Lingkari area di halaman">${CIRCLE_ASK_ICON}</button>
+        <textarea class="inp chat-inp" id="chat-inp" rows="1" placeholder="Tanya apa saja…"></textarea>
+        <button type="button" class="btn yellow chat-send" id="chat-send">Kirim</button>
+      </div>
+    </div>
+    <div class="calc-rz" data-chat-rz aria-hidden="true"></div>`;
+
+  const bodyEl = $('#chat-body', widget);
+  const footEl = $('#chat-foot', widget);
+  const attsEl = $('#chat-atts', widget);
+  const inpEl = $('#chat-inp', widget);
+  const sendBtn = $('#chat-send', widget);
+  const attachBtn = $('#chat-attach', widget);
+  const circleBtn = $('#chat-circle', widget);
+  const ctxBtn = $('#chat-ctx', widget);
+  const imgBtn = $('#chat-img', widget);
+  if (!getPageImage) imgBtn.hidden = true;
+  if (!onRequestCircle) circleBtn.hidden = true;
+  const shortModel = (m) => (m || '').split('/').pop();
+  const activeModel = () => ((pendingImgs.length || (useImg && getPageImage)) ? pickVisionModel() : getGroqModel());
+
+  const renderAtts = () => {
+    if (!pendingImgs.length) {
+      attsEl.hidden = true;
+      attsEl.innerHTML = '';
+      inpEl.placeholder = tr('Tanya apa saja…');
+      return;
+    }
+    attsEl.hidden = false;
+    inpEl.placeholder = tr('Tanya tentang gambar ini…');
+    attsEl.innerHTML = `
+      <div class="chat-att-list">${pendingImgs.map((it, i) => `
+        <div class="chat-att-thumb" title="${esc(it.label || tr('Gambar terlampir'))}">
+          <img src="${it.url}" alt="">
+          <button type="button" class="chat-att-rm" data-rm="${i}" title="Hapus lampiran">${ICON.close}</button>
+        </div>`).join('')}</div>
+      <div class="chat-att-q">
+        <button type="button" class="chip-opt ai-pri" data-aq="Baca bagian pada gambar ini dan jelaskan apa maksudnya dengan jelas.">Apa maksudnya?</button>
+        <button type="button" class="chip-opt" data-aq="Baca soal atau pertanyaan pada gambar ini secara teliti, lalu jawab beserta langkah penyelesaiannya.">Jawab soal</button>
+      </div>`;
+    attsEl.querySelectorAll('[data-rm]').forEach((b) => {
+      b.onclick = () => { pendingImgs.splice(+b.dataset.rm, 1); renderAtts(); };
+    });
+    attsEl.querySelectorAll('[data-aq]').forEach((b) => {
+      b.onclick = () => sendPrompt(b.dataset.aq);
+    });
+  };
+
+  const renderBody = async () => {
+    const key = await getGroqKey();
+    if (!key) {
+      footEl.hidden = true;
+      bodyEl.innerHTML = `
+        <div class="chat-setup">
+          <div class="chat-setup-ic">${AI_ICON}</div>
+          <h4>Masukkan API Key Groq</h4>
+          <p>Dapatkan key gratis di console.groq.com, lalu tempel di bawah. Key hanya disimpan di perangkat ini.</p>
+          <input class="inp" id="chat-key-inp" type="password" autocomplete="off" spellcheck="false" placeholder="gsk_...">
+          <button type="button" class="btn yellow" id="chat-key-save" style="width:100%">Simpan &amp; Mulai</button>
+        </div>`;
+      $('#chat-key-save', bodyEl).onclick = async () => {
+        const val = $('#chat-key-inp', bodyEl).value.trim();
+        if (!val) return toast('Tempel API key Groq dulu');
+        const btn = $('#chat-key-save', bodyEl);
+        btn.disabled = true; btn.textContent = tr('Memeriksa…');
+        try {
+          await fetchGroqModels(val);
+          await setGroqKey(val);
+          toast('API key Groq tersimpan');
+          renderBody();
+        } catch (e) {
+          toast(e.message || 'API key tidak valid');
+          btn.disabled = false; btn.textContent = tr('Simpan & Mulai');
+        }
+      };
+      return;
+    }
+
+    footEl.hidden = false;
+    renderAtts();
+    if (!msgs.length) {
+      bodyEl.innerHTML = `
+        <div class="chat-empty">
+          <p>Siap membantu! Tanyakan apa saja atau pilih pintasan cepat:</p>
+          <div class="chat-quick">
+            <button type="button" class="chip-opt" data-q="Rangkum isi halaman ini secara ringkas">Rangkum halaman ini</button>
+            <button type="button" class="chip-opt" data-q="Jelaskan poin-poin penting di halaman ini dengan bahasa sederhana">Jelaskan poin penting</button>
+            <button type="button" class="chip-opt" data-q="Buat 5 soal latihan singkat beserta jawabannya dari materi ini">Buat 5 soal latihan</button>
+          </div>
+        </div>`;
+      bodyEl.querySelectorAll('[data-q]').forEach((b) => {
+        b.onclick = () => sendPrompt(b.dataset.q);
+      });
+      return;
+    }
+
+    bodyEl.innerHTML = msgs.map((m, idx) => m.role === 'user'
+      ? `<div class="chat-msg user"><div class="chat-bub">${m.imgs?.length ? `<div class="chat-msg-imgs">${m.imgs.map((u) => `<img src="${u}" alt="">`).join('')}</div>` : m.hasImg ? `<span class="chat-cap-tag">${CAM_ICON}<span>Halaman di-capture</span></span>` : ''}${esc(m.content).replace(/\n/g, '<br>')}</div></div>`
+      : `<div class="chat-msg ai" data-mi="${idx}">
+          <div class="chat-bub">${m.content ? renderMd(m.content) : '<span class="chat-dots"><i></i><i></i><i></i></span>'}</div>
+          ${m.content && !m.streaming ? `<div class="chat-macts">
+            <button type="button" data-copy="${idx}">Salin</button>
+            <button type="button" data-ins="${idx}">+ Ke catatan</button>
+          </div>` : ''}
+        </div>`
+    ).join('');
+
+    bodyEl.querySelectorAll('.chat-msg-imgs img').forEach((im) => {
+      im.onclick = () => {
+        const ov = document.createElement('div');
+        ov.className = 'chat-zoom';
+        ov.innerHTML = `<img src="${im.src}" alt="">`;
+        ov.onclick = () => ov.remove();
+        document.body.appendChild(ov);
+      };
+    });
+    bodyEl.querySelectorAll('[data-copy]').forEach((b) => {
+      b.onclick = async () => {
+        const txt = latexToPlain(msgs[+b.dataset.copy]?.content || '');
+        try { await navigator.clipboard.writeText(txt); toast('Teks disalin'); } catch {}
+      };
+    });
+    bodyEl.querySelectorAll('[data-ins]').forEach((b) => {
+      b.onclick = () => {
+        const txt = latexToPlain(msgs[+b.dataset.ins]?.content || '');
+        if (txt) onInsertText?.(txt);
+      };
+    });
+    bodyEl.scrollTop = bodyEl.scrollHeight;
+  };
+
+  const syncSendBtn = () => {
+    sendBtn.textContent = tr(busy ? 'Stop' : 'Kirim');
+    sendBtn.classList.toggle('danger-btn', busy);
+    inpEl.disabled = busy;
+  };
+
+  const addFiles = async (fileList) => {
+    const files = [...(fileList || [])].filter((f) => f && (!f.type || f.type.startsWith('image/')));
+    if (!files.length) return;
+    for (const f of files) {
+      if (pendingImgs.length >= 3) { toast('Maksimal 3 gambar per pesan'); break; }
+      const url = await resizeImageFile(f);
+      if (url) pendingImgs.push({ url, label: f.name || 'Gambar terlampir' });
+    }
+    renderAtts();
+    inpEl.focus();
+  };
+
+  const sendPrompt = async (overrideText, extra = null) => {
+    if (busy) { abortCtrl?.abort(); return; }
+    const hasExplicit = !!(extra?.imgs?.length || pendingImgs.length);
+    let text = (overrideText ?? inpEl.value).trim();
+    if (!text && hasExplicit) text = 'Baca dan jelaskan maksud isi gambar yang dilampirkan ini.';
+    if (!text) return;
+    if (!overrideText) { inpEl.value = ''; inpEl.style.height = 'auto'; }
+
+    let sendImgs = [];
+    let fromCircle = false;
+    let extraCtx = '';
+    if (extra?.imgs?.length) {
+      sendImgs = extra.imgs.slice(0, 3);
+      fromCircle = !!extra.fromCircle;
+      extraCtx = (extra.ctxText || '').trim();
+    } else if (pendingImgs.length) {
+      sendImgs = pendingImgs.map((x) => x.url).slice(0, 3);
+      fromCircle = pendingImgs.some((x) => x.fromCircle);
+      extraCtx = pendingImgs.map((x) => x.ctxText).filter(Boolean).join('\n\n').trim();
+      pendingImgs = [];
+      renderAtts();
+    }
+
+    const wantPageImg = !sendImgs.length && !!(useImg && getPageImage);
+    const userMsg = { role: 'user', content: text, imgs: sendImgs, hasImg: wantPageImg && !sendImgs.length };
+    msgs.push(userMsg);
+    const aiMsg = { role: 'assistant', content: '', streaming: true };
+    msgs.push(aiMsg);
+    busy = true;
+    abortCtrl = new AbortController();
+    syncSendBtn();
+    await renderBody();
+
+    if (wantPageImg) {
+      try { const p = await getPageImage(); if (p) sendImgs = [p]; } catch {}
+      if (!sendImgs.length) userMsg.hasImg = false;
+    }
+    if (abortCtrl.signal.aborted || !msgs.includes(aiMsg)) {
+      aiMsg.streaming = false;
+      busy = false;
+      abortCtrl = null;
+      syncSendBtn();
+      await renderBody();
+      return;
+    }
+
+    const pageCtx = (useCtx && !fromCircle) ? (getPageContext?.() || '').trim() : '';
+    const combinedCtx = [extraCtx, pageCtx].filter(Boolean).join('\n\n');
+
+    let userPayload = text;
+    if (sendImgs.length) {
+      if (fromCircle) {
+        userPayload = combinedCtx
+          ? `[Teks di area yang dilingkari/dipilih]\n${combinedCtx.slice(0, 4000)}\n\n[Pertanyaan (fokus pada bagian yang dilingkari di gambar terlampir)]\n${text}`
+          : `[Fokus baca bagian yang dilingkari di gambar lampiran ini]\n\n[Pertanyaan]\n${text}`;
+      } else if (wantPageImg) {
+        userPayload = combinedCtx
+          ? `[Teks halaman saat ini]\n${combinedCtx.slice(0, 6000)}\n\n[Pertanyaan (lihat juga gambar capture halaman terlampir)]\n${text}`
+          : `[Baca isi, tulisan, atau soal dari gambar capture halaman catatan saat ini]\n\n[Pertanyaan]\n${text}`;
+      } else {
+        userPayload = combinedCtx
+          ? `[Konteks catatan]\n${combinedCtx.slice(0, 5000)}\n\n[Pertanyaan tentang gambar terlampir]\n${text}`
+          : text;
+      }
+    } else if (combinedCtx) {
+      userPayload = `[Isi halaman saat ini]\n${combinedCtx.slice(0, 6000)}\n\n[Pertanyaan]\n${text}`;
+    }
+    userMsg.apiContent = userPayload;
+
+    const history = msgs.slice(-9, -2).map((m) => ({ role: m.role, content: m.apiContent || m.content }));
+    const curApiMsg = sendImgs.length
+      ? { role: 'user', content: [{ type: 'text', text: userPayload }, ...sendImgs.map((url) => ({ type: 'image_url', image_url: { url } }))] }
+      : { role: 'user', content: userPayload };
+    const sysPrompt = 'Kamu asisten belajar yang ramah dan teliti di aplikasi catatan Cherry. Jika diberikan gambar (lampiran, capture halaman, atau area yang dilingkari merah putus-putus), baca semua tulisan tangan, teks cetak/PDF, rumus, tabel, diagram, dan nomor soal dengan cermat sebelum menjawab. Untuk penulisan hitung atau matematika: gunakan cara biasa yang langsung enak dibaca seperti buku catatan (pakai simbol standar seperti ×, ÷, ±, ², ³, √, ≤, ≥, ≠, °, π; tulis angka dan perbandingan biasa seperti "23 > 12", "a > b", "3³ - 4 = 23" tanpa membungkusnya dengan kode LaTeX \\( \\)). Jawab ringkas, jelas, dan dalam bahasa yang sama dengan pertanyaan pengguna.';
+
+    const runStream = (model, lastMsg) => streamGroqChat({
+      model,
+      messages: [{ role: 'system', content: sysPrompt }, ...history, lastMsg],
+      signal: abortCtrl.signal,
+      onDelta: (_, full) => {
+        aiMsg.content = full;
+        const bub = bodyEl.querySelector(`.chat-msg[data-mi="${msgs.length - 1}"] .chat-bub`);
+        if (bub) { bub.innerHTML = renderMd(full); bodyEl.scrollTop = bodyEl.scrollHeight; }
+      },
+    });
+
+    try {
+      const model = sendImgs.length ? pickVisionModel() : getGroqModel();
+      try {
+        await runStream(model, curApiMsg);
+      } catch (e) {
+        if (sendImgs.length && combinedCtx && e.name !== 'AbortError' && !aiMsg.content && /image|vision|model|multimodal|not found|decommissioned/i.test(e.message || '')) {
+          userMsg.hasImg = false;
+          await runStream(getGroqModel(), { role: 'user', content: userPayload });
+        } else {
+          throw e;
+        }
+      }
+      if (!aiMsg.content) aiMsg.content = '(Tidak ada jawaban)';
+    } catch (e) {
+      if (e.name === 'AbortError') aiMsg.content = aiMsg.content || '(Dihentikan)';
+      else {
+        aiMsg.content = `⚠️ ${e.message || 'Gagal terhubung ke Groq'}`;
+      }
+    } finally {
+      aiMsg.streaming = false;
+      busy = false;
+      abortCtrl = null;
+      syncSendBtn();
+      await renderBody();
+    }
+  };
+
+  sendBtn.onclick = () => sendPrompt();
+  attachBtn.onclick = async () => { const files = await pickFile('image/*', true); if (files?.length) await addFiles(files); };
+  circleBtn.onclick = () => onRequestCircle?.();
+  inpEl.addEventListener('paste', (e) => {
+    const files = [...(e.clipboardData?.files || [])].filter((f) => f.type?.startsWith('image/'));
+    if (files.length) { e.preventDefault(); addFiles(files); }
+  });
+  widget.addEventListener('dragover', (e) => { if (e.dataTransfer?.types?.includes('Files') || e.dataTransfer?.types?.includes('application/x-cherry-capture')) e.preventDefault(); });
+  widget.addEventListener('drop', (e) => {
+    const custom = onResolveDrop?.(e);
+    if (custom?.url) { e.preventDefault(); attachImages([custom]); return; }
+    const files = [...(e.dataTransfer?.files || [])].filter((f) => f.type?.startsWith('image/'));
+    if (files.length) { e.preventDefault(); addFiles(files); }
+  });
+  inpEl.oninput = () => { inpEl.style.height = 'auto'; inpEl.style.height = Math.min(110, inpEl.scrollHeight) + 'px'; };
+  inpEl.onkeydown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+  };
+  ctxBtn.onclick = () => { useCtx = !useCtx; ctxBtn.classList.toggle('on', useCtx); };
+  imgBtn.onclick = () => { useImg = !useImg; imgBtn.classList.toggle('on', useImg); };
+  $('#chat-clear', widget).onclick = () => {
+    if (busy) abortCtrl?.abort();
+    msgs = [];
+    pendingImgs = [];
+    renderAtts();
+    renderBody();
+  };
+  $('#chat-close', widget).onclick = () => close();
+
+  const syncMount = async () => {
+    widget.classList.add('in-split');
+    onToggle?.(open);
+
+    if (!open || hideTemp) {
+      if (widget.parentElement === splitHost) {
+        splitHost.classList.remove('open', 'wide-split');
+        widget.remove();
+      }
+      onLayoutChange?.();
+      return;
+    }
+    await renderBody();
+    renderAtts();
+    onBeforeSplit?.();
+    splitHost.appendChild(widget);
+    splitHost.classList.add('wide-split');
+    requestAnimationFrame(() => splitHost.classList.add('open'));
+    setTimeout(() => onLayoutChange?.(), 290);
+  };
+
+  const setMode = () => { syncMount(); };
+  const openPanel = async () => { hideTemp = false; open = true; await syncMount(); };
+  const toggle = () => { hideTemp = false; open = !open; syncMount(); return open; };
+  const close = () => { hideTemp = false; if (!open) return; open = false; syncMount(); };
+  const closeIfSplit = () => { if (open) close(); };
+  const setTempHidden = (v) => {
+    hideTemp = !!v;
+    if (open) syncMount();
+  };
+  const attachImages = async (items) => {
+    if (!items?.length) return;
+    for (const it of items) {
+      if (pendingImgs.length >= 3) { toast('Maksimal 3 gambar per pesan'); break; }
+      if (it?.url) pendingImgs.push(it);
+    }
+    await openPanel();
+    renderAtts();
+    inpEl.focus();
+  };
+  const askWithImage = async ({ url, label, ctxText, prompt } = {}) => {
+    if (!url) return;
+    const key = await getGroqKey();
+    if (!key) {
+      await attachImages([{ url, label: label || 'Area dilingkari', ctxText: ctxText || '', fromCircle: true }]);
+      toast('API key belum diisi');
+      return;
+    }
+    await openPanel();
+    await sendPrompt(prompt || 'Baca bagian yang dilingkari di gambar ini, lalu jelaskan apa maksudnya dengan jelas.', {
+      imgs: [url],
+      ctxText: ctxText || '',
+      fromCircle: true,
+      label,
+    });
+  };
+  const destroy = () => { abortCtrl?.abort(); pendingImgs = []; open = false; widget.remove(); };
+  const isOpen = () => open;
+
+  return { toggle, close, closeIfSplit, destroy, isOpen, setMode, openPanel, attachImages, askWithImage, setTempHidden };
+}
