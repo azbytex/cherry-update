@@ -1,0 +1,292 @@
+import { db, settings, saveSettings, STORES } from './db.js';
+import { $, $$, esc, ICON, toast, confirmDialog, pickFile, openSheet, closeSheet } from './ui.js';
+import { customize, upcomingCount } from './calendar.js';
+import { todoStats } from './todo.js';
+import { state } from './notebooks.js';
+import { exportBackup, importBackup } from './io.js';
+import { applyTheme } from './app.js';
+import { reschedule, ensurePermission, testNotification } from './notify.js';
+import { hasPin, changePin, removePin } from './lock.js';
+import { LANGS } from './i18n.js';
+import { modelStatus, ensureScribbleReady, removeModel, scribLangName } from './scribble.js';
+import { state as nbState, saveNotebook } from './notebooks.js';
+import { checkUpdate, versionInfo } from './updater.js';
+import { openGestureSettings } from './gestures.js';
+import { getGroqKey, getGroqModel, maskKey, openGroqSettings } from './groq.js';
+import { getGcalUrl, setGcalUrl, getGcalBridgeUrl, setGcalBridgeUrl, getAppsScriptCode, testGcalBridge, syncGcal, gcalLastSync } from './calendar.js';
+
+let root, _drawn = false;
+let _syncAsync = () => {};
+export function initSettings(el) { root = el; }
+
+function statsData() {
+  const nbs = state.notebooks.filter((n) => !n.trashed);
+  const daily = nbs.filter((n) => n.kind === 'day' || n.kind === 'month').length;
+  const pages = nbs.reduce((a, n) => a + n.pageIds.length, 0);
+  const td = todoStats();
+  const pct = td.total ? Math.round((td.done / td.total) * 100) : 0;
+  return { ev: upcomingCount(), td, pct, books: nbs.length, folders: state.folders.length, pages, daily };
+}
+
+function updateSummaryStats() {
+  if (!root || !_drawn) return;
+  const d = statsData();
+  const set = (id, v) => { const el = $(id, root); if (el) el.textContent = v; };
+  set('#st-ev', d.ev);
+  set('#st-td', d.td.open);
+  set('#st-td-sub', d.td.total ? `${d.td.done}/${d.td.total} selesai (${d.pct}%)` : 'Belum ada tugas');
+  const bar = $('#st-td-bar', root);
+  if (bar) bar.style.width = `${d.pct}%`;
+  set('#st-bk', d.books);
+  set('#st-bk-sub', `${d.folders} folder`);
+  set('#st-pg', d.pages);
+  set('#st-pg-sub', `${d.daily} catatan harian`);
+}
+
+export function renderSettings(force = false) {
+  if (!root) return;
+  if (!force && _drawn) {
+    updateSummaryStats();
+    _syncAsync();
+    return;
+  }
+  // ganti pengaturan: tampilan diperbarui di tempat, posisi gulir tetap (tidak loncat ke atas)
+  const keep = root.isConnected && root.childElementCount ? [root, ...root.querySelectorAll("*")].filter((x) => x.scrollTop > 0).map((x) => [x.className, x === root, x.scrollTop]) : null;
+  drawSettings();
+  _drawn = true;
+  if (keep) { root.classList.add("still"); setTimeout(() => root.classList.remove("still"), 500); for (const [cls, isRoot, top] of keep) { const el = isRoot ? root : [...root.querySelectorAll("*")].find((x) => x.className === cls && x.scrollHeight > x.clientHeight); if (el) el.scrollTop = top; } }
+}
+function drawSettings() {
+  const s = settings;
+  const d = statsData();
+  const opt = (key, val, label) => `<button class="chip-opt ${s[key] === val ? 'on' : ''}" data-k="${key}" data-v='${JSON.stringify(val)}'>${label}</button>`;
+  root.innerHTML = `
+    <div class="topbar"><div class="title">Saya</div></div>
+    <div class="scroll"><div class="pad" style="max-width:720px">
+      <div class="brand"><img src="assets/logo/logo_cherry_tulisan.svg" alt="Cherry"></div>
+
+      <div class="h2">Ringkasan</div>
+      <div class="s-bento">
+        <div class="s-stat" style="--st-c:var(--cal)">
+          <div class="s-stat-top"><span class="s-stat-ic"><svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M8 3v4M16 3v4"/><path d="M9 12h6"/></svg></span><span class="s-stat-lbl">Acara</span></div>
+          <div class="s-stat-val" id="st-ev">${d.ev}</div>
+          <div class="s-stat-sub">Jadwal mendatang</div>
+        </div>
+        <div class="s-stat" style="--st-c:#16a34a">
+          <div class="s-stat-top"><span class="s-stat-ic"><svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="17" height="17" rx="3"/><path d="M8 12l3 3 5-6"/></svg></span><span class="s-stat-lbl">Tugas aktif</span></div>
+          <div class="s-stat-val" id="st-td">${d.td.open}</div>
+          <div class="s-stat-bar"><i id="st-td-bar" style="width:${d.pct}%"></i></div>
+          <div class="s-stat-sub" id="st-td-sub">${d.td.total ? `${d.td.done}/${d.td.total} selesai (${d.pct}%)` : 'Belum ada tugas'}</div>
+        </div>
+        <div class="s-stat" style="--st-c:#d97706">
+          <div class="s-stat-top"><span class="s-stat-ic"><svg viewBox="0 0 24 24"><rect x="4.5" y="4.5" width="15" height="16.5" rx="2.5"/><path d="M9 3h6v3H9z"/><path d="M8.5 11h7M8.5 15h5"/></svg></span><span class="s-stat-lbl">Buku catatan</span></div>
+          <div class="s-stat-val" id="st-bk">${d.books}</div>
+          <div class="s-stat-sub" id="st-bk-sub">${d.folders} folder</div>
+        </div>
+        <div class="s-stat" style="--st-c:#8b5cf6">
+          <div class="s-stat-top"><span class="s-stat-ic">${ICON.pages}</span><span class="s-stat-lbl">Total halaman</span></div>
+          <div class="s-stat-val" id="st-pg">${d.pages}</div>
+          <div class="s-stat-sub" id="st-pg-sub">${d.daily} catatan harian</div>
+        </div>
+      </div>
+
+      <div class="h2">Tampilan</div>
+      <div class="s-group">
+        <div class="row"><div class="grow">Bahasa · Language</div><div class="chips">${Object.entries(LANGS).map(([k, v]) => `<button class="chip-opt ${(s.lang || 'id') === k ? 'on' : ''}" data-lang="${k}">${v}</button>`).join('')}</div></div>
+        <div class="row"><div class="grow">Tema</div><div class="chips">${opt('theme', 'light', 'Terang')}${opt('theme', 'dark', 'Gelap')}${opt('theme', 'system', 'Ikuti HP')}</div></div>
+        <div class="row click" id="s-cal"><div class="grow">Sesuaikan kalender<div class="sub">Warna, awal minggu, gaya tanggal & acara</div></div>${ICON.fwd.replace('<svg', '<svg width="20" height="20"')}</div>
+      </div>
+
+      <div class="h2">Menulis &amp; Sensasi</div>
+      <div class="s-group">
+        <div class="row"><div class="grow">Suara alat tulis (ASMR)<div class="sub">Efek suara kertas, stiker, dan coretan</div></div><div class="chips">${opt('soundFx', true, 'Aktif')}${opt('soundFx', false, 'Mati')}</div></div>
+        <div class="row"><div class="grow">Mode stylus<div class="sub">Stylus menulis, jari menggeser dan zoom</div></div><div class="chips">${opt('stylusOnly', false, 'Mati')}${opt('stylusOnly', true, 'Aktif')}</div></div>
+        <div class="row"><div class="grow">Haluskan coretan<div class="sub">Meredam getaran tangan saat menulis dan menggambar</div></div><div class="chips">${opt('smooth', 0, 'Mati')}${opt('smooth', 1, 'Halus')}${opt('smooth', 2, 'Sangat halus')}</div></div>
+        <div class="row click" id="s-gestures">${ICON.hand.replace('<svg', '<svg width="22" height="22"')}<div class="grow">Gestur &amp; pintasan<div class="sub">Ketuk 2 jari, 3 jari, dan ketuk ganda di editor catatan</div></div>${ICON.fwd.replace('<svg', '<svg width="20" height="20"')}</div>
+      </div>
+
+      <div class="h2">Notifikasi</div>
+      <div class="s-group">
+        <div class="row"><div class="grow">Pengingat acara<div class="sub">Sesuai pilihan "Ingatkan" di tiap acara</div></div><div class="chips">${opt('notifEvents', false, 'Mati')}${opt('notifEvents', true, 'Aktif')}</div></div>
+        <div class="row"><div class="grow">Ringkasan pagi<div class="sub">Acara & to-do hari itu, jam <input type="time" id="s-dtime" class="inp-time" value="${s.notifDailyTime || '07:00'}"></div></div><div class="chips">${opt('notifDaily', false, 'Mati')}${opt('notifDaily', true, 'Aktif')}</div></div>
+        <div class="row"><div class="grow">Pengingat cadangan<div class="sub">Kalau sudah 30 hari belum mencadangkan</div></div><div class="chips">${opt('notifBackup', false, 'Mati')}${opt('notifBackup', true, 'Aktif')}</div></div>
+        <div class="row click" id="s-ntest">${ICON.note.replace('<svg', '<svg width="22" height="22"')}<div class="grow">Coba notifikasi<div class="sub">Kirim contoh notifikasi sekarang</div></div></div>
+      </div>
+
+      <div class="h2">Integrasi &amp; AI</div>
+      <div class="s-group">
+        <div class="row" id="s-scr"><div class="grow">Pengenal tulisan tangan (Scribble)<div class="sub" id="s-scr-sub">Memeriksa…</div></div><div class="chips" id="s-scr-act"></div></div>
+        <div class="row click" id="s-groq">${ICON.ai.replace('<svg', '<svg width="22" height="22"')}<div class="grow">Groq AI (API Key)<div class="sub" id="s-groq-sub">Memeriksa…</div></div>${ICON.fwd.replace('<svg', '<svg width="20" height="20"')}</div>
+        <div class="row click" id="s-gcal"><svg width="22" height="22" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M8 3v4M16 3v4"/><path class="acc" d="M9 11.5h6"/></svg><div class="grow">Sinkronisasi Google Calendar<div class="sub" id="s-gcal-sub">Belum dikonfigurasi</div></div>${ICON.fwd.replace('<svg', '<svg width="20" height="20"')}</div>
+      </div>
+
+      <div class="h2">Keamanan</div>
+      <div class="s-group">
+        <div class="row click" id="s-pin">${ICON.lock.replace('<svg', '<svg width="22" height="22"')}<div class="grow">${hasPin() ? 'Ganti PIN' : 'Buat PIN'}<div class="sub">${hasPin() ? 'PIN untuk buku catatan yang dikunci' : 'Kunci buku catatan lewat menu buku: Kunci dengan PIN'}</div></div></div>
+        ${hasPin() ? `<div class="row click" id="s-pinoff">${ICON.unlock.replace('<svg', '<svg width="22" height="22"')}<div class="grow">Hapus PIN<div class="sub">Semua buku yang terkunci akan terbuka</div></div></div>` : ''}
+      </div>
+
+      <div class="h2">Data &amp; Cadangan</div>
+      <p style="color:var(--soft);font-size:13px;margin:0 0 10px;line-height:1.5">Catatanmu tersimpan di HP ini saja. Buat cadangan sebelum ganti HP atau hapus aplikasi.</p>
+      <div class="s-group">
+        <div class="row click" id="s-backup">${ICON.copy.replace('<svg', '<svg width="22" height="22"')}<div class="grow">Buat cadangan<div class="sub">Simpan semua catatan, kalender & to-do ke satu file</div></div></div>
+        <div class="row click" id="s-restore">${ICON.restore.replace('<svg', '<svg width="22" height="22"')}<div class="grow">Pulihkan dari cadangan<div class="sub">Mengganti data saat ini dengan isi file cadangan</div></div></div>
+        <div class="row click" id="s-wipe" style="color:var(--danger)">${ICON.trash.replace('<svg', '<svg width="22" height="22"')}<div class="grow">Hapus semua data</div></div>
+      </div>
+
+      <div class="h2">Tentang</div>
+      <div class="s-group">
+        <div class="row" id="s-upd"><div class="grow">Pembaruan aplikasi<div class="sub" id="s-upd-sub">Memeriksa versi…</div></div><div class="chips"><button class="chip-opt" id="s-upd-btn">Cek update</button></div></div>
+      </div>
+
+      <p style="color:var(--muted);font-size:12px;text-align:center;margin-top:30px" id="s-ver">Cherry</p>
+    </div></div>`;
+  $$('[data-k]', root).forEach((b) => b.onclick = () => {
+    const k = b.dataset.k, v = JSON.parse(b.dataset.v);
+    s[k] = v; saveSettings(); applyTheme(); renderSettings(true);
+    if (k.startsWith('notif')) { if (v) ensurePermission().then(reschedule); else reschedule(); }
+  });
+  $$('[data-lang]', root).forEach((b) => b.onclick = async () => { if ((s.lang || 'id') === b.dataset.lang) return; s.lang = b.dataset.lang; await saveSettings(); location.reload(); });
+  $('#s-upd-btn', root).onclick = () => checkUpdate();
+  versionInfo().then((v) => {
+    const sub = $('#s-upd-sub', root), ver = $('#s-ver', root); if (!sub) return;
+    const label = v.web || v.app;
+    ver.textContent = 'Cherry ' + label;
+    sub.textContent = !v.enabled ? (v.app ? 'Alamat update belum diatur' : 'Tersedia di aplikasi Android') : `Versi ${label}${v.updated ? ' (diperbarui online)' : ''}. Dicek otomatis saat dibuka.`;
+  });
+  (async () => {
+    const st = await modelStatus(), sub = $('#s-scr-sub', root), act = $('#s-scr-act', root); if (!sub) return;
+    if (st === 'unsupported') { sub.textContent = 'Tersedia di aplikasi Android'; return; }
+    if (st === 'ready') {
+      sub.textContent = scribLangName() + ' sudah terunduh. Jalan tanpa internet.';
+      act.innerHTML = '<button class="chip-opt" id="s-scr-del">Hapus</button>';
+      $('#s-scr-del', root).onclick = async () => { if (await confirmDialog('Hapus pengenal tulisan tangan dari HP ini? Bisa diunduh lagi kapan saja (sekitar 20 MB).', { ok: 'Hapus', danger: true })) { await removeModel(); toast('Pengenal tulisan dihapus'); renderSettings(true); } };
+    } else {
+      sub.textContent = 'Belum diunduh. Sekitar 20 MB, sekali saja.';
+      act.innerHTML = '<button class="chip-opt on" id="s-scr-get">Unduh</button>';
+      $('#s-scr-get', root).onclick = async () => { await ensureScribbleReady(true); renderSettings(true); };
+    }
+  })();
+  $('#s-pin', root).onclick = async () => { await changePin(); renderSettings(true); };
+  $('#s-pinoff', root)?.addEventListener('click', async () => { await removePin(async () => { for (const n of nbState.notebooks) if (n.locked) { n.locked = false; await saveNotebook(n); } }); renderSettings(true); });
+  $('#s-dtime', root).onchange = (e) => { s.notifDailyTime = e.target.value || '07:00'; saveSettings(); reschedule(); };
+  $('#s-ntest', root).onclick = async () => { if (!(await testNotification())) toast('Izinkan notifikasi untuk Cherry di pengaturan HP'); };
+  $('#s-cal', root).onclick = customize;
+  $('#s-gestures', root).onclick = openGestureSettings;
+  const syncGroqSub = async () => {
+    const sub = $('#s-groq-sub', root); if (!sub) return;
+    const k = await getGroqKey();
+    sub.textContent = k ? `${maskKey(k)} · ${getGroqModel()}` : 'Belum diatur — tempel API key Groq kamu';
+  };
+  syncGroqSub();
+  $('#s-groq', root).onclick = () => openGroqSettings(syncGroqSub);
+
+  // Google Calendar iCal sync
+  const syncGcalSub = async () => {
+    const sub = $('#s-gcal-sub', root); if (!sub) return;
+    const url = getGcalUrl(), br = getGcalBridgeUrl();
+    if (!url && !br) { sub.textContent = 'Belum dikonfigurasi — tempel URL iCal Google Calendar kamu'; return; }
+    const ts = await gcalLastSync();
+    const ago = ts ? Math.round((Date.now() - ts) / 60000) : null;
+    const mode = br ? '2 Arah Aktif' : 'Hanya-baca (iCal)';
+    sub.textContent = `${mode}`
+      + (ago !== null ? ` · Sync ${ago < 1 ? 'baru saja' : ago + ' mnt lalu'}` : '');
+  };
+  syncGcalSub();
+  _syncAsync = () => { syncGroqSub(); syncGcalSub(); };
+  $('#s-gcal', root).onclick = () => openGcalSettings(syncGcalSub);
+  $('#s-backup', root).onclick = exportBackup;
+  $('#s-restore', root).onclick = async () => {
+    const f = await pickFile('application/json,.json'); if (!f) return;
+    if (await confirmDialog('Data saat ini akan diganti dengan isi file cadangan. Lanjutkan?', { ok: 'Pulihkan', danger: true })) importBackup(f);
+  };
+  $('#s-wipe', root).onclick = async () => {
+    if (!(await confirmDialog('Hapus SEMUA catatan, acara kalender, dan to-do? Tindakan ini tidak bisa dibatalkan.', { ok: 'Hapus semua', danger: true }))) return;
+    for (const st of STORES) if (st !== 'kv') await db.clear(st);
+    toast('Semua data dihapus'); setTimeout(() => location.reload(), 600);
+  };
+}
+
+/** Sheet pengaturan Google Calendar iCal + Bridge 2 Arah */
+function openGcalSettings(onDone) {
+  const cur = getGcalUrl();
+  const curBridge = getGcalBridgeUrl();
+  const s = openSheet(`
+    <h3>Google Calendar</h3>
+    <div class="field">
+      <label>1. URL iCal (Baca acara dari Google)</label>
+      <textarea class="inp" id="gcal-url" rows="2" placeholder="https://calendar.google.com/calendar/ical/…/basic.ics" style="font-size:12px;word-break:break-all">${esc(cur)}</textarea>
+      <small style="color:var(--soft);font-size:12px">calendar.google.com → ⚙ Pengaturan → nama kalender → "Secret address in iCal format"</small>
+    </div>
+
+    <div class="field" style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line)">
+      <label>2. Sinkronisasi 2 Arah (Edit &amp; Hapus ke Google)</label>
+      <textarea class="inp" id="gcal-bridge" rows="2" placeholder="https://script.google.com/macros/s/…/exec" style="font-size:12px;word-break:break-all">${esc(curBridge)}</textarea>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+        <button type="button" class="btn ghost" id="gcal-copy-code" style="font-size:12px;padding:6px 10px">Salin Kode Apps Script</button>
+        <button type="button" class="btn ghost" id="gcal-test" style="font-size:12px;padding:6px 10px">Tes Koneksi</button>
+      </div>
+      <details style="margin-top:8px;font-size:12px;color:var(--soft);line-height:1.55">
+        <summary style="cursor:pointer;color:var(--ink)">Cara pasang Apps Script (1x saja)</summary>
+        <ol style="margin:6px 0 0 18px;padding:0">
+          <li>Klik <b>Salin Kode Apps Script</b> di atas.</li>
+          <li>Buka <b>script.google.com</b> → klik <b>New project</b>.</li>
+          <li>Hapus isi default, tempel kode tadi, lalu simpan.</li>
+          <li>Klik <b>Deploy → New deployment → Web app</b>.</li>
+          <li><b>Execute as</b>: Me · <b>Who has access</b>: Anyone → Deploy &amp; izinkan akses kalender.</li>
+          <li>Salin <b>Web app URL</b> (<code>/exec</code>) lalu tempel di kolom atas.</li>
+        </ol>
+      </details>
+    </div>
+
+    <div class="actions">
+      <button class="btn ghost" id="gcal-clear" ${(cur || curBridge) ? '' : 'disabled'}>Hapus</button>
+      <button class="btn ghost" id="gcal-cancel">Batal</button>
+      <button class="btn primary" id="gcal-save">Simpan &amp; Sinkronkan</button>
+    </div>`);
+  setTimeout(() => $('#gcal-url', s)?.focus(), 60);
+  $('#gcal-cancel', s).onclick = () => closeSheet();
+  $('#gcal-copy-code', s).onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(getAppsScriptCode());
+      toast('Kode Apps Script disalin! Tempel di script.google.com');
+    } catch {
+      toast('Gagal menyalin otomatis');
+    }
+  };
+  $('#gcal-test', s).onclick = async () => {
+    const br = ($('#gcal-bridge', s).value || '').trim();
+    if (!br) { toast('Tempel URL Web App Apps Script dulu'); return; }
+    await setGcalBridgeUrl(br);
+    toast('Menguji koneksi…');
+    const r = await testGcalBridge();
+    if (r.ok) toast(`Terhubung ke kalender: ${r.calendar || 'OK'}`);
+    else toast('Gagal terhubung: ' + (r.error || 'periksa URL / deployment'));
+  };
+  $('#gcal-clear', s).onclick = async () => {
+    await setGcalUrl('');
+    await setGcalBridgeUrl('');
+    await syncGcal({ silent: true });
+    closeSheet(); onDone?.(); toast('Pengaturan Google Calendar dihapus');
+  };
+  $('#gcal-save', s).onclick = async () => {
+    const url = ($('#gcal-url', s).value || '').trim();
+    const br = ($('#gcal-bridge', s).value || '').trim();
+    if (url && !url.includes('calendar.google.com') && !url.endsWith('.ics')) {
+      toast('URL iCal tidak terlihat valid. Periksa kembali.'); return;
+    }
+    if (br && !br.includes('script.google.com')) {
+      toast('URL Bridge harus berupa Web App URL dari script.google.com'); return;
+    }
+    await setGcalUrl(url);
+    await setGcalBridgeUrl(br);
+    closeSheet(); onDone?.();
+    if (url) {
+      toast('Menyinkronkan…');
+      const r = await syncGcal();
+      if (r.ok) onDone?.();
+    } else if (br) {
+      toast('Bridge 2 arah disimpan');
+    }
+  };
+}
