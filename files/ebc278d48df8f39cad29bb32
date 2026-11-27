@@ -1,0 +1,197 @@
+// Pengaturan & pengenalan gestur sentuhan di Editor (ketuk 2 jari, 3 jari, ketuk 1 ganda).
+import { settings, saveSettings } from './db.js';
+import { $, $$, ICON, openSheet, closeSheet } from './ui.js';
+
+export const DEFAULT_GESTURES = {
+  tap2: 'undo',
+  tap3: 'redo',
+  dbl1: 'none',
+};
+
+export function getGestures() {
+  return { ...DEFAULT_GESTURES, ...(settings.gestures || {}) };
+}
+
+const ACTIONS = [
+  ['undo', 'Undo'],
+  ['redo', 'Redo'],
+  ['prevPage', 'Halaman sebelumnya'],
+  ['nextPage', 'Halaman berikutnya'],
+  ['addPage', 'Tambah halaman'],
+  ['zoomFit', 'Reset zoom'],
+  ['prevTool', 'Alat sebelumnya'],
+  ['toolSelect', 'Alat Pilih'],
+  ['toolLasso', 'Alat Laso'],
+  ['toolPen', 'Pena'],
+  ['toolHl', 'Stabilo'],
+  ['toolEraser', 'Penghapus'],
+  ['toolText', 'Teks'],
+  ['toggleStylus', 'Mode Stylus'],
+  ['toggleSpread', 'Mode 2 Halaman'],
+  ['toggleCalc', 'Kalkulator'],
+  ['toggleAi', 'Asisten AI'],
+  ['none', 'Mati'],
+];
+
+const labelOf = (val) => ACTIONS.find(([v]) => v === val)?.[1] || 'Mati';
+
+/**
+ * Pasang pendeteksi ketuk multi-jari (2 jari, 3 jari) & ketuk ganda 1 jari pada elemen.
+ * Tidak mengganggu scroll, cubit-zoom, atau seret karena hanya memicu jika jari tidak bergeser dan dilepas cepat.
+ */
+export function attachTapGestures(el, { onTap2, onTap3, onDbl1, isBlocked } = {}) {
+  const active = new Map();
+  let seq = null;
+  let lastSingle = null;
+  let mouseDown = null;
+
+  const down = (e) => {
+    if (isBlocked?.(e)) { seq = null; mouseDown = null; return; }
+    if (e.pointerType === 'mouse') {
+      if (e.button === 0 || e.button === 1) mouseDown = { x: e.clientX, y: e.clientY, t: performance.now(), btn: e.button };
+      return;
+    }
+    if (e.pointerType !== 'touch') return;
+    active.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (active.size === 1 && !seq) {
+      seq = { max: 1, t0: performance.now(), moved: false, pids: new Set([e.pointerId]), starts: new Map([[e.pointerId, { x: e.clientX, y: e.clientY }]]) };
+    } else if (seq) {
+      seq.pids.add(e.pointerId);
+      seq.max = Math.max(seq.max, active.size, seq.pids.size);
+      seq.starts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
+  };
+
+  const move = (e) => {
+    if (e.pointerType === 'mouse') {
+      if (mouseDown && Math.hypot(e.clientX - mouseDown.x, e.clientY - mouseDown.y) > 8) mouseDown = null;
+      return;
+    }
+    if (e.pointerType !== 'touch' || !seq) return;
+    const st = seq.starts.get(e.pointerId);
+    // jari pertama sering sedikit bergeser sebelum jari kedua mendarat → awal ketukan diberi kelonggaran yang sama
+    const lim = seq.max >= 2 || performance.now() - seq.t0 < 250 ? 32 : 16;
+    if (st && Math.hypot(e.clientX - st.x, e.clientY - st.y) > lim) seq.moved = true;
+  };
+
+  const checkDbl1 = (e) => {
+    if (!onDbl1) return;
+    const now = performance.now();
+    if (lastSingle && now - lastSingle.t < 380 && Math.hypot(e.clientX - lastSingle.x, e.clientY - lastSingle.y) < 28) {
+      lastSingle = null;
+      onDbl1(e);
+    } else {
+      lastSingle = { t: now, x: e.clientX, y: e.clientY };
+    }
+  };
+
+  const finishSeq = (e, cancelled = false) => {
+    if (active.size > 0 || !seq) return;
+    const cur = seq;
+    seq = null;
+    const count = Math.max(cur.max, cur.pids.size);
+    const dt = performance.now() - cur.t0;
+    if (cur.moved || dt > (count >= 2 ? 600 : 350)) return;
+    if (cancelled && count < 3) return;
+    if (count >= 3) { lastSingle = null; onTap3?.(e); return; }
+    if (count === 2) { lastSingle = null; onTap2?.(e); return; }
+    if (count === 1) checkDbl1(e);
+  };
+
+  const up = (e) => {
+    if (e.pointerType === 'mouse') {
+      if (mouseDown && performance.now() - mouseDown.t < 350) {
+        if (mouseDown.btn === 0) checkDbl1(e);
+        else if (mouseDown.btn === 1) { lastSingle = null; onTap3?.(e); }
+      }
+      mouseDown = null;
+      return;
+    }
+    if (e.pointerType !== 'touch') return;
+    active.delete(e.pointerId);
+    finishSeq(e, false);
+  };
+
+  const cancel = (e) => {
+    if (e.pointerType === 'mouse') { mouseDown = null; return; }
+    if (e.pointerType !== 'touch') return;
+    active.delete(e.pointerId);
+    finishSeq(e, true);
+  };
+
+  el.addEventListener('pointerdown', down, { passive: true });
+  el.addEventListener('pointermove', move, { passive: true });
+  el.addEventListener('pointerup', up, { passive: true });
+  el.addEventListener('pointercancel', cancel, { passive: true });
+}
+
+/** Sheet pengaturan gestur: 3 baris yang bisa expand mulus ke bawah dengan pilihan 2 kolom. */
+export function openGestureSettings() {
+  const g = getGestures();
+  const rows = [
+    ['tap2', 'Ketuk 2 Jari'],
+    ['tap3', 'Ketuk 3 Jari'],
+    ['dbl1', 'Ketuk 1 Ganda'],
+  ];
+  const chev = ICON.fwd.replace('<svg', '<svg class="g-chev"');
+  const s = openSheet(`
+    <h3>Gestur &amp; Pintasan</h3>
+    <div class="g-list">
+      ${rows.map(([k, title]) => `
+        <div class="g-item" data-gitem="${k}">
+          <div class="g-head" data-ghead="${k}">
+            <div class="grow">${title}</div>
+            <span class="g-val">${labelOf(g[k])}</span>
+            ${chev}
+          </div>
+          <div class="g-drop">
+            <div class="g-drop-in">
+              <div class="g-grid">
+                ${ACTIONS.map(([val, lbl]) => `
+                  <button class="g-opt ${g[k] === val ? 'on' : ''}" data-gk="${k}" data-gv="${val}">
+                    <span>${lbl}</span><i class="g-dot"></i>
+                  </button>`).join('')}
+              </div>
+            </div>
+          </div>
+        </div>`).join('')}
+    </div>
+    <div class="actions"><button class="btn yellow" id="gs-ok">Selesai</button></div>`);
+
+  const syncUI = (all) => {
+    $$('[data-gitem]', s).forEach((item) => {
+      const k = item.dataset.gitem;
+      $('.g-val', item).textContent = labelOf(all[k]);
+      $$('[data-gv]', item).forEach((btn) => btn.classList.toggle('on', btn.dataset.gv === all[k]));
+    });
+  };
+
+  $$('[data-ghead]', s).forEach((head) => {
+    head.onclick = () => {
+      const item = head.closest('.g-item');
+      const willOpen = !item.classList.contains('open');
+      $$('.g-item.open', s).forEach((x) => x.classList.remove('open'));
+      if (willOpen) item.classList.add('open');
+    };
+  });
+
+  $$('[data-gk]', s).forEach((btn) => {
+    btn.onclick = () => {
+      const k = btn.dataset.gk, val = btn.dataset.gv;
+      const all = getGestures();
+      const prev = all[k];
+      const next = { ...all, [k]: val };
+      if (val !== 'none') {
+        for (const [other] of rows) {
+          if (other !== k && next[other] === val) next[other] = prev;
+        }
+      }
+      settings.gestures = next;
+      saveSettings();
+      syncUI(next);
+      setTimeout(() => btn.closest('.g-item')?.classList.remove('open'), 150);
+    };
+  });
+
+  $('#gs-ok', s).onclick = () => closeSheet();
+}
