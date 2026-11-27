@@ -1,0 +1,452 @@
+// Penggaris & Busur Digital di atas kanvas editor.
+// Cara pakai:
+// - Geser: tahan ±0,4 detik di badan penggaris/busur lalu geser (atau pakai 2 jari langsung geser & putar).
+// - Putar: seret tombol ↻ di ujung penggaris/busur, pakai 2 jari, scroll wheel, atau ketuk chip sudut.
+// - Menggambar presisi: tarik Pena/Stabilo di tepi penggaris atau lengkung/alas busur.
+
+export const RULER_ICON = '<svg viewBox="0 0 24 24"><path d="M3.5 15.5l12-12 5 5-12 12z"/><path class="acc" d="M7 12l2 2M10 9l1.5 1.5M13 6l2 2"/></svg>';
+
+const SNAP_DIST_PX = 30; // jarak tepi penarikan garis (piksel layar)
+const PX_PER_CM = 38;    // skala cm
+const HOLD_MOVE_MS = 400; // jeda tahan sebelum geser agar tidak kepicu saat mulai menulis (< 1 dtk)
+
+const normDeg = (deg) => {
+  let d = ((deg % 360) + 360) % 360;
+  if (d > 180) d -= 360;
+  return d;
+};
+
+// Snap lembut tiap kelipatan 15° (±2.2°) agar sudut standar (0°, 30°, 45°, 60°, 90°) mudah didapat
+function softSnapAngle(deg) {
+  const n = normDeg(deg);
+  const nearest = Math.round(n / 15) * 15;
+  if (Math.abs(n - nearest) <= 2.2) return { deg: normDeg(nearest), snapped: true };
+  return { deg: n, snapped: false };
+}
+
+function rulerSvg(w, h) {
+  const cmTotal = Math.floor((w - 28) / PX_PER_CM);
+  const xStart = (w - cmTotal * PX_PER_CM) / 2;
+  let ticks = '';
+  // Garis bantu tengah tipis agar sejajar garis buku
+  ticks += `<line x1="14" y1="${h / 2}" x2="${w - 14}" y2="${h / 2}" class="tk-mid"/>`;
+  for (let mm = 0; mm <= cmTotal * 10; mm++) {
+    const x = +(xStart + (mm / 10) * PX_PER_CM).toFixed(1);
+    const isCm = mm % 10 === 0, isHalf = mm % 5 === 0;
+    const lenTop = isCm ? 15 : isHalf ? 10 : 6;
+    const lenBot = isCm ? 12 : isHalf ? 8 : 5;
+    ticks += `<line x1="${x}" y1="0" x2="${x}" y2="${lenTop}" class="${isCm ? 'tk-cm' : 'tk-mm'}"/>`;
+    ticks += `<line x1="${x}" y1="${h}" x2="${x}" y2="${h - lenBot}" class="${isCm ? 'tk-cm' : 'tk-mm'}"/>`;
+    if (isCm) {
+      ticks += `<text x="${x}" y="25" class="tk-num">${mm / 10}</text>`;
+    }
+  }
+  return `<svg class="rl-svg" viewBox="0 0 ${w} ${h}">${ticks}</svg>`;
+}
+
+// Busur 180° asli berbentuk setengah cakram D-shape (bukan border kotak membulat)
+function protractorSvg(R) {
+  const padB = 22; // bibir bawah datar sejajar garis 0°–180°
+  const w = R * 2, h = R + padB;
+  const cx = R, cy = R;
+  const rIn = Math.round(R * 0.48); // jendela tengah transparan agar kertas & sudut jelas terlihat
+
+  // Bentuk akrilik busur: setengah lingkaran luar + ekstensi bawah datar, dengan lubang setengah lingkaran di dalam
+  const bodyPath = [
+    `M 0 ${cy}`,
+    `A ${R} ${R} 0 0 1 ${w} ${cy}`,
+    `L ${w} ${h - 6}`,
+    `Q ${w} ${h} ${w - 6} ${h}`,
+    `L 6 ${h}`,
+    `Q 0 ${h} 0 ${h - 6}`,
+    `Z`,
+    `M ${cx - rIn} ${cy}`,
+    `A ${rIn} ${rIn} 0 0 0 ${cx + rIn} ${cy}`,
+    `Z`,
+  ].join(' ');
+
+  let g = `<path d="${bodyPath}" fill-rule="evenodd" class="pr-glass"/>`;
+  // Garis tepi luar & garis dasar 0°–180°
+  g += `<path d="M 0.8 ${cy} A ${R - 0.8} ${R - 0.8} 0 0 1 ${w - 0.8} ${cy} L ${w - 0.8} ${h - 6} Q ${w - 0.8} ${h - 0.8} ${w - 6} ${h - 0.8} L 6 ${h - 0.8} Q 0.8 ${h - 0.8} 0.8 ${h - 6} Z" class="pr-rim"/>`;
+  g += `<line x1="8" y1="${cy}" x2="${w - 8}" y2="${cy}" class="tk-base"/>`;
+
+  for (let a = 0; a <= 180; a++) {
+    const rad = (a * Math.PI) / 180;
+    const cs = Math.cos(rad), sn = Math.sin(rad);
+    const is10 = a % 10 === 0, is5 = a % 5 === 0;
+    const len = is10 ? 15 : is5 ? 10 : 5.5;
+    const x1 = (cx + R * cs).toFixed(1), y1 = (cy - R * sn).toFixed(1);
+    const x2 = (cx + (R - len) * cs).toFixed(1), y2 = (cy - (R - len) * sn).toFixed(1);
+    g += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" class="${is10 ? 'tk-cm' : 'tk-mm'}"/>`;
+
+    // Garis panduan radial tipis tiap 30° & 45°
+    if (a > 0 && a < 180 && (a % 30 === 0 || a % 45 === 0)) {
+      const gx1 = (cx + (rIn + 2) * cs).toFixed(1), gy1 = (cy - (rIn + 2) * sn).toFixed(1);
+      const gx2 = (cx + (R - 34) * cs).toFixed(1), gy2 = (cy - (R - 34) * sn).toFixed(1);
+      g += `<line x1="${gx1}" y1="${gy1}" x2="${gx2}" y2="${gy2}" class="tk-guide"/>`;
+    }
+    if (is10 && a > 0 && a < 180) {
+      const tx = (cx + (R - 25) * cs).toFixed(1), ty = (cy - (R - 25) * sn).toFixed(1);
+      g += `<text x="${tx}" y="${ty}" transform="rotate(${90 - a} ${tx} ${ty})" class="tk-num">${180 - a}</text>`;
+    }
+  }
+  // Angka 0 & 180 di garis dasar
+  g += `<text x="20" y="${cy + 12}" class="tk-num">0</text>`;
+  g += `<text x="${w - 20}" y="${cy + 12}" class="tk-num">180</text>`;
+  // Titik bidik pusat sudut (+)
+  g += `<circle cx="${cx}" cy="${cy}" r="3.5" class="tk-dot"/>`;
+  g += `<line x1="${cx - 10}" y1="${cy}" x2="${cx + 10}" y2="${cy}" class="tk-cross"/>`;
+  g += `<line x1="${cx}" y1="${cy - 10}" x2="${cx}" y2="${cy + 10}" class="tk-cross"/>`;
+
+  return `<svg class="rl-svg" viewBox="0 0 ${w} ${h}">${g}</svg>`;
+}
+
+export function createRulerController({ stageEl, onToggle, toPage }) {
+  let open = false;
+  let mode = 'ruler'; // 'ruler' | 'protractor'
+  let cx = 0, cy = 0, angle = 0; // posisi pusat relatif terhadap stageEl, sudut dalam derajat
+  let lastSnapDeg = null;
+  let rw = 440, rh = 68, prR = 136;
+  const padB = 22;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'ruler-layer';
+  wrap.hidden = true;
+  wrap.innerHTML = `
+    <div class="ruler-hud" id="rl-hud">
+      <div class="rl-modes">
+        <button type="button" class="rl-mbtn on" data-rm="ruler">Penggaris</button>
+        <button type="button" class="rl-mbtn" data-rm="protractor">Busur</button>
+      </div>
+      <button type="button" class="rl-deg" id="rl-deg" title="Ketuk untuk putar ke sudut standar">0°</button>
+      <span class="rl-live" id="rl-live" hidden></span>
+      <button type="button" class="rl-close" id="rl-close" title="Tutup">×</button>
+    </div>
+    <div class="ruler-body" id="rl-body">
+      <div class="rl-face" id="rl-face"></div>
+      <div class="rl-grab" id="rl-grab" title="Tahan sebentar untuk geser">
+        <span class="rl-hold-hint">Tahan untuk geser</span>
+      </div>
+      <button type="button" class="rl-rot" id="rl-rot-btn" title="Seret untuk memutar">↻</button>
+    </div>`;
+  stageEl.appendChild(wrap);
+
+  const hud = wrap.querySelector('#rl-hud');
+  const body = wrap.querySelector('#rl-body');
+  const grab = wrap.querySelector('#rl-grab');
+  const face = wrap.querySelector('#rl-face');
+  const degBtn = wrap.querySelector('#rl-deg');
+  const liveEl = wrap.querySelector('#rl-live');
+  const rotBtn = wrap.querySelector('#rl-rot-btn');
+
+  const computeDims = () => {
+    const r = stageEl.getBoundingClientRect();
+    const sw = r.width || window.innerWidth;
+    rw = Math.max(260, Math.min(500, Math.round(sw * 0.78)));
+    rh = 68;
+    prR = Math.max(108, Math.min(150, Math.round(sw * 0.35)));
+  };
+
+  const renderFace = () => {
+    computeDims();
+    body.classList.toggle('is-pro', mode === 'protractor');
+    if (mode === 'ruler') {
+      body.style.width = rw + 'px';
+      body.style.height = rh + 'px';
+      face.innerHTML = rulerSvg(rw, rh);
+    } else {
+      body.style.width = (prR * 2) + 'px';
+      body.style.height = (prR + padB) + 'px';
+      face.innerHTML = protractorSvg(prR);
+    }
+    wrap.querySelectorAll('[data-rm]').forEach((b) => b.classList.toggle('on', b.dataset.rm === mode));
+    syncTransform();
+  };
+
+  const syncTransform = () => {
+    const ox = mode === 'ruler' ? rw / 2 : prR;
+    const oy = mode === 'ruler' ? rh / 2 : prR;
+    body.style.transformOrigin = `${ox}px ${oy}px`;
+    body.style.transform = `translate3d(${(cx - ox).toFixed(1)}px, ${(cy - oy).toFixed(1)}px, 0) rotate(${angle.toFixed(2)}deg)`;
+    const disp = Math.round(normDeg(angle) * 10) / 10;
+    degBtn.textContent = `${Object.is(disp, -0) ? 0 : disp}°`;
+  };
+
+  const resetCenter = () => {
+    const r = stageEl.getBoundingClientRect();
+    cx = (r.width || 360) / 2;
+    cy = (r.height || 480) * 0.45;
+  };
+
+  // ---- Hold-to-Move (jeda 400ms agar sentuhan menulis tidak menggeser penggaris) & Rotate mulus ----
+  const ptrs = new Map();
+  let drag = null;
+  let holdTimer = 0;
+  let holdRing = null;
+
+  const clearHold = () => {
+    clearTimeout(holdTimer);
+    holdTimer = 0;
+    holdRing?.remove();
+    holdRing = null;
+  };
+
+  const onControlDown = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const isRot = e.target.closest('.rl-rot');
+    const capEl = isRot ? rotBtn : grab;
+    ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    try { capEl.setPointerCapture(e.pointerId); } catch {}
+    const sr = stageEl.getBoundingClientRect();
+    const px = e.clientX - sr.left, py = e.clientY - sr.top;
+
+    if (ptrs.size >= 2) {
+      clearHold();
+      const [a, b] = [...ptrs.values()];
+      const a0 = Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+      drag = {
+        kind: 'pinch',
+        mx0: (a.x + b.x) / 2, my0: (a.y + b.y) / 2,
+        cx0: cx, cy0: cy,
+        prevAng: a0, accum: angle,
+      };
+      body.classList.add('armed');
+    } else if (isRot) {
+      clearHold();
+      const a0 = Math.atan2(py - cy, px - cx) * 180 / Math.PI;
+      drag = { kind: 'rot', prevAng: a0, accum: angle };
+      rotBtn.classList.add('on');
+    } else {
+      // Sentuhan 1 jari di zona tengah penggaris/busur: tahan ±400ms (< 1 detik) khusus untuk menggeser tanpa memicu sensor tulis
+      clearHold();
+      const x0 = e.clientX, y0 = e.clientY, pid = e.pointerId;
+      holdRing = document.createElement('i');
+      holdRing.className = 'hold-ring fast';
+      Object.assign(holdRing.style, { left: x0 + 'px', top: y0 + 'px' });
+      document.body.appendChild(holdRing);
+      drag = { kind: 'pending', x0, y0, pid };
+      holdTimer = setTimeout(() => {
+        clearHold();
+        if (!drag || drag.kind !== 'pending' || drag.pid !== pid) return;
+        const p = ptrs.get(pid);
+        drag = { kind: 'move', x0: p?.x ?? x0, y0: p?.y ?? y0, cx0: cx, cy0: cy };
+        body.classList.add('armed');
+        navigator.vibrate?.(12);
+      }, HOLD_MOVE_MS);
+    }
+  };
+
+  const onControlMove = (e) => {
+    if (!ptrs.has(e.pointerId) || !drag) return;
+    e.preventDefault();
+    e.stopPropagation();
+    ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const sr = stageEl.getBoundingClientRect();
+
+    if (drag.kind === 'pending') {
+      // Bergeser sebelum jeda 400ms selesai → batalkan (mencegah geser tak sengaja)
+      if (Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) > 9) {
+        clearHold();
+        drag = null;
+      }
+      return;
+    }
+
+    if (drag.kind === 'move') {
+      cx = drag.cx0 + (e.clientX - drag.x0);
+      cy = drag.cy0 + (e.clientY - drag.y0);
+      syncTransform();
+    } else if (drag.kind === 'rot') {
+      const px = e.clientX - sr.left, py = e.clientY - sr.top;
+      if (Math.hypot(px - cx, py - cy) < 16) return; // cegah lonjakan dekat titik pusat
+      const curAng = Math.atan2(py - cy, px - cx) * 180 / Math.PI;
+      let d = curAng - drag.prevAng;
+      while (d > 180) d -= 360;
+      while (d < -180) d += 360;
+      drag.accum += d;
+      drag.prevAng = curAng;
+      const res = softSnapAngle(drag.accum);
+      if (res.snapped && lastSnapDeg !== res.deg) navigator.vibrate?.(8);
+      lastSnapDeg = res.snapped ? res.deg : null;
+      angle = res.deg;
+      syncTransform();
+    } else if (drag.kind === 'pinch' && ptrs.size >= 2) {
+      const [a, b] = [...ptrs.values()];
+      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      cx = drag.cx0 + (mx - drag.mx0);
+      cy = drag.cy0 + (my - drag.my0);
+      const curAng = Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI;
+      let d = curAng - drag.prevAng;
+      while (d > 180) d -= 360;
+      while (d < -180) d += 360;
+      drag.accum += d;
+      drag.prevAng = curAng;
+      const res = softSnapAngle(drag.accum);
+      if (res.snapped && lastSnapDeg !== res.deg) navigator.vibrate?.(8);
+      lastSnapDeg = res.snapped ? res.deg : null;
+      angle = res.deg;
+      syncTransform();
+    }
+  };
+
+  const endPtr = (e) => {
+    if (!ptrs.has(e.pointerId)) return;
+    ptrs.delete(e.pointerId);
+    if (ptrs.size === 0) {
+      clearHold();
+      drag = null;
+      body.classList.remove('armed');
+      rotBtn.classList.remove('on');
+    }
+  };
+  for (const el of [grab, rotBtn]) {
+    el.addEventListener('pointerdown', onControlDown);
+    el.addEventListener('pointermove', onControlMove);
+    el.addEventListener('pointerup', endPtr);
+    el.addEventListener('pointercancel', endPtr);
+  }
+
+  // Putar halus dengan scroll wheel di area pegangan
+  grab.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    angle = normDeg(angle + (e.deltaY > 0 ? 5 : -5));
+    syncTransform();
+  }, { passive: false });
+
+  // Tombol HUD
+  hud.addEventListener('pointerdown', (e) => e.stopPropagation());
+  wrap.querySelectorAll('[data-rm]').forEach((b) => {
+    b.onclick = () => { mode = b.dataset.rm; renderFace(); };
+  });
+  degBtn.onclick = () => {
+    const presets = [0, 30, 45, 60, 90, -45];
+    const cur = Math.round(normDeg(angle));
+    const idx = presets.findIndex((p) => p === cur);
+    angle = presets[(idx + 1) % presets.length];
+    syncTransform();
+  };
+  wrap.querySelector('#rl-close').onclick = () => toggle(false);
+
+  // Hitung pusat & vektor sumbu dalam koordinat layar (clientX / clientY)
+  const screenBasis = () => {
+    const sr = stageEl.getBoundingClientRect();
+    const scx = sr.left + cx, scy = sr.top + cy;
+    const rad = (angle * Math.PI) / 180;
+    const ux = Math.cos(rad), uy = Math.sin(rad); // vektor sepanjang sumbu X penggaris
+    const vx = -uy, vy = ux;                      // vektor sepanjang sumbu Y penggaris (tegak lurus ke bawah)
+    return { scx, scy, ux, uy, vx, vy };
+  };
+
+  /** Cek apakah posisi awal pena berada di dekat tepi penggaris atau lengkung/alas busur */
+  const snapStart = (clientX, clientY, pg) => {
+    if (!open) return null;
+    const { scx, scy, ux, uy, vx, vy } = screenBasis();
+    const dx = clientX - scx, dy = clientY - scy;
+    const lx = dx * ux + dy * uy;
+    const ly = dx * vx + dy * vy;
+
+    if (mode === 'ruler') {
+      const halfW = rw / 2 + 16, halfH = rh / 2;
+      if (Math.abs(lx) > halfW) return null;
+      const distTop = Math.abs(ly + halfH);
+      const distBot = Math.abs(ly - halfH);
+      if (distTop > SNAP_DIST_PX && distBot > SNAP_DIST_PX) return null;
+      const edgeY = distTop <= distBot ? -halfH : halfH;
+      const sx = scx + lx * ux + edgeY * vx;
+      const sy = scy + lx * uy + edgeY * vy;
+      const pt = toPage({ clientX: sx, clientY: sy }, pg);
+      return { kind: 'line', scx, scy, ux, uy, vx, vy, edgeY, startLx: lx, pt };
+    }
+
+    // Mode Busur: lengkung luar radius prR ATAU alas datar bawah (ly ≈ padB)
+    const distR = Math.hypot(lx, ly);
+    const localAng = Math.atan2(ly, lx);
+    const nearArc = (ly <= 18) && Math.abs(distR - prR) <= SNAP_DIST_PX;
+    const nearBase = Math.abs(lx) <= prR + 14 && Math.abs(ly - padB) <= SNAP_DIST_PX;
+    if (!nearArc && !nearBase) return null;
+
+    if (nearArc && (!nearBase || Math.abs(distR - prR) <= Math.abs(ly - padB))) {
+      const clampedAng = Math.min(0.08, Math.max(-Math.PI - 0.08, localAng));
+      const sx = scx + prR * (Math.cos(clampedAng) * ux + Math.sin(clampedAng) * vx);
+      const sy = scy + prR * (Math.cos(clampedAng) * uy + Math.sin(clampedAng) * vy);
+      const pt = toPage({ clientX: sx, clientY: sy }, pg);
+      return { kind: 'arc', scx, scy, ux, uy, vx, vy, R: prR, startAng: clampedAng, lastAng: clampedAng, totalSpan: 0, pt };
+    } else {
+      const sx = scx + lx * ux + padB * vx;
+      const sy = scy + lx * uy + padB * vy;
+      const pt = toPage({ clientX: sx, clientY: sy }, pg);
+      return { kind: 'line', scx, scy, ux, uy, vx, vy, edgeY: padB, startLx: lx, pt };
+    }
+  };
+
+  /** Proyeksikan gerakan pena ke garis/busur yang terkunci, kembalikan titik halaman & label ukur live */
+  const snapMove = (st, clientX, clientY, pg) => {
+    const dx = clientX - st.scx, dy = clientY - st.scy;
+    const lx = dx * st.ux + dy * st.uy;
+    const ly = dx * st.vx + dy * st.vy;
+
+    if (st.kind === 'line') {
+      const sx = st.scx + lx * st.ux + st.edgeY * st.vx;
+      const sy = st.scy + lx * st.uy + st.edgeY * st.vy;
+      const pt = toPage({ clientX: sx, clientY: sy }, pg);
+      const cm = (Math.abs(lx - st.startLx) / PX_PER_CM).toFixed(1);
+      showLive(`${cm} cm`);
+      return { pt };
+    }
+
+    const rawAng = Math.atan2(ly, lx);
+    let delta = rawAng - st.lastAng;
+    while (delta > Math.PI) delta -= 2 * Math.PI;
+    while (delta < -Math.PI) delta += 2 * Math.PI;
+    const nextAng = st.lastAng + delta;
+    const steps = Math.max(1, Math.min(24, Math.ceil(Math.abs(delta) / (Math.PI / 90))));
+    const pts = [];
+    for (let i = 1; i <= steps; i++) {
+      const a = st.lastAng + (delta * i) / steps;
+      const sx = st.scx + st.R * (Math.cos(a) * st.ux + Math.sin(a) * st.vx);
+      const sy = st.scy + st.R * (Math.cos(a) * st.uy + Math.sin(a) * st.vy);
+      pts.push(toPage({ clientX: sx, clientY: sy }, pg));
+    }
+    st.lastAng = nextAng;
+    st.totalSpan += delta;
+    const degSpan = Math.min(360, Math.round(Math.abs(st.totalSpan * 180 / Math.PI)));
+    showLive(`${degSpan}°`);
+    return { pts };
+  };
+
+  const showLive = (txt) => {
+    liveEl.textContent = txt;
+    liveEl.hidden = false;
+  };
+  const endStroke = () => {
+    liveEl.hidden = true;
+  };
+
+  const toggle = (force) => {
+    const next = typeof force === 'boolean' ? force : !open;
+    if (next === open) return open;
+    open = next;
+    wrap.hidden = !open;
+    if (open) {
+      if (!cx && !cy) resetCenter();
+      renderFace();
+    } else {
+      clearHold();
+      endStroke();
+    }
+    onToggle?.(open);
+    return open;
+  };
+
+  const onResize = () => { if (open) renderFace(); };
+  window.addEventListener('resize', onResize);
+
+  const destroy = () => {
+    clearHold();
+    window.removeEventListener('resize', onResize);
+    wrap.remove();
+  };
+
+  return { toggle, isOpen: () => open, setMode: (m) => { mode = m; if (open) renderFace(); }, snapStart, snapMove, endStroke, destroy };
+}
