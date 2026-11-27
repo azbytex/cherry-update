@@ -1,0 +1,290 @@
+// Komponen UI bersama: sheet, popover, toast, dialog, ikon.
+export const $ = (s, root = document) => root.querySelector(s);
+export const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+export const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+export const pad = (n) => String(n).padStart(2, '0');
+export const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+export const parseYmd = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
+
+export const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+export const MONTHS_LONG = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+export const DAYS = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
+export const DAYS_LONG = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+export const longDate = (d) => `${DAYS_LONG[d.getDay()]}, ${d.getDate()} ${MONTHS_LONG[d.getMonth()]} ${d.getFullYear()}`;
+export const fmtStamp = (t) => { const d = new Date(t); return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+
+export const COLORS = ['#0a99f0', '#f0442f', '#22a861', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6', '#64748b'];
+
+export const ICON = {
+  lock: '<svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/></svg>',
+  unlock: '<svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8 10.5V8a4 4 0 0 1 7.6-1.7"/></svg>',
+  cursor: '<svg viewBox="0 0 24 24"><path d="M6 3.5l12.5 8.2-5.6 1.3 3.3 6.3-2.4 1.2-3.3-6.3L6 18.3z"/></svg>',
+  plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+  dice: '<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3.5"/><circle cx="8.5" cy="8.5" r="1.1" fill="currentColor"/><circle cx="15.5" cy="8.5" r="1.1" fill="currentColor"/><circle cx="12" cy="12" r="1.1" fill="currentColor"/><circle cx="8.5" cy="15.5" r="1.1" fill="currentColor"/><circle cx="15.5" cy="15.5" r="1.1" fill="currentColor"/></svg>',
+  back: '<svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>',
+  fwd: '<svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg>',
+  more: '<svg viewBox="0 0 24 24" style="fill:currentColor;stroke:none"><circle cx="12" cy="5" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="12" cy="19" r="1.9"/></svg>',
+  caret: '<svg viewBox="0 0 24 24"><path d="M6 9h12l-6 7z"/></svg>',
+  search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>',
+  close: '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  note: '<svg viewBox="0 0 24 24"><rect x="4.5" y="3.5" width="15" height="17" rx="2"/><path d="M8.5 8h7M8.5 12h7M8.5 16h4"/></svg>',
+  folder: '<svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
+  folderPlus: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 8.5v7M8.5 12h7"/></svg>',
+  trash: '<svg viewBox="0 0 24 24"><path d="M4 7h16M9.5 7V4.5h5V7M6 7l1 13h10l1-13M10 11v5.5M14 11v5.5"/></svg>',
+  edit: '<svg viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg>',
+  image: '<svg viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><circle cx="9" cy="10" r="1.8"/><path d="M20 16l-5-5-8 8"/></svg>',
+  pdf: '<svg viewBox="0 0 24 24"><path d="M14 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5z"/><path d="M14 3.5v5h5"/><path d="M8.5 15.5h7M8.5 12h4"/></svg>',
+  move: '<svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M10 13h6M13.5 10.5L16 13l-2.5 2.5"/></svg>',
+  copy: '<svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>',
+  restore: '<svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.5-5.8"/><path d="M4 4v4.5h4.5"/></svg>',
+  pen: '<svg viewBox="0 0 24 24"><path d="M4 20l1.5-5L16 4.5a2.1 2.1 0 0 1 3 3L8.5 18z"/><path d="M14 6.5l3 3"/></svg>',
+  ballpoint: '<svg viewBox="0 0 24 24"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/><circle cx="4" cy="20" r="1.5" fill="currentColor"/></svg>',
+  pencil: '<svg viewBox="0 0 24 24"><path d="M18 2l4 4-13 13H5v-4L18 2z"/><path d="M15 5l4 4"/></svg>',
+  calligraphy: '<svg viewBox="0 0 24 24"><path d="M12 2L4 10v7l3 3h10l3-3v-7L12 2z"/><line x1="12" y1="2" x2="12" y2="15"/><line x1="8" y1="18" x2="16" y2="18"/></svg>',
+  brush: '<svg viewBox="0 0 24 24"><path d="M18.5 2.5a2.1 2.1 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/><path d="M8 16c-2 1-4 3.5-4 5.5 0 .5.5 1 1 1 2 0 4.5-2 5.5-4z"/></svg>',
+  marker: '<svg viewBox="0 0 24 24"><path d="M9 15l-3 3v2h5l2-2"/><path d="M9 15l8.5-8.5a2.1 2.1 0 0 1 3 3L12 18z"/><path d="M3 21h12" style="stroke-width:3;opacity:.45"/></svg>',
+  eraser: '<svg viewBox="0 0 24 24"><path d="M8.5 20L3.8 15.3a1.5 1.5 0 0 1 0-2.1l9.4-9.4a1.5 1.5 0 0 1 2.1 0l4.9 4.9a1.5 1.5 0 0 1 0 2.1L12 20z"/><path d="M8.5 20H20M8 9l7 7"/></svg>',
+  text: '<svg viewBox="0 0 24 24"><path d="M5 6V4.5h14V6M12 4.5v15M9 19.5h6"/></svg>',
+  hand: '<svg viewBox="0 0 24 24"><path d="M8 11V5.5a1.5 1.5 0 0 1 3 0V11M11 10V4a1.5 1.5 0 0 1 3 0v6M14 10V5.5a1.5 1.5 0 0 1 3 0V13c0 4-2.5 7-6.5 7-2.6 0-4-1.3-5.5-3.5l-2-3a1.5 1.5 0 0 1 2.4-1.8L8 14"/></svg>',
+  undo: '<svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>',
+  redo: '<svg viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg>',
+  pages: '<svg viewBox="0 0 24 24"><rect x="7" y="3.5" width="12" height="15" rx="1.5"/><path d="M5 7v12a1.5 1.5 0 0 0 1.5 1.5H15"/></svg>',
+  stylus: '<svg viewBox="0 0 24 24"><path d="M14.5 4.5l5 5L9 20H4v-5z"/><path d="M4 4l3 3"/></svg>',
+  zoomIn: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5M8.5 11h5M11 8.5v5"/></svg>',
+  zoomOut: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5M8.5 11h5"/></svg>',
+  palette: '<svg viewBox="0 0 24 24"><path d="M12 3.5a8.5 8.5 0 1 0 0 17c1.2 0 1.8-.8 1.8-1.7 0-1.3-1-1.5-1-2.6 0-.9.7-1.6 1.6-1.6h2.1a4 4 0 0 0 4-4c0-4-3.8-7.1-8.5-7.1z"/><circle cx="7.5" cy="12" r="1"/><circle cx="10" cy="8" r="1"/><circle cx="14.5" cy="8" r="1"/></svg>',
+  today: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="3"/><path d="M8 3v4M16 3v4"/><circle cx="12" cy="14" r="2" style="fill:currentColor"/></svg>',
+  settings: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1V21a2 2 0 0 1-4 0v-.1a1.6 1.6 0 0 0-2.7-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7H3a2 2 0 0 1 0-4h.1a1.6 1.6 0 0 0 1.1-2.7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 2.7-1.1V3a2 2 0 0 1 4 0v.1a1.6 1.6 0 0 0 2.7 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.7H21a2 2 0 0 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>',
+  check: '<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7"/></svg>',
+  addPage: '<svg viewBox="0 0 24 24"><path d="M14 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5z"/><path d="M14 3.5v5h5M12 11.5v6M9 14.5h6"/></svg>',
+  calc: '<svg viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="2.5"/><path d="M8.5 7.5h7"/><circle cx="9" cy="11.5" r=".9" fill="currentColor"/><circle cx="12" cy="11.5" r=".9" fill="currentColor"/><circle cx="15" cy="11.5" r=".9" fill="currentColor"/><circle cx="9" cy="14.5" r=".9" fill="currentColor"/><circle cx="12" cy="14.5" r=".9" fill="currentColor"/><circle cx="15" cy="14.5" r=".9" fill="currentColor"/><circle cx="9" cy="17.5" r=".9" fill="currentColor"/><path d="M12 17.5h3"/></svg>',
+  ai: '<svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/></svg>',
+};
+
+// ---------- Tombol back Android & penutup lapisan ----------
+const backStack = [];
+export function pushBack(fn) { backStack.push(fn); return () => { const i = backStack.lastIndexOf(fn); if (i >= 0) backStack.splice(i, 1); }; }
+export function handleBack() { const fn = backStack.pop(); if (fn) { fn(); return true; } return false; }
+
+// ---------- Toast ----------
+export function toast(msg, ms = 1900) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), ms);
+}
+
+// ---------- Sheet (dialog) ----------
+let sheetBackRemove = null;
+let sheetOnClose = null;
+let sheetGuard = null; // dipanggil saat ditutup lewat ketuk luar / tombol kembali; true = jangan tutup dulu
+// guard: fungsi sendiri, atau guardForm: true untuk menanyakan kalau isian formulir berubah
+export function openSheet(html, { onClose, wide = false, guard = null, guardForm = false, onSave = null } = {}) {
+  const sheet = $('#sheet');
+  sheet.innerHTML = html;
+  sheet.classList.toggle('wide', wide);
+  $('#scrim').classList.add('open');
+  if (sheetBackRemove) sheetBackRemove();
+  sheetOnClose = onClose || null;
+  sheetGuard = guard || (guardForm ? formGuard(sheet, onSave) : null);
+  const back = () => { if (sheetGuard?.()) { sheetBackRemove = pushBack(back); return; } closeSheet(true); };
+  sheetBackRemove = pushBack(back);
+  return sheet;
+}
+// isian formulir berubah tapi belum disimpan → tanya dulu
+function formGuard(sheet, onSave) {
+  const vals = () => [...sheet.querySelectorAll('input:not([type=color]):not([type=file]), textarea, select')].map((i) => (i.type === 'checkbox' ? i.checked : i.value)).join('\u0001');
+  const start = vals();
+  return () => {
+    if (vals() === start) return false;
+    askUnsaved(!!onSave).then((r) => { if (r === 'save') onSave(); else if (r === 'discard') closeSheet(); });
+    return true;
+  };
+}
+
+// Peringatan "belum disimpan" yang tampil di atas lembar (isi lembar tidak hilang)
+// hasil: 'save' | 'discard' | null (lanjut menulis)
+export function askUnsaved(canSave = true, msg = 'Perubahan belum disimpan. Mau disimpan dulu?', { title = 'Belum disimpan', discard = 'Buang', keep = 'Lanjut menulis' } = {}) {
+  return new Promise((resolve) => {
+    const w = document.createElement('div');
+    w.className = 'mconf';
+    w.innerHTML = `<div class="mconf-card"><h3>${esc(title)}</h3><p>${esc(msg)}</p>
+      <div class="mconf-act">${canSave ? '<button class="btn primary" data-r="save">Simpan</button>' : ''}<button class="btn danger-ghost" data-r="discard">${esc(discard)}</button><button class="btn ghost" data-r="">${esc(keep)}</button></div></div>`;
+    const done = (r) => { w.classList.add('out'); setTimeout(() => w.remove(), 200); removeBack(); resolve(r || null); };
+    const removeBack = pushBack(() => done(null));
+    w.addEventListener('pointerdown', (e) => { if (e.target === w) { e.stopPropagation(); done(null); } });
+    w.querySelectorAll('[data-r]').forEach((b) => b.onclick = (e) => { e.stopPropagation(); done(b.dataset.r); });
+    document.body.appendChild(w);
+  });
+}
+// salinan visual yang memudar & mengecil halus saat ditutup (aslinya langsung bebas dipakai lagi)
+function ghostOut(el, cls) {
+  if (!el || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const g = el.cloneNode(true);
+  g.removeAttribute('id'); g.querySelectorAll('[id]').forEach((x) => x.removeAttribute('id'));
+  g.classList.add('fx-ghost', cls); g.setAttribute('aria-hidden', 'true');
+  if (el.style.cssText) g.style.cssText = el.style.cssText;
+  el.parentNode.appendChild(g);
+  setTimeout(() => g.remove(), 320);
+}
+export function closeSheet(fromBack = false) {
+  sheetGuard = null;
+  if ($('#scrim').classList.contains('open')) ghostOut($('#scrim'), 'closing');
+  $('#scrim').classList.remove('open');
+  if (!fromBack && sheetBackRemove) sheetBackRemove();
+  sheetBackRemove = null;
+  const cb = sheetOnClose; sheetOnClose = null; cb?.();
+  syncFabs();
+}
+document.addEventListener('DOMContentLoaded', () => {
+  $('#scrim').addEventListener('pointerdown', (e) => {
+    if (e.target.id !== 'scrim') return;
+    swallowTap(e); // ketuk luar hanya menutup, tidak menekan apa pun di bawahnya
+    if (sheetGuard?.()) return;
+    closeSheet();
+  });
+});
+
+export function confirmDialog(msg, { ok = 'Ya', danger = false, title = 'Konfirmasi' } = {}) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; resolve(v); };
+    const s = openSheet(`<h3>${esc(title)}</h3><p>${esc(msg)}</p>
+      <div class="actions"><button class="btn ghost" data-r="0">Batal</button><button class="btn ${danger ? 'primary' : 'primary'}" data-r="1" ${danger ? 'style="background:var(--danger)"' : ''}>${esc(ok)}</button></div>`,
+      { onClose: () => finish(false) });
+    s.querySelectorAll('[data-r]').forEach((b) => b.onclick = () => { const v = b.dataset.r === '1'; finish(v); closeSheet(); });
+  });
+}
+
+export function promptDialog(title, value = '', { placeholder = '', ok = 'Simpan', multiline = false } = {}) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; resolve(v); };
+    const field = multiline
+      ? `<textarea class="inp" id="pd-in" rows="5" placeholder="${esc(placeholder)}">${esc(value)}</textarea>`
+      : `<input class="inp" id="pd-in" value="${esc(value)}" placeholder="${esc(placeholder)}">`;
+    const s = openSheet(`<h3>${esc(title)}</h3><div class="field">${field}</div>
+      <div class="actions"><button class="btn ghost" id="pd-c">Batal</button><button class="btn primary" id="pd-ok">${esc(ok)}</button></div>`,
+      { onClose: () => finish(null) });
+    const inp = $('#pd-in', s);
+    setTimeout(() => { inp.focus(); if (!multiline) inp.select(); }, 40);
+    const submit = () => { finish(inp.value); closeSheet(); };
+    $('#pd-ok', s).onclick = submit;
+    $('#pd-c', s).onclick = () => closeSheet();
+    if (!multiline) inp.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+  });
+}
+
+// ---------- Popover menu ----------
+let popBackRemove = null;
+export function popover(anchor, items) {
+  const pop = $('#popover');
+  pop.innerHTML = items.map((it, i) => it === '-' ? '<hr>' :
+    `<button data-i="${i}" class="${it.danger ? 'danger' : ''}">${it.icon ? ICON[it.icon] : ''}<span>${esc(it.label)}</span></button>`).join('');
+  pop.classList.add('open');
+  const r = anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : { left: anchor.x, right: anchor.x, top: anchor.y, bottom: anchor.y };
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  let x = r.right - pw, y = r.bottom + 6;
+  if (x < 8) x = Math.min(r.left, innerWidth - pw - 8);
+  if (y + ph > innerHeight - 8) y = Math.max(8, r.top - ph - 6);
+  pop.style.left = Math.max(8, x) + 'px'; pop.style.top = y + 'px';
+  if (popBackRemove) popBackRemove();
+  popBackRemove = pushBack(() => closePopover(true));
+  pop.onclick = (e) => {
+    const b = e.target.closest('[data-i]'); if (!b) return;
+    closePopover(); items[+b.dataset.i].fn?.();
+  };
+}
+export function closePopover(fromBack = false) {
+  const pop = $('#popover');
+  if (!pop.classList.contains('open')) return;
+  ghostOut(pop, 'closing');
+  pop.classList.remove('open');
+  if (!fromBack && popBackRemove) popBackRemove();
+  popBackRemove = null;
+  syncFabs();
+}
+// Ketukan yang dipakai untuk MENUTUP sesuatu tidak boleh ikut menekan tombol/halaman di bawahnya
+let swallowUntil = 0, swallowUp = false;
+export function swallowTap(e) {
+  e?.stopPropagation?.(); e?.preventDefault?.();
+  swallowUntil = performance.now() + 650; swallowUp = true;
+}
+// hanya pointerup & klik dari ketukan yang sama yang ditelan (sekali saja)
+document.addEventListener('pointerup', (e) => { if (swallowUp) { swallowUp = false; if (performance.now() < swallowUntil) e.stopImmediatePropagation(); } }, true);
+document.addEventListener('click', (e) => {
+  if (performance.now() < swallowUntil) { swallowUntil = 0; e.stopImmediatePropagation(); e.preventDefault(); }
+}, true);
+document.addEventListener('pointerdown', (e) => {
+  if ($('#popover')?.classList.contains('open') && !e.target.closest('#popover')) {
+    closePopover();
+    if (e.target.closest('#ed-pages')) { e.cherryClosed = true; return; }
+    swallowTap(e); e.stopImmediatePropagation();
+  }
+}, true);
+
+// ---------- Tombol + (FAB): ikon berputar jadi × saat menu/lembar terbuka, kembali + saat ditutup ----------
+let fabSuppress = false;
+function syncFabs() {
+  setTimeout(() => {
+    const anyOpen = $('#scrim')?.classList.contains('open') || $('#popover')?.classList.contains('open');
+    if (!anyOpen) $$('.fab.open').forEach((f) => f.classList.remove('open'));
+  });
+}
+// ketuk + yang sedang terbuka = tutup saja (jangan buka lagi)
+document.addEventListener('pointerdown', (e) => { if (e.target.closest('.fab.open')) fabSuppress = true; }, true);
+document.addEventListener('click', (e) => {
+  const f = e.target.closest('.fab'); if (!f) return;
+  if (fabSuppress) { fabSuppress = false; e.stopPropagation(); e.preventDefault(); closePopover(); closeSheet(); f.classList.remove('open'); return; }
+  f.classList.add('open'); syncFabs();
+}, true);
+
+// ---------- Pilih file ----------
+export function pickFile(accept, multiple = false, capture) {
+  return new Promise((resolve) => {
+    const old = $('#filePicker');
+    const inp = old.cloneNode(); old.replaceWith(inp);
+    inp.accept = accept; inp.multiple = multiple;
+    if (capture) inp.setAttribute('capture', capture); else inp.removeAttribute('capture');
+    inp.onchange = () => resolve(multiple ? [...inp.files] : inp.files[0] || null);
+    inp.click();
+  });
+}
+
+export const blobToDataURL = (blob) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(blob); });
+export const dataURLToBlob = async (url) => (await fetch(url)).blob();
+
+/** Penanda pilihan Liquid Glass yang meluncur halus antar tab & auto-tengah bila perlu */
+export function syncLiquidNav(bar, activeBtn, { center = false, prevGeo = null } = {}) {
+  if (!bar || !activeBtn) return;
+  let pill = bar.querySelector(':scope > .lg-pill');
+  if (!pill) {
+    pill = document.createElement('i');
+    pill.className = 'lg-pill';
+    pill.setAttribute('aria-hidden', 'true');
+    bar.prepend(pill);
+  }
+  const apply = (g) => {
+    pill.style.width = g.w + 'px';
+    pill.style.height = g.h + 'px';
+    pill.style.transform = `translate3d(${g.x}px, ${g.y}px, 0)`;
+  };
+  const target = { x: activeBtn.offsetLeft, y: activeBtn.offsetTop, w: activeBtn.offsetWidth, h: activeBtn.offsetHeight };
+  if (prevGeo) {
+    pill.style.transition = 'none';
+    apply(prevGeo);
+    pill.offsetWidth; // paksa layout sebelum transisi ke target
+    pill.style.transition = '';
+  }
+  requestAnimationFrame(() => apply(target));
+  if (bar.scrollWidth > bar.clientWidth + 2) {
+    if (center) {
+      const left = Math.max(0, activeBtn.offsetLeft - (bar.clientWidth - activeBtn.offsetWidth) / 2);
+      bar.scrollTo({ left, behavior: 'smooth' });
+    } else {
+      if (activeBtn.offsetLeft < bar.scrollLeft) bar.scrollTo({ left: Math.max(0, activeBtn.offsetLeft - 8), behavior: 'smooth' });
+      else if (activeBtn.offsetLeft + activeBtn.offsetWidth > bar.scrollLeft + bar.clientWidth) {
+        bar.scrollTo({ left: activeBtn.offsetLeft + activeBtn.offsetWidth - bar.clientWidth + 8, behavior: 'smooth' });
+      }
+    }
+  }
+}
