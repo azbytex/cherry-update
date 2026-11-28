@@ -1,0 +1,176 @@
+// Titik masuk aplikasi Cherry.
+import { loadSettings, settings } from './db.js';
+import { $, $$, handleBack, toast, ICON } from './ui.js';
+import { loadAll } from './notebooks.js';
+import { initCalendar, applyAccent, render as renderCalendar, getEvents, occursOn, showDate, triggerQuickGcalSync } from './calendar.js';
+import { initNotify } from './notify.js';
+import { loadPin } from './lock.js';
+import { initLang, lang } from './i18n.js';
+import { setPaperLang } from './paper.js';
+import { initLibrary, render as renderLibrary, clearPicking } from './library.js';
+import { initTodo, todosDue } from './todo.js';
+import { initSettings, renderSettings } from './settings.js';
+import { isEditorOpen, flushEditor } from './editor.js';
+import { loadMyStickers, seedBundledStickers, preloadStickers } from './stickers.js';
+import { initFonts, fontList, ensureFont } from './fonts.js';
+import { initColorPicker } from './colorpick.js';
+import { initUpdater } from './updater.js';
+import { resumePdfJobs } from './io.js';
+import { initDashboard, render as renderDashboard } from './dashboard.js';
+
+let view = 'home';
+// Kalender, Catatan, dan To-do dibuka dari Dashboard (bukan dari rail lagi)
+const UNDER_HOME = ['calendar', 'notes', 'todo'];
+
+export function applyTheme() {
+  const dark = settings.theme === 'dark' || (settings.theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  document.querySelector('meta[name="theme-color"]').content = dark ? '#161618' : '#ffffff';
+  try { window.Capacitor?.Plugins?.SystemBars?.setStyle({ style: dark ? 'DARK' : 'LIGHT' }); } catch {}
+}
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+
+function setView(v) {
+  if (v !== 'notes') clearPicking();
+  view = v;
+  $$('.view').forEach((el) => el.classList.toggle('active', el.id === 'view-' + v));
+  $$('#rail button').forEach((b) => b.classList.toggle('active', b.dataset.view === v || (b.dataset.view === 'home' && UNDER_HOME.includes(v))));
+  if (v === 'home') { renderDashboard(); triggerQuickGcalSync(1800); }
+  if (v === 'calendar') { renderCalendar(0, false); triggerQuickGcalSync(1800); }
+  if (v === 'notes') renderLibrary();
+  if (v === 'settings') renderSettings();
+}
+
+// ---------- Layar pembuka ----------
+// Animasi video loading diputar di kanvas tanpa kontrol/play button bawaan WebView,
+// berputar sampai animasi selesai sebelum masuk ke aplikasi (bisa diketuk untuk lewati).
+function startSplash() {
+  const s = $('#splash'); if (!s) return { done: async () => {} };
+  const v = s.querySelector('video');
+  let videoEnd, ready = false, fellBack = false;
+  const ended = new Promise((r) => (videoEnd = r));
+
+  const fallback = () => {
+    if (fellBack || s.classList.contains('playing')) return;
+    fellBack = true;
+    v?.pause?.();
+    s.classList.add('novideo');
+    setTimeout(videoEnd, 1500);
+  };
+
+  if (!v || matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    fallback();
+  } else {
+    v.muted = true;
+    v.defaultMuted = true;
+    v.playsInline = true;
+
+    v.addEventListener('playing', () => {
+      if (!fellBack) s.classList.add('playing');
+    }, { once: true });
+
+    v.addEventListener('ended', () => videoEnd(), { once: true });
+    v.addEventListener('error', fallback, { once: true });
+    setTimeout(fallback, 3500);
+
+    v.addEventListener('loadeddata', () => {
+      try {
+        const c = document.createElement('canvas'); c.width = c.height = 8;
+        const x = c.getContext('2d'); x.drawImage(v, 0, 0, 8, 8);
+        const [r, g, b] = x.getImageData(1, 1, 1, 1).data;
+        s.style.background = `rgb(${r},${g},${b})`;
+      } catch {}
+    }, { once: true });
+
+    v.play().then(() => {
+      if (!fellBack) s.classList.add('playing');
+    }).catch(fallback);
+  }
+
+  // Ketuk untuk melewati kapan saja setelah aplikasi selesai memuat di latar
+  s.addEventListener('click', () => { if (ready) videoEnd(); });
+
+  return {
+    async done() {
+      ready = true;
+      await ended;
+      s.classList.add('out');
+      document.querySelector('.app')?.animate(
+        [{ opacity: 0, transform: 'scale(.98)' }, { opacity: 1, transform: 'none' }],
+        { duration: 480, easing: 'cubic-bezier(.22,1,.36,1)' }
+      );
+      setTimeout(() => s.remove(), 600);
+    },
+  };
+}
+
+// Muat lebih dulu semua yang berat: font, stiker, dan gambar 3D
+async function preloadAll() {
+  const fonts = await initFonts();
+  // hanya font yang dipakai di pengaturan (gaya kalender dll.); font halaman dimuat saat halamannya dibuka
+  const used = JSON.stringify(settings);
+  await Promise.all([
+    ...fonts.filter((f) => used.includes(`"${f.family}"`)).flatMap((f) => [ensureFont(f.family, 400), f.bold ? ensureFont(f.family, 700) : null]),
+    preloadStickers().catch(() => {}),
+  ]);
+}
+
+async function boot() {
+  const splash = startSplash();
+  await loadSettings();
+  initLang(); setPaperLang(lang() === 'en'); initColorPicker();
+  initFonts();
+  applyTheme(); applyAccent();
+  await loadAll();
+  await loadPin();
+  await loadMyStickers().catch(() => {});
+  await initCalendar($('#view-calendar'));
+  initLibrary($('#view-notes'));
+  await initTodo($('#view-todo'));
+  initSettings($('#view-settings'));
+  initDashboard($('#view-home'), setView);
+  // tombol kembali ke Dashboard di pojok kiri atas Kalender, Catatan, dan To-do
+  for (const v of UNDER_HOME) {
+    const bar = $('#view-' + v + ' .topbar'); if (!bar) continue;
+    bar.insertAdjacentHTML('afterbegin', `<button class="ib d-home" title="Kembali ke Dashboard" aria-label="Kembali ke Dashboard">${ICON.back}</button>`);
+    bar.firstElementChild.onclick = () => setView('home');
+  }
+  $$('#rail button').forEach((b) => b.onclick = () => setView(b.dataset.view));
+  setView('home');
+  initNotify({ events: getEvents, occurs: occursOn, todosDue, openDate: (d) => { setView('calendar'); showDate(d); } });
+  await splash.done();
+  setTimeout(() => {
+    preloadAll().catch(() => {});
+    seedBundledStickers().catch((e) => console.warn('stiker bawaan', e));
+  }, 150);
+
+  // Tombol back Android
+  let lastBack = 0;
+  const App = window.Capacitor?.Plugins?.App;
+  App?.addListener('backButton', () => {
+    if (handleBack()) return;
+    if (view !== 'home') return setView('home');
+    if (Date.now() - lastBack < 2000) return App.exitApp();
+    lastBack = Date.now(); toast('Tekan sekali lagi untuk keluar');
+  });
+  // Simpan saat aplikasi ditinggalkan
+  document.addEventListener('visibilitychange', () => { if (document.hidden && isEditorOpen()) flushEditor(); });
+  window.addEventListener('pagehide', () => { if (isEditorOpen()) flushEditor(); });
+  navigator.storage?.persist?.();
+  setTimeout(resumePdfJobs, 3000); // impor PDF yang belum selesai digambar dilanjutkan di latar
+  initUpdater(); // aplikasi sudah terbuka normal → tandai versi ini aman, lalu cek update di latar
+}
+
+boot().catch((e) => {
+  console.error(e);
+  document.getElementById("splash")?.remove();
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#fee;color:#900;padding:12px;z-index:9999;font:13px/1.45 system-ui,sans-serif';
+  box.innerHTML = `<pre style="margin:0 0 8px;white-space:pre-wrap">${String(e?.stack || e).replace(/</g, '&lt;')}</pre>`
+    + `<button id="boot-rec" style="padding:8px 14px;border:0;border-radius:8px;background:#b91c1c;color:#fff;font-weight:600">Pulihkan Versi</button>`;
+  document.body.appendChild(box);
+  box.querySelector('#boot-rec').onclick = async () => {
+    try { await window.Capacitor?.Plugins?.CherryUpdate?.reset?.(); } catch {}
+    location.reload();
+  };
+});
